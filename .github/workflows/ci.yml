@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+# A nightly fuzz smoke (`zig build test --fuzz=100K` — the bounded form
+# exits after N iterations) is intentionally NOT wired up yet: zig 0.16.0's
+# bundled fuzz test runner fails to compile (compiler/test_runner.zig
+# passes *builtin.StackTrace where *const debug.StackTrace is expected),
+# so every fuzz-mode rebuild errors out. Re-add the scheduled job when the
+# pinned toolchain moves past 0.16.0.
+
 jobs:
   macos:
     name: macOS (arm64)
@@ -33,3 +40,19 @@ jobs:
           version: 0.16.0
       - name: Unit tests (core)
         run: zig build test
+
+  # Separate job from the unit tests so live-server flakes are visible at
+  # a glance and never mask deterministic failures. ubuntu-latest runners
+  # ship a working Docker daemon; the runner skips itself (exit 0) when
+  # one is absent.
+  linux-integration:
+    name: Linux (live integration, Docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Live integration suite
+        run: zig build integration

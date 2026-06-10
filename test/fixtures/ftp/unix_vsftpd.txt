@@ -1,0 +1,4 @@
+drwxr-xr-x    2 0        0            4096 Jun 09 11:30 pub
+-rw-r--r--    1 1000     1000     1073741824 Mar 02  2024 big.iso
+-rw-r--r--    1 14       50           3415 Jan 23 16:05 welcome.msg
+lrwxrwxrwx    1 0        0               7 Jun 09 11:30 latest -> big.iso

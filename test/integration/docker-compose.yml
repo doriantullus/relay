@@ -1,0 +1,66 @@
+# Relay live integration servers. Managed by test/integration/runner.zig
+# (`zig build integration`); see test/integration/README.md.
+#
+# Fixed high host ports — passive FTP advertises port numbers in-protocol,
+# so container and host ports must match 1:1:
+#   vsftpd    42121 (ctrl) 42130-42139 (pasv)   FTPS, require_ssl_reuse=YES
+#   pure-ftpd 42221 (ctrl) 42230-42239 (pasv)   plain FTP + AUTH TLS
+#   proftpd   42321 (ctrl) 42330-42339 (pasv)   FTPS (mod_tls, reuse default)
+#   sftp      42422                              OpenSSH (atmoz/sftp)
+services:
+  vsftpd:
+    build: ./vsftpd
+    ports:
+      - "127.0.0.1:42121:21"
+      - "127.0.0.1:42130-42139:42130-42139"
+    tmpfs:
+      - /home/relay
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/21"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  pureftpd:
+    build: ./pureftpd
+    # Debian's pure-ftpd is built with libcap and dies with "Unable to
+    # switch capabilities" under Docker's default capability set; no single
+    # added capability suffices (test container — full caps are fine).
+    cap_add:
+      - ALL
+    ports:
+      - "127.0.0.1:42221:21"
+      - "127.0.0.1:42230-42239:42230-42239"
+    tmpfs:
+      - /home/relay
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/21"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  proftpd:
+    build: ./proftpd
+    ports:
+      - "127.0.0.1:42321:21"
+      - "127.0.0.1:42330-42339:42330-42339"
+    tmpfs:
+      - /home/relay
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/21"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  sftp:
+    image: atmoz/sftp:alpine
+    command: "relay:relaypw:1001:100:upload"
+    ports:
+      - "127.0.0.1:42422:22"
+    tmpfs:
+      - /home/relay
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 22"]
+      interval: 2s
+      timeout: 2s
+      retries: 30

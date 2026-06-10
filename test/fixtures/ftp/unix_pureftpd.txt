@@ -1,0 +1,4 @@
+drwxr-xr-x    5 1000       ftpgroup         4096 Jun  9 11:30 .
+drwxr-xr-x    5 1000       ftpgroup         4096 Jun  9 11:30 ..
+-rw-r--r--    1 1000       ftpgroup      1024000 Sep  6  2003 -leading-dash.bin
+-r--r--r--    1 1000       ftpgroup           42 Jun 10 00:00 čí šek.txt

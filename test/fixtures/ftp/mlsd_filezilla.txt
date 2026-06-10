@@ -1,0 +1,3 @@
+type=dir;modify=20240910084528; My Documents
+type=file;modify=20240910084528.997;size=512354; report final.pdf
+Type=file;Modify=20240910084528;Size=0;Unique=853g10168; UPPER case facts.txt

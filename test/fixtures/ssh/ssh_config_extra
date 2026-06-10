@@ -1,0 +1,4 @@
+# Included (one level) from the ssh_config fixture.
+Host included.example.net
+    User from-include
+    Port 2422

@@ -3,7 +3,11 @@
 A native macOS FTP / FTPS / SFTP client written in Zig — Transmit-level polish
 with ForkLift-level keyboard power, for programmers who dislike FileZilla.
 
-**Status: M0 (skeleton + risk-retirement spikes).** Not usable yet.
+**Status: M1 complete (headless protocol core).** FTP/FTPS/SFTP engines,
+SSH userland (agent/keys/known_hosts/ssh_config), VFS, connection pool, and
+transfer queue are implemented and tested (321 unit tests + a 50-case live
+Docker integration matrix incl. FTPS TLS session reuse against vsftpd
+`require_ssl_reuse=YES`). No GUI yet — that's M2.
 
 ## Building
 

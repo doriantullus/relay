@@ -1,0 +1,6 @@
+total 64
+drwxr-xr-x    2 root     root         12288 Apr  5  2023 bin
+crw-rw-rw-    1 root     root        1,   3 Jan  1 00:00 null
+brw-rw----    1 root     disk        8,   0 Jan  1 00:00 sda
+prw-r--r--    1 root     root             0 Jul  4  1995 fifo
+-rwxr-sr-x    1 root     root        452472 Apr  5  2023 busybox

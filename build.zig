@@ -80,6 +80,29 @@ pub fn build(b: *std.Build) void {
     spikes_step.dependOn(&spike_ssh_exe.step);
 
     // ------------------------------------------------------------------
+    // Live integration suite: real servers in Docker (test/integration/).
+    // Skips itself cleanly when no docker daemon is reachable.
+    // ------------------------------------------------------------------
+    const integration_mod = b.createModule(.{
+        .root_source_file = b.path("test/integration/runner.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "relay_core", .module = core_mod },
+        },
+    });
+    const integration_exe = b.addExecutable(.{
+        .name = "relay-integration",
+        .root_module = integration_mod,
+    });
+    const integration_run = b.addRunArtifact(integration_exe);
+    integration_run.addArg("--compose-file");
+    integration_run.addFileArg(b.path("test/integration/docker-compose.yml"));
+    if (b.args) |args| integration_run.addArgs(args);
+    b.step("integration", "Run the live Docker integration suite").dependOn(&integration_run.step);
+
+    // ------------------------------------------------------------------
     // macOS-only: relay_mac module, the Relay app bundle, and the UI spike.
     // ------------------------------------------------------------------
     if (is_macos) {

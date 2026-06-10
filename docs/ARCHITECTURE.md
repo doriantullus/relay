@@ -10,9 +10,12 @@ Native macOS FTP/FTPS/SFTP client in Zig 0.16. Target: macOS 15+, aarch64.
 2. **`relay_core` never imports ObjC** and stays Linux-buildable. Protocol
    integration tests run against real Docker servers on Linux CI; the macOS
    runner only builds, unit-tests, bundles, and signs.
-3. **The core↔UI boundary is C-ABI-clean** (extern event structs, opaque
-   handles) — keeps a Ghostty-style Swift-shell pivot and a future CLI
-   companion cheap.
+3. **The core↔UI boundary is C-ABI-clean at the bridge layer.** CoreEvent
+   (src/core/events.zig) stays a native Zig union — ergonomic for the
+   pure-Zig UI we chose. The extern-struct conversion lives in one place:
+   the app's bridge (M2's `src/app/bridge.zig`, later `capi.zig` if the
+   Ghostty-style Swift-shell pivot or CLI companion ever needs it). No
+   other file may assume either representation crosses the boundary.
 
 ## Layers
 

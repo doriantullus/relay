@@ -1,0 +1,5 @@
+drwxr-xr-x   9 ftp      ftp          4096 Aug 17  2025 archive
+-rw-r--r--   1 relay    staff      524288 Jun 08 22:11 RELEASE NOTES.txt
+-rwsr-xr-x   1 root     wheel       77824 Dec 25  2024 setuid-tool
+drwxrwxrwt   2 ftp      ftp          4096 Jun 10 00:00 incoming
+lrwxrwxrwx   1 ftp      ftp            11 Feb 14 09:01 current -> ./archive/9

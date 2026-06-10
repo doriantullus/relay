@@ -1,0 +1,43 @@
+# Relay test fixture: exercises the supported ~/.ssh/config subset.
+# Parsed by src/core/proto/ssh/ssh_config.zig tests; edit with care, the
+# tests assert on the exact values below.
+
+Host work
+    HostName files.example.com
+    User fredrik
+    Port 2200
+    IdentityFile ~/.ssh/id_ed25519
+    IdentityAgent ~/.agent.sock
+
+# Key=Value form, quoted argument, case-insensitive keywords.
+host "spacey host"
+    hostname=spacey.example.com
+
+# Multiple patterns; later HostName for *.example.com must NOT override
+# the one set for work (first obtained value wins).
+Host *.example.com !beta.example.com work
+    User shared
+    Port 2022
+    IdentityFile ~/.ssh/id_rsa_3072
+
+# Token expansion: %h is the (possibly rewritten) host name, %p the port.
+# Deliberately .net: must not match *.example.com above, whose Port would
+# win under first-obtained-value semantics.
+Host tokens.example.net
+    Port 2222
+    IdentityFile /keys/%h_%p
+
+# ProxyJump / ProxyCommand are parse-only in M1.
+Host jumped
+    HostName inner.example.com
+    ProxyJump alice@bastion.example.com:2222,bastion2
+Host cmd-proxied
+    HostName cmd.example.com
+    ProxyCommand ssh -W %h:%p gateway
+
+Include ssh_config_extra
+
+# Defaults for everything; must lose against anything set above.
+Host *
+    User fallback
+    IdentityFile ~/.ssh/id_fallback

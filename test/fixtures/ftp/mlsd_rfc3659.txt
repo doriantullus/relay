@@ -1,0 +1,5 @@
+type=cdir;modify=19990112033515; /iana/assignments/media-types
+type=pdir;modify=19990112033515; ..
+type=dir;modify=19981107085215;perm=el; tmp
+type=file;size=4096;modify=19970811033900;perm=r; file1.txt
+type=file;size=1024;modify=19970811033900;perm=r; file2.txt

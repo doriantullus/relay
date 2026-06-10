@@ -1,0 +1,4 @@
+modify=20260609183045;perm=flcdmpe;type=dir;unique=FD03U5DC0046;UNIX.group=1000;UNIX.groupname=relay;UNIX.mode=0755;UNIX.owner=501;UNIX.ownername=fredrik; src
+modify=20260609183045;perm=adfrw;size=1218;type=file;unique=FD03U5DC0047;UNIX.group=1000;UNIX.mode=0644;UNIX.uid=501; build.zig
+modify=20231005120000;perm=adfrw;size=12;type=OS.unix=slink:/srv/data;unique=FD03U5DC0048;UNIX.mode=0777; data-link
+type=file;size=99;UNKNOWNFACT=zzz;modify=20260101000000; tolerate unknown.bin

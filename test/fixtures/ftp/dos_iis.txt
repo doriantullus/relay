@@ -1,0 +1,5 @@
+01-23-26  04:05PM       <DIR>          aspnet_client
+06-25-18  01:08PM             14336 default.htm
+12-30-25  11:59PM                 0 empty file.log
+02-29-00  12:00AM            524288 y2k leap.bin
+07-04-95  12:00PM       <DIR>          Old Sites

@@ -16,9 +16,11 @@ const std = @import("std");
 const CancelToken = @import("../cancel.zig").CancelToken;
 const diag_mod = @import("../diag.zig");
 
-/// Capability bitset: drives UI affordances (grey out chmod where the
+/// Capability set: drives UI affordances (grey out chmod where the
 /// backend can't, hide resume when the server lacks REST, ...).
-pub const Caps = packed struct {
+/// Not `packed`: the tri-state `case_sensitive` (?bool) has no bit-packed
+/// representation, and nothing serializes this type.
+pub const Caps = struct {
     resume_read: bool = false,
     resume_write: bool = false,
     atomic_rename: bool = false,

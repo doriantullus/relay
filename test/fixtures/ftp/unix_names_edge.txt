@@ -1,0 +1,7 @@
+-rw-r--r--   1 user     users         100 Jan  1  2020 simple.txt
+-rw-r--r--   1 user     users         200 Jan  1  2020 two  spaces.txt
+-rw-r--r--   1 user     users         300 Jan  1  2020 -rf
+-rw-r--r--   1 user     users         400 Jan  1  2020 åäö 日本語.dat
+lrwxrwxrwx   1 user     users          20 Jan  1  2020 weird -> name -> target dir
+-rw-r--r--   1 May      12           1234 May 12 13:14 owner-named-may
+-rw-r--r--   1 user     users         500 Jun 11 09:15 from-last-year.log

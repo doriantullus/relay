@@ -142,6 +142,9 @@ pub fn build(b: *std.Build) void {
             .root_module = app_mod,
         });
 
+        const app_tests = b.addTest(.{ .root_module = app_mod });
+        test_step.dependOn(&b.addRunArtifact(app_tests).step);
+
         const install_app = b.addInstallArtifact(app_exe, .{
             .dest_dir = .{ .override = .{ .custom = "Relay.app/Contents/MacOS" } },
         });

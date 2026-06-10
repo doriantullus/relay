@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  macos:
+    name: macOS (arm64)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Format check
+        run: zig fmt --check build.zig build.zig.zon src
+      - name: Build app bundle
+        run: zig build
+      - name: Build spikes
+        run: zig build spikes
+      - name: Unit tests
+        run: zig build test
+
+  linux-core:
+    name: Linux (relay_core only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Unit tests (core)
+        run: zig build test

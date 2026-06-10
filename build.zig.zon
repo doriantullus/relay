@@ -1,0 +1,34 @@
+.{
+    .name = .relay,
+    .version = "0.1.0",
+    .fingerprint = 0x5d3ae2b9e8bb5965, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // ObjC runtime bindings (msgSend, class creation, blocks, autorelease pools).
+        // No tagged releases exist; pinned to the Zig 0.16 compatibility merge (2026-04-17).
+        .objc = .{
+            .url = "git+https://github.com/mitchellh/zig-objc#c8de82ff80281215ad92900866dab7103a8efa8b",
+            .hash = "zig_objc-0.0.0-Ir_Sp9gsAQCPAJc0oF5xoWePHWP6Y6tCphDeyNUThJoi",
+        },
+        // Static libcrypto/libssl built with the Zig build system (artifacts: "crypto", "ssl", "tls").
+        // FTPS needs TLS session reuse on data connections; std.crypto.tls cannot do that.
+        .libressl = .{
+            .url = "https://github.com/allyourcodebase/libressl/archive/refs/tags/4.0.0+6.tar.gz",
+            .hash = "libressl-4.0.0--kqV4FHUAABdqKrbT3i3K-m1m7s_HyZZMMoBpbHjCiNQ",
+        },
+        // Upstream libssh2 source. Compiled in our build.zig against the LibreSSL artifacts
+        // above (the allyourcodebase wrapper links *system* ssl/crypto, which is not hermetic
+        // on macOS — /usr/lib stubs abort on load). Recipe mirrors allyourcodebase/libssh2.
+        .libssh2 = .{
+            .url = "https://github.com/libssh2/libssh2/archive/refs/tags/libssh2-1.11.1.tar.gz",
+            .hash = "N-V-__8AAATRLQBu_rNy4X2UK6RtcdYK_yAzkV6OcCqgo5aK",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "resources",
+        "README.md",
+    },
+}

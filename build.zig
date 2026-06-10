@@ -10,18 +10,8 @@ pub fn build(b: *std.Build) void {
     // ------------------------------------------------------------------
     // relay_core — protocol engines, queue, VFS. No ObjC; builds anywhere.
     // ------------------------------------------------------------------
-    const core_mod = b.addModule("relay_core", .{
-        .root_source_file = b.path("src/core/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const core_tests = b.addTest(.{ .root_module = core_mod });
-    test_step.dependOn(&b.addRunArtifact(core_tests).step);
-
     // ------------------------------------------------------------------
     // Vendored C: LibreSSL (static) + libssh2 compiled against it.
-    // Only built when a step actually links them (spikes now, core in M1).
     // ------------------------------------------------------------------
     const libressl_dep = b.dependency("libressl", .{
         .target = target,
@@ -42,6 +32,26 @@ pub fn build(b: *std.Build) void {
     c_translate.addIncludePath(libssl.getEmittedIncludeTree());
     c_translate.addIncludePath(libcrypto.getEmittedIncludeTree());
     const c_mod = c_translate.createModule();
+
+    const core_mod = b.addModule("relay_core", .{
+        .root_source_file = b.path("src/core/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "c", .module = c_mod },
+        },
+    });
+    core_mod.linkLibrary(ssh2_lib);
+    core_mod.linkLibrary(libssl);
+    core_mod.linkLibrary(libcrypto);
+    if (is_macos) {
+        core_mod.linkFramework("Security", .{});
+        core_mod.linkFramework("CoreFoundation", .{});
+    }
+
+    const core_tests = b.addTest(.{ .root_module = core_mod });
+    test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
     // ------------------------------------------------------------------
     // Spike: ssh — proves libssh2 + LibreSSL static link on aarch64-macos.

@@ -75,6 +75,9 @@ pub const section_count: usize = 3;
 pub const history_file = "history.zon";
 pub const meta_file = "sites_meta.zon";
 
+/// Standalone fallback (no PaneHost wired — headless tests): an opaque
+/// routing key for pane_sites/listPath. No browser pane exists in that
+/// configuration, so it never has to match a real (allocated) pane token.
 pub const default_pane_token: bridge.PaneToken = 1;
 
 /// Injected by phase 3's window assembly so connects land in the ACTIVE

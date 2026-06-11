@@ -35,8 +35,10 @@
 //! exception is the compare diff, computed on a GCD global queue over two
 //! ref'd immutable snapshots and applied back via the main queue.
 //!
-//! Lifetime: listeners cannot unregister, so a BrowserController must only
-//! be destroyed after `AppCore.shutdown()` (or never — app lifetime).
+//! Lifetime: a BrowserController can be torn down while the AppCore keeps
+//! running — `core.unregisterListeners(controller)` then `destroy()`
+//! (closing a tab) — or after `AppCore.shutdown()` (app quit; shutdown
+//! frees the listener lists, and the core pointer, itself).
 
 const std = @import("std");
 const relay = @import("relay_core");
@@ -945,6 +947,29 @@ pub const NavMode = enum {
 // ---------------------------------------------------------------------------
 // BrowserPane
 // ---------------------------------------------------------------------------
+
+/// Pane-token allocator (main thread only, like all pane create/teardown):
+/// every pane created by ANY BrowserController gets a process-unique token,
+/// so bridge events (pane_token routing) can never cross panes — or, with
+/// multiple controllers per window (tabs), cross tabs.
+var g_next_pane_token: bridge.PaneToken = 1;
+
+/// Process-wide pane registry (main thread only): unique token → live pane.
+/// Maintained by createPane/destroyPane. Drag drops resolve their SOURCE
+/// pane through it, because the source may belong to another controller
+/// (tab) than the receiving table's. All panes share the app gpa, so the
+/// backing is freed through whichever pane leaves last.
+var g_pane_registry: std.AutoHashMapUnmanaged(bridge.PaneToken, *BrowserPane) = .empty;
+
+fn unregisterPane(pane: *BrowserPane) void {
+    _ = g_pane_registry.remove(pane.token());
+    // Leak hygiene (leak-checked tests): the backing goes with the last pane.
+    if (g_pane_registry.count() == 0) {
+        g_pane_registry.deinit(pane.gpa);
+        g_pane_registry = .empty;
+    }
+}
+
 pub const BrowserPane = struct {
     controller: *BrowserController,
     gpa: Allocator,
@@ -954,6 +979,9 @@ pub const BrowserPane = struct {
     role: PaneRole,
     home_role: PaneRole,
     index: u32,
+    /// Process-unique bridge routing token (from g_next_pane_token at
+    /// creation; never index-derived — indexes repeat across controllers).
+    pane_token: bridge.PaneToken,
     /// item_mod.local_site_id (0) for the local pane; the connected site id
     /// for a bound remote pane; null while the remote pane is unbound.
     site: ?u64,
@@ -1042,7 +1070,7 @@ pub const BrowserPane = struct {
     ts_last_ns: i96 = 0,
 
     pub fn token(pane: *const BrowserPane) bridge.PaneToken {
-        return @as(bridge.PaneToken, pane.index) + 1;
+        return pane.pane_token;
     }
 
     /// True when this pane currently hosts a connected remote site (not the
@@ -2215,11 +2243,12 @@ pub const BrowserPane = struct {
         return any;
     }
 
-    fn dropAcceptPaneRows(ctx: *anyopaque, source_pane: u32, rows: []const u32, target: drag.DropTarget) bool {
+    fn dropAcceptPaneRows(ctx: *anyopaque, source_token: u64, rows: []const u32, target: drag.DropTarget) bool {
         const pane: *BrowserPane = @ptrCast(@alignCast(ctx));
-        const ctrl = pane.controller;
-        if (source_pane >= ctrl.panes.len) return false;
-        const src = ctrl.panes[source_pane];
+        // The pasteboard carries the source's unique pane token; the
+        // registry resolves it process-wide, so the source pane may belong
+        // to another controller (tab) than this table's.
+        const src = g_pane_registry.get(source_token) orelse return false;
         if (src == pane) return false; // M2: cross-pane drags only
         const dst_dir = pane.dropDirOwned(target) orelse return false;
         defer pane.gpa.free(dst_dir);
@@ -2385,8 +2414,10 @@ pub const BrowserController = struct {
         return self;
     }
 
-    /// Tear down views + state. Listeners cannot unregister, so call this
-    /// only after `AppCore.shutdown()` (no further drains), or never.
+    /// Tear down views + state. Never touches the AppCore: `shutdown()`
+    /// destroys the core (the pointer dangles afterwards), so detaching
+    /// while the core keeps running (closing a tab) requires
+    /// `core.unregisterListeners(controller)` BEFORE this call.
     pub fn destroy(self: *BrowserController) void {
         self.split.deinit();
         for (self.panes) |pane| destroyPane(pane);
@@ -2880,9 +2911,13 @@ pub const BrowserController = struct {
             .role = role,
             .home_role = role,
             .index = index,
+            .pane_token = g_next_pane_token,
             .site = if (role == .local) item_mod.local_site_id else null,
             .show_hidden = self.core.settings.show_hidden_files,
         };
+        g_next_pane_token += 1;
+        try g_pane_registry.put(gpa, pane.token(), pane);
+        errdefer unregisterPane(pane);
 
         // Full column set for BOTH panes (role switching just toggles the
         // Permissions column's visibility).
@@ -2914,7 +2949,7 @@ pub const BrowserController = struct {
             .acceptFiles = BrowserPane.dropAcceptFiles,
             .acceptPaneRows = BrowserPane.dropAcceptPaneRows,
         });
-        drag.enableRowDragSource(pane.table, index);
+        drag.enableRowDragSource(pane.table, pane.token());
 
         pane.updateStatus();
         return pane;
@@ -2999,6 +3034,7 @@ pub const BrowserController = struct {
 
     fn destroyPane(pane: *BrowserPane) void {
         const gpa = pane.gpa;
+        unregisterPane(pane);
         chrome.clearControlWiring(pane.path_field);
         chrome.clearControlWiring(pane.filter_field);
         pane.banner.deinit();
@@ -4073,6 +4109,65 @@ test "inline error banner + chip tooltip: status/listing event transitions (head
 
     core.shutdown();
     bc.destroy();
+    win.release();
+}
+
+test "pane tokens are process-unique; the drag registry tracks pane lifetime" {
+    const pool = foundation.AutoreleasePool.init();
+    defer pool.deinit();
+    const gpa = testing.allocator;
+
+    var tmp_conf = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_conf.cleanup();
+    var tmp_root = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_root.cleanup();
+    var fake = FakeStore.init(gpa);
+    defer fake.deinit();
+
+    const core = try bridge.AppCore.initOptions(gpa, .{
+        .pump = .manual,
+        .config_dir = tmp_conf.dir,
+        .local_root = tmp_root.dir,
+        .cred_store = fake.credStore(),
+    });
+
+    const win = window_mod.Window.create(
+        foundation.rect(0, 0, 1000, 600),
+        "relay-browser-token-test",
+        window_mod.StyleMask.standard,
+    );
+
+    // Two controllers on one core (the multi-tab shape): four panes must
+    // hold four distinct tokens (index-derived tokens would collide).
+    const bc1 = try BrowserController.create(gpa, core, win, .{ .initial_local_path = "/" });
+    const bc2 = try BrowserController.create(gpa, core, win, .{ .initial_local_path = "/" });
+
+    const all = [_]*BrowserPane{ bc1.panes[0], bc1.panes[1], bc2.panes[0], bc2.panes[1] };
+    for (all, 0..) |pa, i| {
+        for (all[i + 1 ..]) |pb| try testing.expect(pa.token() != pb.token());
+    }
+
+    // Drag routing: the registry resolves every live token to its pane —
+    // including panes of the OTHER controller.
+    for (all) |pane|
+        try testing.expectEqual(@as(?*BrowserPane, pane), g_pane_registry.get(pane.token()));
+
+    // Detaching one controller while the core keeps running (closing a
+    // tab): unregister its listeners, destroy it — its tokens leave the
+    // registry and the surviving controller still receives its listings.
+    const dead_token = bc2.panes[0].token();
+    core.unregisterListeners(bc2);
+    bc2.destroy();
+    try testing.expectEqual(@as(?*BrowserPane, null), g_pane_registry.get(dead_token));
+    try testing.expectEqual(
+        @as(?*BrowserPane, bc1.panes[1]),
+        g_pane_registry.get(bc1.panes[1].token()),
+    );
+    var settled: PaneSettled = .{ .pane = bc1.panes[0], .path = "/" };
+    try drainUntil(core, &settled, PaneSettled.ready);
+
+    core.shutdown();
+    bc1.destroy();
     win.release();
 }
 

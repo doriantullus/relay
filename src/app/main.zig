@@ -565,7 +565,9 @@ fn paneHostActiveToken(_: ?*anyopaque) bridge.PaneToken {
     // pane and connecting never clobbers it. Exception: when the FOCUSED
     // pane is already remote, target it — that preserves switching servers
     // in place and remote↔remote workflows.
-    if (!g_ui_built) return @as(bridge.PaneToken, 2); // panes[1].token()
+    // Pane tokens are allocated per pane (no fixed values); before the UI
+    // exists there is no pane, so the standalone fallback routes nowhere.
+    if (!g_ui_built) return sites_mod.default_pane_token;
     const active = g_ui.browser.activePane();
     if (active.isRemote()) return active.token();
     return g_ui.browser.remotePane().token();

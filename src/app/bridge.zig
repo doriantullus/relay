@@ -526,9 +526,10 @@ pub const AppCore = struct {
     // Listener registry (main thread only)
 
     /// Register `handler` for `tag`. `ctx` must be a (non-const) pointer
-    /// that outlives the AppCore. Multiple listeners per tag are dispatched
-    /// in registration order. There is no unregister: controllers live for
-    /// the app lifetime. Never call from inside a listener callback.
+    /// that outlives its registration: listeners live until
+    /// `unregisterListeners(ctx)` (a controller detaching, e.g. a tab
+    /// closing) or shutdown. Multiple listeners per tag are dispatched in
+    /// registration order. Never call from inside a listener callback.
     pub fn registerListener(
         self: *AppCore,
         comptime tag: EventTag,
@@ -553,6 +554,25 @@ pub const AppCore = struct {
             .call = Thunk.call,
         });
         if (tag == .prompt_needed) _ = self.prompt_listeners.fetchAdd(1, .monotonic);
+    }
+
+    /// Remove every listener registered with `ctx`, across all tags (a
+    /// controller detaching, e.g. a tab closing). Main thread only, like
+    /// registerListener; never call from inside a listener callback, and
+    /// never after `shutdown()` (which destroys the AppCore). orderedRemove
+    /// keeps the documented dispatch order of the remaining listeners.
+    pub fn unregisterListeners(self: *AppCore, ctx: *anyopaque) void {
+        std.debug.assert(!self.shutdown_done);
+        for (&self.listeners, 0..) |*list, tag_idx| {
+            var i = list.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (list.items[i].ctx != ctx) continue;
+                _ = list.orderedRemove(i);
+                if (tag_idx == @intFromEnum(EventTag.prompt_needed))
+                    _ = self.prompt_listeners.fetchSub(1, .monotonic);
+            }
+        }
     }
 
     fn emit(self: *AppCore, comptime tag: EventTag, payload: Payload(tag)) void {
@@ -1658,6 +1678,55 @@ test "listener registry dispatches typed payloads to every registered listener" 
     h.core.postEvent(.{ .site_status = .{ .site_id = 2, .status = .offline } });
     h.core.drainNow();
     try testing.expectEqual(@as(usize, 3), a.calls);
+}
+
+test "unregisterListeners detaches one ctx across all tags; the rest keep firing" {
+    var h: TestHarness = undefined;
+    try h.start(null);
+    defer h.stop();
+
+    const Recorder = struct {
+        status_calls: usize = 0,
+        prompt_calls: usize = 0,
+
+        fn onStatus(self: *@This(), e: events_mod.CoreEvent.SiteStatusChange) void {
+            _ = e;
+            self.status_calls += 1;
+        }
+        fn onPrompt(self: *@This(), e: events_mod.CoreEvent.PromptNeeded) void {
+            _ = e;
+            self.prompt_calls += 1;
+        }
+    };
+    var a: Recorder = .{};
+    var b: Recorder = .{};
+    try h.core.registerListener(.site_status, &a, Recorder.onStatus);
+    try h.core.registerListener(.prompt_needed, &a, Recorder.onPrompt);
+    try h.core.registerListener(.site_status, &b, Recorder.onStatus);
+    try testing.expectEqual(@as(usize, 1), h.core.prompt_listeners.load(.monotonic));
+
+    // The sweep covers EVERY tag the ctx registered for (and keeps the
+    // prompt-wired count honest), without touching the other ctx.
+    h.core.unregisterListeners(&a);
+    try testing.expectEqual(@as(usize, 0), h.core.prompt_listeners.load(.monotonic));
+
+    h.core.postEvent(.{ .site_status = .{ .site_id = 9, .status = .offline } });
+    h.core.postEvent(.{ .prompt_needed = .{
+        .site_id = 9,
+        .prompt_id = 1,
+        .prompt = .{ .password = .{ .user = "u", .host = "h" } },
+    } });
+    h.core.drainNow();
+    try testing.expectEqual(@as(usize, 0), a.status_calls);
+    try testing.expectEqual(@as(usize, 0), a.prompt_calls);
+    try testing.expectEqual(@as(usize, 1), b.status_calls);
+
+    // Unregistering a never-registered ctx is a harmless no-op.
+    var stranger: Recorder = .{};
+    h.core.unregisterListeners(&stranger);
+    h.core.postEvent(.{ .site_status = .{ .site_id = 9, .status = .offline } });
+    h.core.drainNow();
+    try testing.expectEqual(@as(usize, 2), b.status_calls);
 }
 
 const ListingRecorder = struct {

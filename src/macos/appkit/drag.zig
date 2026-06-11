@@ -1,8 +1,9 @@
 //! drag — drag & drop glue for table panes (M2 scope).
 //!
 //! Incoming: Finder file drops (public.file-url) and internal pane-to-pane
-//! row drags (custom pasteboard type carrying pane id + row indexes) onto a
-//! table_source.TableView. Outgoing: row drag source for pane-to-pane moves.
+//! row drags (custom pasteboard type carrying the source pane token + row
+//! indexes) onto a table_source.TableView. Outgoing: row drag source for
+//! pane-to-pane moves.
 //!
 //! Outgoing NSFilePromiseProvider (drag a remote file *to* Finder) is a
 //! documented stub — see enableOutgoingFilePromises.
@@ -23,7 +24,9 @@ const getClass = table_source.getClass;
 /// UTI of Finder file drops.
 pub const file_url_type: [*:0]const u8 = "public.file-url";
 /// Custom pasteboard type for internal pane-to-pane row drags. Each dragged
-/// row is one pasteboard item whose data is encodePaneRow(pane, row).
+/// row is one pasteboard item whose data is encodePaneRow(token, row),
+/// where `token` is the source pane's app-unique u64 token (the receiver
+/// may live in a different controller than the source).
 pub const pane_rows_type: [*:0]const u8 = "us.doriantull.relay.pane-rows";
 
 // NSDragOperation values (AppKit).
@@ -66,27 +69,28 @@ pub const DropHandler = struct {
     validate: *const fn (ctx: *anyopaque, payload: Payload, target: DropTarget) Operation,
     /// Finder files dropped; absolute filesystem paths.
     acceptFiles: ?*const fn (ctx: *anyopaque, paths: []const []const u8, target: DropTarget) bool = null,
-    /// Internal rows dropped from another (or the same) pane.
-    acceptPaneRows: ?*const fn (ctx: *anyopaque, source_pane: u32, rows: []const u32, target: DropTarget) bool = null,
+    /// Internal rows dropped from another (or the same) pane; `source_token`
+    /// is the unique pane token the source's enableRowDragSource declared.
+    acceptPaneRows: ?*const fn (ctx: *anyopaque, source_token: u64, rows: []const u32, target: DropTarget) bool = null,
 };
 
 // ---------------------------------------------------------------------------
 // Pane-row payload codec (pure; unit-tested headless).
 // ---------------------------------------------------------------------------
-pub const PaneRow = struct { pane: u32, row: u32 };
+pub const PaneRow = struct { pane: u64, row: u32 };
 
-pub fn encodePaneRow(pane: u32, row: u32) [8]u8 {
-    var out: [8]u8 = undefined;
-    std.mem.writeInt(u32, out[0..4], pane, .little);
-    std.mem.writeInt(u32, out[4..8], row, .little);
+pub fn encodePaneRow(pane: u64, row: u32) [12]u8 {
+    var out: [12]u8 = undefined;
+    std.mem.writeInt(u64, out[0..8], pane, .little);
+    std.mem.writeInt(u32, out[8..12], row, .little);
     return out;
 }
 
 pub fn decodePaneRow(bytes: []const u8) ?PaneRow {
-    if (bytes.len != 8) return null;
+    if (bytes.len != 12) return null;
     return .{
-        .pane = std.mem.readInt(u32, bytes[0..4], .little),
-        .row = std.mem.readInt(u32, bytes[4..8], .little),
+        .pane = std.mem.readInt(u64, bytes[0..8], .little),
+        .row = std.mem.readInt(u32, bytes[8..12], .little),
     };
 }
 
@@ -122,9 +126,10 @@ pub fn attachDropHandler(tv: *TableView, handler: DropHandler) void {
 }
 
 /// Make the table's rows draggable as internal pane-to-pane payloads.
-/// `pane_id` identifies this pane in the receiver's acceptPaneRows callback.
-pub fn enableRowDragSource(tv: *TableView, pane_id: u32) void {
-    tv.drag_pane_id = pane_id;
+/// `pane_token` (the pane's app-unique token) identifies this pane in the
+/// receiver's acceptPaneRows callback — even across controllers.
+pub fn enableRowDragSource(tv: *TableView, pane_token: u64) void {
+    tv.drag_pane_token = pane_token;
     const table = objc.Object.fromId(tv.tableHandle());
     table.msgSend(void, "setDraggingSourceOperationMask:forLocal:", .{
         ns_drag_copy | ns_drag_move, true,
@@ -252,7 +257,7 @@ fn helperAcceptDrop(
         .pane_rows => {
             const cb = handler.acceptPaneRows orelse return 0;
             var rows: std.ArrayList(u32) = .empty;
-            var source_pane: ?u32 = null;
+            var source_pane: ?u64 = null;
             var i: NSUInteger = 0;
             while (i < count) : (i += 1) {
                 const item = items.msgSend(objc.Object, "objectAtIndex:", .{i});
@@ -278,13 +283,13 @@ fn helperPasteboardWriterForRow(
     row: NSInteger,
 ) callconv(.c) c.id {
     const tv = tvFromHelper(target);
-    const pane_id = tv.drag_pane_id orelse return null;
+    const pane_token = tv.drag_pane_token orelse return null;
     if (row < 0) return null;
 
     const pool = objc.AutoreleasePool.init();
     var result: c.id = null;
     {
-        const payload = encodePaneRow(pane_id, @intCast(row));
+        const payload = encodePaneRow(pane_token, @intCast(row));
         const data = getClass("NSData").msgSend(objc.Object, "dataWithBytes:length:", .{
             @as(?*const anyopaque, @ptrCast(&payload)), @as(NSUInteger, payload.len),
         });
@@ -304,11 +309,13 @@ fn helperPasteboardWriterForRow(
 // Headless tests
 // ---------------------------------------------------------------------------
 test "pane-row payload codec round-trip" {
-    const bytes = encodePaneRow(2, 98_412);
+    // Full-width u64 pane token (tokens are app-unique, not 0/1 pane ids).
+    const bytes = encodePaneRow(0xDEAD_BEEF_0000_0042, 98_412);
     const decoded = decodePaneRow(&bytes) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u32, 2), decoded.pane);
+    try std.testing.expectEqual(@as(u64, 0xDEAD_BEEF_0000_0042), decoded.pane);
     try std.testing.expectEqual(@as(u32, 98_412), decoded.row);
-    try std.testing.expectEqual(@as(?PaneRow, null), decodePaneRow(bytes[0..7]));
+    try std.testing.expectEqual(@as(?PaneRow, null), decodePaneRow(bytes[0..11]));
+    try std.testing.expectEqual(@as(?PaneRow, null), decodePaneRow(bytes[0..8])); // old u32+u32 wire size
     try std.testing.expectEqual(@as(?PaneRow, null), decodePaneRow(""));
 }
 

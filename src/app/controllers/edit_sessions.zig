@@ -59,9 +59,10 @@ const Allocator = std.mem.Allocator;
 /// .edit_external` is the registry id; this is the palette-facing name).
 pub const command_id = "file.editExternal";
 
-/// Pane token for the controller's re-stat listings: never collides with
-/// the browser panes (1, 2), so their listeners drop these results.
-pub const edit_pane_token: bridge.PaneToken = 0xED17_0000;
+/// Pane token for the controller's re-stat listings: a high-bit sentinel
+/// far outside the browser's monotonic pane-token range (which counts up
+/// from 1), so pane listeners drop these results.
+pub const edit_pane_token: bridge.PaneToken = 0xED17_0000_0000_0000;
 
 /// FSEvents coalescing window for save detection: long enough to fold an
 /// editor's atomic-save dance (tmp write + rename) into one trigger.

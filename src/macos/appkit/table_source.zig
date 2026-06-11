@@ -324,7 +324,7 @@ pub const TableView = struct {
     monospaced: bool = false,
     /// Set by drag.attachDropHandler / drag.enableRowDragSource.
     drop: ?drag.DropHandler = null,
-    drag_pane_id: ?u32 = null,
+    drag_pane_token: ?u64 = null,
     // Reuse telemetry (main-thread only; smoke/tests assert on these).
     made_views: u64 = 0,
     reuse_hits: u64 = 0,

@@ -983,6 +983,28 @@ pub fn parseFileZilla(gpa: Allocator, xml: []const u8) error{OutOfMemory}!Import
     return .{ .arena = arena, .sites = sites.items, .skipped = skipped };
 }
 
+/// An imported host/account is safe iff it carries no ASCII control bytes
+/// (incl. NUL/CR/LF) and no leading dash — the latter would be parsed as an
+/// option by ssh/scp/rsync (see terminal.destinationSafe). Empty is allowed
+/// (anonymous/identity-only logins).
+fn importedFieldSafe(field: []const u8) bool {
+    if (field.len == 0) return true;
+    if (field[0] == '-') return false;
+    for (field) |ch| {
+        if (ch < 0x20 or ch == 0x7f) return false;
+    }
+    return true;
+}
+
+test "importedFieldSafe rejects control bytes and leading dash" {
+    try std.testing.expect(importedFieldSafe("example.com"));
+    try std.testing.expect(importedFieldSafe("")); // anonymous
+    try std.testing.expect(importedFieldSafe("2001:db8::1"));
+    try std.testing.expect(!importedFieldSafe("-oProxyCommand=touch /tmp/x"));
+    try std.testing.expect(!importedFieldSafe("evil\x00host"));
+    try std.testing.expect(!importedFieldSafe("two\nlines"));
+}
+
 fn parseFzServer(a: Allocator, block: []const u8) error{OutOfMemory}!?ImportedSite {
     const host_raw = xmlTagText(block, "Host") orelse return null;
     const host = try xmlDecode(a, std.mem.trim(u8, host_raw, " \t\r\n"));
@@ -2213,6 +2235,14 @@ pub const SitesController = struct {
     pub fn applyImport(self: *SitesController, result: *const ImportResult, import_passwords: bool) ImportStats {
         var stats: ImportStats = .{ .skipped = result.skipped };
         for (result.sites) |site| {
+            // Imported host/account come from an untrusted file. Control
+            // bytes (XML entity refs can decode to NUL/newline) would flow
+            // into cred keys, known_hosts lines, and ssh argv — reject them
+            // here, the single commit chokepoint for both importers.
+            if (!importedFieldSafe(site.fields.host) or !importedFieldSafe(site.fields.account)) {
+                stats.skipped += 1;
+                continue;
+            }
             if (self.store.findMatching(site.fields) != null) {
                 stats.duplicates += 1;
                 continue;

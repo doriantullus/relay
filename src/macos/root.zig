@@ -30,6 +30,7 @@ pub const appkit = struct {
     pub const panels = @import("appkit/panels.zig");
     pub const drag = @import("appkit/drag.zig");
     pub const banner = @import("appkit/banner.zig");
+    pub const tab_bar = @import("appkit/tab_bar.zig");
 };
 
 const std = @import("std");
@@ -51,4 +52,5 @@ test {
     _ = appkit.panels;
     _ = appkit.drag;
     _ = appkit.banner;
+    _ = appkit.tab_bar;
 }

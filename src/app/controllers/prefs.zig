@@ -53,6 +53,8 @@ pub const Command = enum {
     new_window,
     connect_server,
     disconnect,
+    /// Disconnect every connected site (no shortcut; palette picks it up).
+    disconnect_all,
     new_folder,
     rename_selection,
     delete_selection,
@@ -262,6 +264,7 @@ pub const file_menu: MenuDef = .{
         .separator,
         cmdLeaf("Connect to Server…", .connect_server, "k", .{}),
         cmdLeaf("Disconnect", .disconnect, "k", .{ .shift = true }),
+        cmdLeaf("Disconnect All", .disconnect_all, "", .{}),
         .separator,
         cmdLeaf("New Folder", .new_folder, "n", .{ .shift = true }),
         cmdLeaf("Rename", .rename_selection, "", .{}),

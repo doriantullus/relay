@@ -665,6 +665,7 @@ fn bindCommands() void {
     cmds.bind(.new_window, null, cmdNewWindow);
     cmds.bind(.connect_server, null, cmdConnectServer);
     cmds.bind(.disconnect, null, cmdDisconnect);
+    cmds.bind(.disconnect_all, null, cmdDisconnectAll);
     cmds.bind(.new_folder, null, cmdNewFolder);
     cmds.bind(.rename_selection, null, cmdRename);
     cmds.bind(.delete_selection, null, cmdDelete);
@@ -714,6 +715,9 @@ fn cmdConnectServer(_: ?*anyopaque) void {
 }
 fn cmdDisconnect(_: ?*anyopaque) void {
     g_ui.sites.disconnectActivePane();
+}
+fn cmdDisconnectAll(_: ?*anyopaque) void {
+    g_ui.sites.disconnectAll();
 }
 fn cmdNewFolder(_: ?*anyopaque) void {
     g_ui.browser.newFolderSheet();

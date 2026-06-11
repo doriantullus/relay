@@ -27,7 +27,9 @@
 //! append happens core-side once the M2 factories land). Quick Connect
 //! (Cmd+K via `serverMenuItems`) accepts sftp:// | ftps:// | ftp:// URLs
 //! and bare ssh-config aliases, with a save-as-site choice. Disconnect is
-//! Cmd+Shift+K (`disconnectActivePane`).
+//! Cmd+Shift+K (`disconnectActivePane`), the sidebar context menu's
+//! Disconnect on connected rows, and File ▸ Disconnect All
+//! (`disconnectAll`).
 //!
 //! Secrets: passwords go ONLY to the cred store (Keychain) — never to
 //! sites.zon. "Save in Keychain: No" stores the secret transiently (the
@@ -1138,7 +1140,7 @@ fn parseDuck(a: Allocator, text: []const u8) error{OutOfMemory}!?ImportedSite {
 // SitesController
 // ---------------------------------------------------------------------------
 
-const MenuKind = enum(usize) { servers, ssh, history, background };
+const MenuKind = enum(usize) { servers, servers_connected, ssh, history, background };
 const menu_kind_count = @typeInfo(MenuKind).@"enum".fields.len;
 
 const TransientCred = struct {
@@ -1397,13 +1399,24 @@ pub const SitesController = struct {
         const self = fromCtx(ctx);
         self.clicked = item;
         const kind: MenuKind = if (item) |sr| switch (sr.section) {
-            section_servers => .servers,
+            section_servers => self.serversMenuKind(sr.row),
             section_ssh => .ssh,
             section_history => .history,
             else => MenuKind.background,
         } else .background;
         const m = self.menus[@intFromEnum(kind)] orelse return null;
         return m.value;
+    }
+
+    /// The Disconnect-bearing variant only when the row's site is actually
+    /// connected (or trying to be); offline rows keep the plain menu.
+    fn serversMenuKind(self: *const SitesController, row: usize) MenuKind {
+        const entry = self.store.persistedAt(row) orelse return .servers;
+        const status = self.statuses.get(entry.site.id) orelse return .servers;
+        return switch (status) {
+            .connected, .reconnecting => .servers_connected,
+            .offline => .servers,
+        };
     }
 
     // ------------------------------------------------------------------ //
@@ -1420,6 +1433,19 @@ pub const SitesController = struct {
             menu_mod.Item.call("Add Site…", .{ .ctx = self, .f = cmAddSite }, "", .{}),
         };
         self.menus[@intFromEnum(MenuKind.servers)] = try menu_mod.buildContextMenu(reg, &servers_items);
+
+        // Connected/reconnecting rows get the same menu plus Disconnect.
+        const servers_connected_items = [_]menu_mod.Item{
+            menu_mod.Item.call("Connect", .{ .ctx = self, .f = cmConnect }, "", .{}),
+            menu_mod.Item.call("Disconnect", .{ .ctx = self, .f = cmDisconnect }, "", .{}),
+            .separator,
+            menu_mod.Item.call("Edit Site…", .{ .ctx = self, .f = cmEdit }, "", .{}),
+            menu_mod.Item.call("Delete Site…", .{ .ctx = self, .f = cmDelete }, "", .{}),
+            .separator,
+            menu_mod.Item.call("Add Site…", .{ .ctx = self, .f = cmAddSite }, "", .{}),
+        };
+        self.menus[@intFromEnum(MenuKind.servers_connected)] =
+            try menu_mod.buildContextMenu(reg, &servers_connected_items);
 
         const ssh_items = [_]menu_mod.Item{
             menu_mod.Item.call("Connect", .{ .ctx = self, .f = cmConnect }, "", .{}),
@@ -1451,6 +1477,14 @@ pub const SitesController = struct {
     fn cmConnect(ctx: ?*anyopaque) void {
         const self = fromMenuCtx(ctx);
         if (self.clicked) |sr| self.activateRow(sr);
+    }
+
+    fn cmDisconnect(ctx: ?*anyopaque) void {
+        const self = fromMenuCtx(ctx);
+        const sr = self.clicked orelse return;
+        if (sr.section != section_servers) return;
+        const entry = self.store.persistedAt(sr.row) orelse return;
+        self.disconnectSite(entry.site.id);
     }
 
     fn cmEdit(ctx: ?*anyopaque) void {
@@ -1610,6 +1644,36 @@ pub const SitesController = struct {
         const pane = self.pane_host.activeToken();
         const kv = self.pane_sites.fetchRemove(pane) orelse return;
         self.core.disconnectSite(kv.value);
+    }
+
+    /// Sidebar Disconnect: disconnect one site and drop every pane binding
+    /// pointing at it (a stale binding would make Cmd+Shift+K re-disconnect
+    /// a dead site).
+    fn disconnectSite(self: *SitesController, site_id: u64) void {
+        self.core.disconnectSite(site_id);
+        // Collect-then-remove: removal invalidates a live map iterator.
+        var stale: [8]bridge.PaneToken = undefined; // bounded: one per pane
+        var n: usize = 0;
+        var it = self.pane_sites.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* == site_id and n < stale.len) {
+                stale[n] = e.key_ptr.*;
+                n += 1;
+            }
+        }
+        for (stale[0..n]) |pane| _ = self.pane_sites.remove(pane);
+    }
+
+    /// File ▸ Disconnect All: disconnect every site whose last status was
+    /// connected or reconnecting, then drop all pane bindings (every one is
+    /// stale after a global disconnect).
+    pub fn disconnectAll(self: *SitesController) void {
+        var it = self.statuses.iterator();
+        while (it.next()) |e| switch (e.value_ptr.*) {
+            .connected, .reconnecting => self.core.disconnectSite(e.key_ptr.*),
+            .offline => {},
+        };
+        self.pane_sites.clearRetainingCapacity();
     }
 
     fn connectSshAlias(self: *SitesController, row: usize) void {
@@ -3218,6 +3282,129 @@ test "controller: dsRowItem maps site status to the sidebar dot" {
         outline_mod.StatusDot.none,
         SitesController.dsRowItem(ctx, section_history, 0, &buf).status,
     );
+}
+
+test "controller: servers context menu swaps to the Disconnect variant by status" {
+    var h: Harness = undefined;
+    try h.start(.{ .sites = &.{.{
+        .id = 7,
+        .name = "box",
+        .protocol = .sftp,
+        .host = "box.example",
+        .account = "root",
+    }} });
+
+    const ctrl = try SitesController.create(testing.allocator, h.core, .{
+        .window = null,
+        .home = "/nonexistent-relay-home",
+        .build_sidebar = true,
+        .sidebar_autosave = null,
+    });
+    defer ctrl.destroy();
+    defer h.stop();
+
+    const ctx: *anyopaque = @ptrCast(ctrl);
+    const plain = ctrl.menus[@intFromEnum(MenuKind.servers)].?.value;
+    const connected = ctrl.menus[@intFromEnum(MenuKind.servers_connected)].?.value;
+    const sr: outline_mod.SectionRow = .{ .section = section_servers, .row = 0 };
+
+    // No status yet → the plain menu (no Disconnect).
+    try testing.expectEqual(plain, SitesController.dsContextMenu(ctx, sr).?);
+
+    ctrl.onSiteStatus(.{ .site_id = 7, .status = .connected, .reason = "" });
+    try testing.expectEqual(connected, SitesController.dsContextMenu(ctx, sr).?);
+
+    ctrl.onSiteStatus(.{ .site_id = 7, .status = .reconnecting, .reason = "" });
+    try testing.expectEqual(connected, SitesController.dsContextMenu(ctx, sr).?);
+
+    ctrl.onSiteStatus(.{ .site_id = 7, .status = .offline, .reason = "test" });
+    try testing.expectEqual(plain, SitesController.dsContextMenu(ctx, sr).?);
+
+    // Background (no row) keeps its own menu.
+    try testing.expectEqual(
+        ctrl.menus[@intFromEnum(MenuKind.background)].?.value,
+        SitesController.dsContextMenu(ctx, null).?,
+    );
+
+    // cmDisconnect drops only the pane bindings pointing at the clicked
+    // site (others must survive for Cmd+Shift+K).
+    try ctrl.pane_sites.put(ctrl.gpa, 0, 7);
+    try ctrl.pane_sites.put(ctrl.gpa, 1, 8);
+    ctrl.clicked = sr;
+    SitesController.cmDisconnect(ctrl);
+    try testing.expectEqual(@as(?u64, null), ctrl.pane_sites.get(0));
+    try testing.expectEqual(@as(?u64, 8), ctrl.pane_sites.get(1));
+}
+
+test "controller: disconnectAll disconnects exactly the connected/reconnecting sites" {
+    var hub = relay.pool.site_pool.MockHub.init(testing.allocator);
+    const Make = struct {
+        fn make(ctx: *anyopaque, site: *const sites_mod.Site) relay.pool.site_pool.ConnFactory {
+            _ = site;
+            const hub_ptr: *relay.pool.site_pool.MockHub = @ptrCast(@alignCast(ctx));
+            return hub_ptr.factory();
+        }
+    };
+
+    // Harness.start has no factory seam, so wire the mock factory inline
+    // (same setup as bridge.zig's mock-factory test).
+    var h: Harness = undefined;
+    h.tmp_conf = std.testing.tmpDir(.{ .iterate = true });
+    h.tmp_root = std.testing.tmpDir(.{ .iterate = true });
+    h.fake = .init(testing.allocator);
+    try sites_mod.save(.{ .sites = &.{
+        .{ .id = 1, .name = "one", .protocol = .ftp, .host = "one.example", .account = "alice" },
+        .{ .id = 2, .name = "two", .protocol = .ftp, .host = "two.example", .account = "alice" },
+    } }, std.testing.io, h.tmp_conf.dir, bridge.sites_file, testing.allocator);
+    var diag: Diagnostics = .{};
+    try h.fake.set(&diag, .{ .protocol = .ftp, .host = "one.example", .port = 21, .account = "alice" }, "pw");
+    try h.fake.set(&diag, .{ .protocol = .ftp, .host = "two.example", .port = 21, .account = "alice" }, "pw");
+    h.core = try bridge.AppCore.initOptions(testing.allocator, .{
+        .pump = .manual,
+        .config_dir = h.tmp_conf.dir,
+        .local_root = h.tmp_root.dir,
+        .cred_store = h.fake.credStore(),
+        .factory_provider = .{ .ctx = &hub, .makeFn = Make.make },
+    });
+
+    const ctrl = try SitesController.create(testing.allocator, h.core, .{
+        .window = null,
+        .home = "/nonexistent-relay-home",
+        .build_sidebar = false,
+    });
+    defer ctrl.destroy();
+    defer h.stop();
+
+    try h.core.connectSite(1);
+    try h.core.connectSite(2);
+    const Pred = struct {
+        fn bothConnected(c_: *SitesController) bool {
+            const one = c_.siteStatus(1) orelse return false;
+            const two = c_.siteStatus(2) orelse return false;
+            return one == .connected and two == .connected;
+        }
+        fn oneOffline(c_: *SitesController) bool {
+            return (c_.siteStatus(1) orelse return false) == .offline;
+        }
+    };
+    try h.waitUntil(ctrl, Pred.bothConnected);
+    try testing.expectEqual(@as(usize, 2), hub.openConns());
+
+    // Stale pane bindings, plus a site the controller believes is offline
+    // even though its pool is open — exactly what disconnectAll must skip —
+    // and a status entry for a site that never had a runtime.
+    try ctrl.pane_sites.put(ctrl.gpa, 0, 1);
+    try ctrl.pane_sites.put(ctrl.gpa, 1, 2);
+    ctrl.onSiteStatus(.{ .site_id = 2, .status = .offline, .reason = "test" });
+    ctrl.onSiteStatus(.{ .site_id = 99, .status = .offline, .reason = "test" });
+
+    ctrl.disconnectAll();
+    try h.waitUntil(ctrl, Pred.oneOffline);
+    // Site 1 (connected) was disconnected; site 2 (offline per status) was
+    // skipped, so its mock connection is still open.
+    try testing.expectEqual(@as(usize, 1), hub.openConns());
+    // Every pane binding is dropped — Cmd+Shift+K has nothing stale left.
+    try testing.expectEqual(@as(usize, 0), ctrl.pane_sites.count());
 }
 
 test "controller: site CRUD propagates to sites.zon, the core list, and the keychain" {

@@ -564,20 +564,31 @@ const SftpConnState = struct {
     client: sftp_client_mod.SftpClient,
 };
 
+/// Connect a TCP stream to host:port. `host` may be an IP literal OR a DNS
+/// name — IpAddress.resolve parses literals only (it does NOT do DNS), so a
+/// hostname must go through HostName.connect (which does the lookup +
+/// happy-eyeballs). This is the single dial seam for every protocol.
 fn dialTcp(
     io: std.Io,
     diag: *Diagnostics,
     host: []const u8,
     port: u16,
 ) vfs_mod.Error!std.Io.net.Stream {
-    const addr = std.Io.net.IpAddress.resolve(io, host, port) catch {
-        diag.set(.transient, 0, "could not resolve {s}", .{host});
-        return error.Unexpected;
-    };
-    return addr.connect(io, .{ .mode = .stream }) catch {
-        diag.set(.transient, 0, "could not connect to {s}:{d}", .{ host, port });
-        return error.ConnectionLost;
-    };
+    if (std.Io.net.IpAddress.resolve(io, host, port)) |addr| {
+        return addr.connect(io, .{ .mode = .stream }) catch {
+            diag.set(.transient, 0, "could not connect to {s}:{d}", .{ host, port });
+            return error.ConnectionLost;
+        };
+    } else |_| {
+        const name = std.Io.net.HostName.init(host) catch {
+            diag.set(.transient, 0, "invalid host name {s}", .{host});
+            return error.Unexpected;
+        };
+        return name.connect(io, port, .{ .mode = .stream }) catch {
+            diag.set(.transient, 0, "could not resolve/connect {s}:{d}", .{ host, port });
+            return error.ConnectionLost;
+        };
+    }
 }
 
 /// Builds the transport chain per the plan and returns the fd the target
@@ -905,14 +916,7 @@ fn dialFtp(
     const tls: ?tls_provider_mod.TlsProvider =
         if (site.protocol == .ftps) try state.tlsFor(diag) else null;
 
-    const addr = std.Io.net.IpAddress.resolve(io, site.host, site.port) catch {
-        diag.set(.transient, 0, "could not resolve {s}", .{site.host});
-        return error.Unexpected;
-    };
-    const stream = addr.connect(io, .{ .mode = .stream }) catch {
-        diag.set(.transient, 0, "could not connect to {s}:{d}", .{ site.host, site.port });
-        return error.ConnectionLost;
-    };
+    const stream = try dialTcp(io, diag, site.host, site.port);
     var stream_owned = true;
     defer if (stream_owned) stream.close(io);
 
@@ -1000,13 +1004,24 @@ fn dataDial(
         diag.set(.cancel, 0, "data connection dial canceled", .{});
         return error.Canceled;
     };
-    const addr = std.Io.net.IpAddress.resolve(io, host, port) catch {
-        diag.set(.transient, 0, "could not resolve data host {s}", .{host});
-        return error.ConnectionRefused;
-    };
-    const stream = addr.connect(io, .{ .mode = .stream }) catch {
-        diag.set(.transient, 0, "could not open the data connection to {s}:{d}", .{ host, port });
-        return error.ConnectionRefused;
+    // host is usually a PASV IP literal, but EPSV dials the control host,
+    // which may be a DNS name — handle both (IpAddress.resolve is literal-only).
+    const stream = blk: {
+        if (std.Io.net.IpAddress.resolve(io, host, port)) |addr| {
+            break :blk addr.connect(io, .{ .mode = .stream }) catch {
+                diag.set(.transient, 0, "could not open the data connection to {s}:{d}", .{ host, port });
+                return error.ConnectionRefused;
+            };
+        } else |_| {
+            const name = std.Io.net.HostName.init(host) catch {
+                diag.set(.transient, 0, "invalid data host {s}", .{host});
+                return error.ConnectionRefused;
+            };
+            break :blk name.connect(io, port, .{ .mode = .stream }) catch {
+                diag.set(.transient, 0, "could not open the data connection to {s}:{d}", .{ host, port });
+                return error.ConnectionRefused;
+            };
+        }
     };
     const data = factories.gpa.create(DataState) catch {
         stream.close(io);

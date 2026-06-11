@@ -102,6 +102,19 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| integration_run.addArgs(args);
     b.step("integration", "Run the live Docker integration suite").dependOn(&integration_run.step);
 
+    // Headless FTP/FTPS probe against a real server (diagnostics).
+    const ftp_probe_mod = b.createModule(.{
+        .root_source_file = b.path("src/spikes/ftp_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "relay_core", .module = core_mod }},
+    });
+    const ftp_probe_exe = b.addExecutable(.{ .name = "ftp-probe", .root_module = ftp_probe_mod });
+    const ftp_probe_run = b.addRunArtifact(ftp_probe_exe);
+    if (b.args) |args| ftp_probe_run.addArgs(args);
+    b.step("ftp-probe", "Probe a real FTP/FTPS server").dependOn(&ftp_probe_run.step);
+
     // ------------------------------------------------------------------
     // macOS-only: relay_mac module, the Relay app bundle, and the UI spike.
     // ------------------------------------------------------------------

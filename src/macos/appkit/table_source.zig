@@ -696,6 +696,8 @@ fn cellIsFlipped(_: c.id, _: c.SEL) callconv(.c) c.BOOL {
 
 const NSFontAttributeName = @extern(*const c.id, .{ .name = "NSFontAttributeName" });
 const NSForegroundColorAttributeName = @extern(*const c.id, .{ .name = "NSForegroundColorAttributeName" });
+const NSParagraphStyleAttributeName = @extern(*const c.id, .{ .name = "NSParagraphStyleAttributeName" });
+const line_break_truncating_tail: NSInteger = 4; // NSLineBreakByTruncatingTail
 
 const h_pad: f64 = 8;
 const icon_text_gap: f64 = 6;
@@ -775,18 +777,32 @@ fn cellDrawRect(target: c.id, _: c.SEL, _: NSRect) callconv(.c) void {
         getClass("NSFont").msgSend(objc.Object, "systemFontOfSize:", .{tv.density.fontSize()});
 
     const color = textColorForCell(self);
+
+    // Tail-truncating paragraph style so a long name gets an ellipsis and
+    // is CLIPPED to its column instead of overflowing into the next one
+    // (NSView does not clip drawing to bounds by default).
+    const para = getClass("NSMutableParagraphStyle").msgSend(objc.Object, "alloc", .{})
+        .msgSend(objc.Object, "init", .{});
+    defer para.msgSend(void, "release", .{});
+    para.msgSend(void, "setLineBreakMode:", .{line_break_truncating_tail});
+    para.msgSend(void, "setAlignment:", .{@as(NSInteger, switch (spec.alignment) {
+        .left => 0, // NSTextAlignmentLeft
+        .right => 1, // NSTextAlignmentRight
+        .center => 2, // NSTextAlignmentCenter
+    })});
+
     const attrs = getClass("NSMutableDictionary").msgSend(objc.Object, "dictionary", .{});
     attrs.msgSend(void, "setObject:forKey:", .{ font.value, NSFontAttributeName.* });
     attrs.msgSend(void, "setObject:forKey:", .{ color.value, NSForegroundColorAttributeName.* });
+    attrs.msgSend(void, "setObject:forKey:", .{ para.value, NSParagraphStyleAttributeName.* });
 
     const size = str.msgSend(NSSize, "sizeWithAttributes:", .{attrs});
-    const x = switch (spec.alignment) {
-        .left => text_x,
-        .right => @max(text_x, bounds.size.width - h_pad - size.width),
-        .center => @max(text_x, (bounds.size.width - size.width) / 2),
-    };
+    // Content rect: between the icon/leading pad and the trailing pad,
+    // vertically centered. drawInRect clips and truncates to this width.
+    const avail_w = @max(0, bounds.size.width - text_x - h_pad);
     const y = (bounds.size.height - size.height) / 2;
-    str.msgSend(void, "drawAtPoint:withAttributes:", .{ NSPoint{ .x = x, .y = y }, attrs });
+    const text_rect = rect(text_x, y, avail_w, size.height);
+    str.msgSend(void, "drawInRect:withAttributes:", .{ text_rect, attrs });
 }
 
 /// labelColor normally; alternateSelectedControlTextColor when the enclosing

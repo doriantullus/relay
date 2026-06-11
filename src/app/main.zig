@@ -202,6 +202,11 @@ fn onWillTerminate(_: ?*anyopaque) void {
 /// Quit-time snapshot for ui.zon (M3 state restoration). Remote sites are
 /// recorded only when they are persisted (saved sites) — ephemeral
 /// quick-connect ids are meaningless across runs.
+///
+/// Ownership: the returned .tabs slice is gpa-owned (caller frees), but the
+/// path strings inside it are BORROWED from live pane arenas — the caller
+/// must hand the snapshot to setSessionState (which dupes them) before any
+/// pane teardown, and must not free the strings.
 fn captureSessionState() prefs_mod.SessionState {
     const active_browser = activeBrowser();
     var session: prefs_mod.SessionState = .{
@@ -358,6 +363,10 @@ fn buildUi() !void {
     const first_browser = try browser_mod.BrowserController.create(gpa, core, g_ui.win, browser_options);
     // TabsController adopts first_browser; don't destroy it separately.
     g_ui.tabs = try tabs_mod.TabsController.create(gpa, core, g_ui.win, first_browser);
+    // Every newTab (Cmd+T, "+" button, session restore) wires the app seams;
+    // the "+" button routes through cmdNewTab so it picks up current prefs.
+    g_ui.tabs.on_tab_created = setBrowserHooks;
+    g_ui.tabs.on_new_request = newTabRequest;
 
     g_ui.transfers = try transfers_mod.TransfersController.create(gpa, core);
 
@@ -534,7 +543,8 @@ fn restoreSession(session: prefs_mod.SessionState) void {
 
     if (session.tabs.len > 0) {
         // Phase B: restore all tabs. Tab 0 was already created at buildUi
-        // time (with its local path). Additional tabs get created here.
+        // time (with its local path). Additional tabs get created here
+        // (hook wiring rides on_tab_created inside newTab).
         for (session.tabs[1..]) |tab_state| {
             const local: ?[]const u8 = if (tab_state.pane0_site == item_mod.local_site_id and
                 tab_state.pane0_path.len > 0 and localDirExists(tab_state.pane0_path))
@@ -542,22 +552,29 @@ fn restoreSession(session: prefs_mod.SessionState) void {
             else
                 null;
             g_ui.tabs.newTab(.{ .initial_local_path = local }) catch continue;
-            setBrowserHooks(activeBrowser());
         }
-        // Select the saved active tab.
-        const active = if (session.active_tab < g_ui.tabs.tabs.items.len)
-            session.active_tab
-        else
-            0;
-        g_ui.tabs.selectTab(active);
-        // Reconnect remote panes (gated on the pref).
+        // Reconnect remote panes (gated on the pref). connectAndList targets
+        // the ACTIVE tab's focused pane (pane_host.activeToken), so each
+        // tab is selected while its reconnects are issued; the resulting
+        // events route by pane token, immune to later tab switches.
         if (reconnect) {
             for (session.tabs, 0..) |tab_state, i| {
+                // A newTab above may have failed (catch continue): never
+                // index past the tabs that actually exist.
+                if (i >= g_ui.tabs.tabs.items.len) break;
+                g_ui.tabs.selectTab(i);
                 const browser = g_ui.tabs.tabs.items[i].browser;
                 restorePaneSiteOnBrowser(browser, 0, tab_state.pane0_site, tab_state.pane0_path);
                 restorePaneSiteOnBrowser(browser, 1, tab_state.pane1_site, tab_state.pane1_path);
             }
         }
+        // Select the saved active tab (after the reconnect pass — it walks
+        // the tabs via selectTab).
+        const active = if (session.active_tab < g_ui.tabs.tabs.items.len)
+            session.active_tab
+        else
+            0;
+        g_ui.tabs.selectTab(active);
     } else {
         // Legacy: single-tab session from before Phase B.
         if (reconnect) {
@@ -788,7 +805,7 @@ fn paneSelection(
 fn revealInPane(_: ?*anyopaque, site_id: u64, dir: []const u8) void {
     // Either pane can host either role (active-pane connects): reveal in
     // whichever pane currently shows the item's site. Check the active tab
-    // first, then other tabs.
+    // first, then other tabs (switching to the first that matches).
     const browser = activeBrowser();
     for (browser.panes, 0..) |pane, i| {
         const pane_site = pane.site orelse continue;
@@ -797,6 +814,18 @@ fn revealInPane(_: ?*anyopaque, site_id: u64, dir: []const u8) void {
         pane.navigateTo(dir, .push);
         browser.focusPane(@intCast(i));
         return;
+    }
+    for (g_ui.tabs.tabs.items, 0..) |tab, ti| {
+        if (tab.browser == browser) continue;
+        for (tab.browser.panes, 0..) |pane, pi| {
+            const pane_site = pane.site orelse continue;
+            if (pane_site != site_id) continue;
+            if (site_id == item_mod.local_site_id and pane.role != .local) continue;
+            g_ui.tabs.selectTab(ti);
+            pane.navigateTo(dir, .push);
+            tab.browser.focusPane(@intCast(pi));
+            return;
+        }
     }
 }
 
@@ -867,7 +896,10 @@ fn cmdNewTab(_: ?*anyopaque) void {
         .monospace_lists = ui_prefs.monospace_lists,
         .vim_mode = ui_prefs.vim_mode,
     }) catch {};
-    setBrowserHooks(activeBrowser());
+}
+/// TabBar "+" button → the same path as Cmd+T (current prefs included).
+fn newTabRequest() void {
+    cmdNewTab(null);
 }
 fn cmdCloseTab(_: ?*anyopaque) void {
     if (!g_ui.tabs.closeActiveTab()) {

@@ -55,6 +55,14 @@ pub const TabsController = struct {
     bar: *tab_bar_mod.TabBar,
     /// Borrowed reference to the sites store for title derivation.
     sites_store: ?*sites_mod_ctrl.SiteStore = null,
+    /// App-level hook wiring (selection/visit/space/context-menu) for every
+    /// browser this controller creates. newTab calls it so tabs opened from
+    /// the strip's "+" button get the same seams as Cmd+T tabs.
+    on_tab_created: ?*const fn (*BrowserController) void = null,
+    /// New-tab request from the strip's "+" button. Routed back to the app
+    /// (the same path as Cmd+T) so the new browser gets the CURRENT prefs
+    /// (density, date format, vim mode…) — TabsController doesn't know them.
+    on_new_request: ?*const fn () void = null,
 
     // ------------------------------------------------------------------ //
     // Lifecycle
@@ -113,16 +121,13 @@ pub const TabsController = struct {
         return self;
     }
 
-    /// Tear down: unregisters the listener. Each browser was either detached
-    /// via closeTab (which called unregisterListeners + destroy for it) or is
-    /// the surviving first tab — destroy it here.
+    /// Tear down every surviving browser (tests/teardown paths only — the
+    /// app quit path never calls this; the process exits after
+    /// AppCore.shutdown()). MUST run while the core is alive: the body
+    /// calls core.unregisterListeners, which asserts !shutdown_done. The
+    /// caller is responsible for core.unregisterListeners(self) for the
+    /// site_status listener registered in create().
     pub fn destroy(self: *TabsController) void {
-        // The site_status listener for TabsController itself is cleaned up by
-        // AppCore.shutdown() (app quit path) or the caller must have called
-        // core.unregisterListeners(self) before destroy() on the tab-close
-        // path — but TabsController itself isn't closed mid-run; it lives
-        // for the app lifetime. We don't unregister here because shutdown()
-        // will do it.
         for (self.tabs.items) |tab| {
             self.core.unregisterListeners(tab.browser);
             tab.browser.destroy();
@@ -152,6 +157,7 @@ pub const TabsController = struct {
             browser.destroy();
         }
         try self.tabs.append(self.gpa, .{ .browser = browser });
+        if (self.on_tab_created) |hook| hook(browser);
         self.active = self.tabs.items.len - 1;
         self.swapViewIn(browser);
         self.bar.setHidden(false);
@@ -174,11 +180,10 @@ pub const TabsController = struct {
         tab.browser.destroy();
         _ = self.tabs.orderedRemove(index);
 
-        // Clamp active index.
-        if (self.active >= self.tabs.items.len) {
-            self.active = self.tabs.items.len - 1;
-        }
-        // If we closed the active tab, swap in the new active tab.
+        self.active = activeAfterClose(self.active, index, self.tabs.items.len);
+        // Re-swap unconditionally: closing the active tab needs the new
+        // active view in; closing a background tab makes this a no-op
+        // re-add of the already-displayed view.
         self.swapViewIn(self.tabs.items[self.active].browser);
         if (self.tabs.items.len == 1) self.bar.setHidden(true);
         self.refreshTitles() catch {};
@@ -297,7 +302,12 @@ pub const TabsController = struct {
 
     fn tabBarOnNew(ctx: *anyopaque) void {
         const self: *TabsController = @ptrCast(@alignCast(ctx));
-        // New tab: local $HOME, unbound remote.
+        // Route through the app so the tab gets current prefs; the direct
+        // fallback (default options) only serves headless tests.
+        if (self.on_new_request) |request| {
+            request();
+            return;
+        }
         self.newTab(.{}) catch {};
     }
 };
@@ -317,10 +327,38 @@ fn paneLabel(store: ?*sites_mod_ctrl.SiteStore, pane: *browser_mod.BrowserPane) 
 }
 
 // ---------------------------------------------------------------------------
+// Index helpers
+// ---------------------------------------------------------------------------
+
+/// Active index after removing `closed` from a list now `new_len` long
+/// (new_len >= 1). Tabs right of the closed one shift left, so an active
+/// index past the closed slot moves with them; closing the active tab
+/// selects its right neighbor (or the new last tab when it was last).
+fn activeAfterClose(active: usize, closed: usize, new_len: usize) usize {
+    var a = active;
+    if (closed < a) a -= 1;
+    if (a >= new_len) a = new_len - 1;
+    return a;
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 const testing = std.testing;
 
 test {
     testing.refAllDecls(@This());
+}
+
+test "activeAfterClose keeps the displayed tab stable" {
+    // [A,B,C] showing B(1): closing A(0) shifts B to 0.
+    try testing.expectEqual(@as(usize, 0), activeAfterClose(1, 0, 2));
+    // [A,B,C] showing B(1): closing C(2) leaves B at 1.
+    try testing.expectEqual(@as(usize, 1), activeAfterClose(1, 2, 2));
+    // [A,B,C] showing B(1): closing B selects its right neighbor (C, now 1).
+    try testing.expectEqual(@as(usize, 1), activeAfterClose(1, 1, 2));
+    // [A,B] showing B(1): closing B (last) selects the new last tab (A).
+    try testing.expectEqual(@as(usize, 0), activeAfterClose(1, 1, 1));
+    // [A,B] showing A(0): closing B leaves A displayed.
+    try testing.expectEqual(@as(usize, 0), activeAfterClose(0, 1, 1));
 }

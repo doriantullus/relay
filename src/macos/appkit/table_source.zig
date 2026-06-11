@@ -196,6 +196,7 @@ var g_table_state_ivar: c.Ivar = null;
 var g_cell_state_ivar: c.Ivar = null;
 var g_cell_row_ivar: c.Ivar = null;
 var g_cell_col_ivar: c.Ivar = null;
+var g_cell_bg_ivar: c.Ivar = null;
 
 const state_ivar_name = "relayState";
 
@@ -262,18 +263,25 @@ pub fn ensureClasses() void {
 
     // Custom-drawn cell view (one class for every column).
     {
-        const cls = objc.allocateClassPair(getClass("NSView"), "RelayTableCellView") orelse
+        // NSTableCellView (not bare NSView): the table sets backgroundStyle
+        // on it when row selection changes, which is how the cell learns to
+        // redraw its text in the selected vs normal color.
+        const cls = objc.allocateClassPair(getClass("NSTableCellView"), "RelayTableCellView") orelse
             @panic("allocateClassPair(RelayTableCellView)");
         if (!cls.addIvar(state_ivar_name)) @panic("addIvar(RelayTableCellView)");
         if (!cls.addIvar("relayRow")) @panic("addIvar(relayRow)");
         if (!cls.addIvar("relayCol")) @panic("addIvar(relayCol)");
+        if (!cls.addIvar("relayBg")) @panic("addIvar(relayBg)");
         if (!cls.addMethod("drawRect:", cellDrawRect)) @panic("addMethod(drawRect:)");
         if (!cls.addMethod("isFlipped", cellIsFlipped)) @panic("addMethod(isFlipped)");
+        if (!cls.addMethod("setBackgroundStyle:", cellSetBackgroundStyle))
+            @panic("addMethod(setBackgroundStyle:)");
         objc.registerClassPair(cls);
         g_cell_state_ivar = c.class_getInstanceVariable(cls.value, state_ivar_name);
         g_cell_row_ivar = c.class_getInstanceVariable(cls.value, "relayRow");
         g_cell_col_ivar = c.class_getInstanceVariable(cls.value, "relayCol");
-        if (g_cell_state_ivar == null or g_cell_row_ivar == null or g_cell_col_ivar == null)
+        g_cell_bg_ivar = c.class_getInstanceVariable(cls.value, "relayBg");
+        if (g_cell_state_ivar == null or g_cell_row_ivar == null or g_cell_col_ivar == null or g_cell_bg_ivar == null)
             @panic("ivar lookup (RelayTableCellView)");
         g_cell_class = cls;
     }
@@ -694,6 +702,16 @@ fn cellIsFlipped(_: c.id, _: c.SEL) callconv(.c) c.BOOL {
     return 1;
 }
 
+/// NSTableView sets this when row selection/emphasis changes. We store it
+/// and force a redraw so the custom-drawn text switches between the normal
+/// and selected color — without this, deselecting a row leaves stale
+/// (white) text on the now-white background, i.e. the row goes blank.
+fn cellSetBackgroundStyle(target: c.id, _: c.SEL, style: NSInteger) callconv(.c) void {
+    const v: usize = if (style < 0) 0 else @intCast(style);
+    c.object_setIvar(target, g_cell_bg_ivar, indexToIvar(v));
+    objc.Object.fromId(target).msgSend(void, "setNeedsDisplay:", .{true});
+}
+
 const NSFontAttributeName = @extern(*const c.id, .{ .name = "NSFontAttributeName" });
 const NSForegroundColorAttributeName = @extern(*const c.id, .{ .name = "NSForegroundColorAttributeName" });
 const NSParagraphStyleAttributeName = @extern(*const c.id, .{ .name = "NSParagraphStyleAttributeName" });
@@ -808,16 +826,12 @@ fn cellDrawRect(target: c.id, _: c.SEL, _: NSRect) callconv(.c) void {
 /// labelColor normally; alternateSelectedControlTextColor when the enclosing
 /// row is selected with the emphasized (accent) highlight. Semantic only.
 fn textColorForCell(cell: objc.Object) objc.Object {
-    const row_view = cell.msgSend(objc.Object, "superview", .{});
-    if (row_view.value != null) {
-        const responds = row_view.msgSend(c.BOOL, "respondsToSelector:", .{objc.sel("isSelected")});
-        if (responds != 0) {
-            const selected = row_view.msgSend(c.BOOL, "isSelected", .{}) != 0;
-            const emphasized = row_view.msgSend(c.BOOL, "isEmphasized", .{}) != 0;
-            if (selected and emphasized)
-                return getClass("NSColor").msgSend(objc.Object, "alternateSelectedControlTextColor", .{});
-        }
-    }
+    // NSBackgroundStyleEmphasized (1) = selected in a key table → white
+    // text; anything else (normal, or selected-but-inactive) → labelColor,
+    // which reads correctly on both white and the inactive gray highlight.
+    const style = readIndexIvar(cell.value, g_cell_bg_ivar) orelse 0;
+    if (style == 1)
+        return getClass("NSColor").msgSend(objc.Object, "alternateSelectedControlTextColor", .{});
     return getClass("NSColor").msgSend(objc.Object, "labelColor", .{});
 }
 

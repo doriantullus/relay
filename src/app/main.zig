@@ -161,6 +161,13 @@ fn onDidBecomeActive(_: ?*anyopaque) void {
     if (g_ui_built) g_ui.sites.refreshSshConfigIfChanged();
 }
 
+/// Foreground predicate for the transfers controller's background-only
+/// failure notifications. The selector lives in the relay_mac wrapper
+/// (windowkit.App.isActive) per the macOS-layer law; main only forwards.
+fn appIsForeground(_: ?*anyopaque) bool {
+    return windowkit.App.shared().isActive();
+}
+
 /// Runs inside applicationShouldTerminate, BEFORE the core teardown.
 fn onWillTerminate(_: ?*anyopaque) void {
     // [NSApp terminate:] is silently swallowed while an NSAlert sheet is
@@ -383,7 +390,14 @@ fn buildUi() !void {
 
     g_ui.notifier = try notifications.Notifier.create(gpa);
     try g_ui.notifier.attach(core);
-    if (g_mode == .normal) g_ui.notifier.requestAuthorization();
+    // Background-only transfer-failure notifications: the transfers
+    // controller coalesces a per-drain burst and posts via this notifier,
+    // gated on NSApplication.isActive (foreground = silent; the Failed tab
+    // covers it). Wired only in the real app (smoke modes stay quiet).
+    if (g_mode == .normal) {
+        g_ui.notifier.requestAuthorization();
+        g_ui.transfers.attachFailureNotifier(g_ui.notifier, null, appIsForeground);
+    }
 
     if (g_mode == .normal) {
         // Production FTP/FTPS/SFTP connect factories: known_hosts + prompt

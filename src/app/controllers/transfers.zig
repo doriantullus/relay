@@ -395,6 +395,149 @@ pub const QueueModel = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Background transfer-failure notifications (coalesced per drain)
+// ---------------------------------------------------------------------------
+//
+// When a transfer transitions to `.failed` while Relay is in the BACKGROUND,
+// surface it as a UNUserNotification ("Transfer failed", "<name>: <reason>").
+// Foreground transitions stay silent — the Failed tab already shows them.
+//
+// Coalescing: all `.transfer_state` events of one bridge drain are dispatched
+// back-to-back synchronously (bridge.drainOnMain), so failures are recorded
+// into `pending` during the drain and flushed once, on the next main-queue
+// turn (a single `mainQueueAsync` scheduled per burst). A burst of N>1
+// background failures yields ONE summary ("N transfers failed") instead of N
+// banners. The (1 vs N) decision and the foreground-suppression gate are the
+// pure `Plan`/`shouldNotify` seams below, headless-tested without AppKit.
+
+/// Cap on retained failure text per coalesced burst (one notification body).
+pub const notify_name_cap = 200;
+pub const notify_reason_cap = 256;
+
+/// What the notifier will post for a flushed burst. `none` = nothing (no
+/// failures, or every failure was foreground). Pure result of `plan`.
+pub const NotifyPlan = union(enum) {
+    none,
+    /// Exactly one background failure: "<name>: <reason>".
+    single: struct { name: []const u8, reason: []const u8 },
+    /// N>1 background failures collapsed into "N transfers failed".
+    summary: struct { count: u32 },
+};
+
+/// Foreground-suppression predicate (pure seam): notify only in the
+/// background. `active` is NSApplication.isActive at flush time.
+pub fn shouldNotify(active: bool) bool {
+    return !active;
+}
+
+/// Decide the burst notification from the count of BACKGROUND failures
+/// recorded this drain and the first one's text. Pure; the heart of the
+/// 1-vs-N coalescing rule.
+pub fn plan(count: u32, first_name: []const u8, first_reason: []const u8) NotifyPlan {
+    return switch (count) {
+        0 => .none,
+        1 => .{ .single = .{ .name = first_name, .reason = first_reason } },
+        else => .{ .summary = .{ .count = count } },
+    };
+}
+
+/// Posts background transfer-failure notifications, coalescing a per-drain
+/// burst into a single banner. Owned by TransfersController.
+pub const FailureNotifier = struct {
+    /// Background-state predicate (NSApplication.isActive in production; a
+    /// fake in tests). `ctx` is opaque; null ctx is allowed.
+    active_ctx: ?*anyopaque = null,
+    active_fn: ?*const fn (?*anyopaque) bool = null,
+    /// UNUserNotificationCenter sink. Null = posting disabled (tests/headless
+    /// keep the coalescing logic observable via `flushed_*`).
+    notifier: ?*mac.notifications.Notifier = null,
+
+    /// Background failures recorded since the last flush.
+    pending: u32 = 0,
+    /// First background failure's text (the body when the burst is a single).
+    first_name_buf: [notify_name_cap]u8 = undefined,
+    first_name_len: usize = 0,
+    first_reason_buf: [notify_reason_cap]u8 = undefined,
+    first_reason_len: usize = 0,
+    /// A flush is already scheduled on the main queue (coalesce the burst).
+    flush_scheduled: bool = false,
+
+    /// Test observability: the last plan handed to `deliver` and a counter.
+    last_plan: NotifyPlan = .none,
+    flush_count: u32 = 0,
+
+    /// Record a `.failed` transition. `active` is the live foreground state;
+    /// foreground failures are dropped here (never reach a notification).
+    /// `schedule` flushes the burst on a later main-queue turn (null in
+    /// headless tests, which call `flush` directly). Returns true if this
+    /// failure was retained (background) — for tests.
+    pub fn recordFailure(
+        self: *FailureNotifier,
+        active: bool,
+        name: []const u8,
+        reason: []const u8,
+        comptime schedule: ?fn (*FailureNotifier) void,
+    ) bool {
+        if (!shouldNotify(active)) return false;
+        if (self.pending == 0) {
+            self.first_name_len = copyClamp(&self.first_name_buf, name);
+            self.first_reason_len = copyClamp(&self.first_reason_buf, reason);
+        }
+        self.pending += 1;
+        if (schedule) |s| {
+            if (!self.flush_scheduled) {
+                self.flush_scheduled = true;
+                s(self);
+            }
+        }
+        return true;
+    }
+
+    /// Emit the coalesced burst (1 → single, N → summary), then reset.
+    /// Re-checks foreground at flush time: if Relay came forward between the
+    /// drain and this turn, the user is already looking — stay silent.
+    pub fn flush(self: *FailureNotifier) void {
+        self.flush_scheduled = false;
+        const count = self.pending;
+        self.pending = 0;
+        const decided = if (self.appIsActive())
+            NotifyPlan.none
+        else
+            plan(count, self.first_name_buf[0..self.first_name_len], self.first_reason_buf[0..self.first_reason_len]);
+        self.last_plan = decided;
+        self.flush_count += 1;
+        self.deliver(decided);
+    }
+
+    fn appIsActive(self: *FailureNotifier) bool {
+        const f = self.active_fn orelse return false;
+        return f(self.active_ctx);
+    }
+
+    fn deliver(self: *FailureNotifier, decided: NotifyPlan) void {
+        const n = self.notifier orelse return;
+        var body_buf: [notify_name_cap + notify_reason_cap + 4]u8 = undefined;
+        switch (decided) {
+            .none => {},
+            .single => |s| {
+                const body = std.fmt.bufPrint(&body_buf, "{s}: {s}", .{ s.name, s.reason }) catch s.reason;
+                n.post("Transfer failed", body, "us.doriantull.relay.transfer-failed");
+            },
+            .summary => |s| {
+                const body = std.fmt.bufPrint(&body_buf, "{d} transfers failed", .{s.count}) catch "Transfers failed";
+                n.post("Transfers failed", body, "us.doriantull.relay.transfer-failed");
+            },
+        }
+    }
+
+    fn copyClamp(buf: []u8, src: []const u8) usize {
+        const n = @min(src.len, buf.len);
+        @memcpy(buf[0..n], src[0..n]);
+        return n;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Controller
 // ---------------------------------------------------------------------------
 
@@ -483,6 +626,10 @@ pub const TransfersController = struct {
     last_failed_count: usize = std.math.maxInt(usize),
     header_cache: [160]u8 = undefined,
     header_cache_len: usize = 0,
+
+    /// Background transfer-failure notifications (coalesced per drain). Inert
+    /// until main.zig calls `attachFailureNotifier`.
+    fail_notifier: FailureNotifier = .{},
 
     // Reveal-in-pane hook (browser controller wires this in phase 3).
     reveal_ctx: ?*anyopaque = null,
@@ -878,14 +1025,41 @@ pub const TransfersController = struct {
             }
         }
         if (self.model.applyState(e.item_id, e.state, e.failure)) |idx| {
+            if (e.state == .failed) {
+                const row = &self.model.rows.items[idx];
+                self.recordFailure(row.name(), failureReason(e.failure, row.failureMessage()));
+            }
             self.queue_table.reloadRange(idx, 1);
         } else {
             // Unknown id: queue membership changed (enqueue, folder child,
             // restore) — the engine queue is truth.
+            if (e.state == .failed) self.recordFailure("Transfer", failureReason(e.failure, ""));
             self.refreshFromEngine();
         }
         self.refreshFailedUi();
         self.updateAggregateLabel();
+    }
+
+    /// Feed a `.failed` transition into the background notifier with the live
+    /// foreground state; coalescing + posting happen there.
+    fn recordFailure(self: *TransfersController, name: []const u8, reason: []const u8) void {
+        const active = self.fail_notifier.appIsActive();
+        _ = self.fail_notifier.recordFailure(active, name, reason, scheduleFlush);
+    }
+
+    /// main.zig wiring: attach the UNUserNotificationCenter sink + the
+    /// foreground predicate (production: NSApplication.isActive). Without
+    /// this the notifier is inert (no posts), which is correct for headless
+    /// runs and the --smoke path.
+    pub fn attachFailureNotifier(
+        self: *TransfersController,
+        notifier: *mac.notifications.Notifier,
+        active_ctx: ?*anyopaque,
+        active_fn: *const fn (?*anyopaque) bool,
+    ) void {
+        self.fail_notifier.notifier = notifier;
+        self.fail_notifier.active_ctx = active_ctx;
+        self.fail_notifier.active_fn = active_fn;
     }
 
     fn onTransferProgress(self: *TransfersController, e: events_mod.CoreEvent.TransferProgress) void {
@@ -1048,6 +1222,22 @@ pub const TransfersController = struct {
         f(self.reveal_ctx, endpoint.site_id, path_mod.parent(endpoint.path) orelse "/");
     }
 };
+
+/// Failure body text: the classified Diagnostics message if present (event
+/// payload preferred, else the row's stored copy), falling back to a generic
+/// line so a notification is never empty.
+fn failureReason(failure: ?events_mod.Failure, fallback: []const u8) []const u8 {
+    if (failure) |f| if (f.message.len > 0) return f.message;
+    if (fallback.len > 0) return fallback;
+    return "Transfer failed";
+}
+
+/// Coalesced-burst flush: deferred to the next main-queue turn so every
+/// `.failed` of the current drain is recorded first (one notification per
+/// burst). Main thread only.
+fn scheduleFlush(fn_self: *FailureNotifier) void {
+    mac.dispatch.mainQueueAsync(fn_self, FailureNotifier.flush);
+}
 
 // --- target class IMPs --------------------------------------------------------
 
@@ -1555,6 +1745,132 @@ test "applyGlobalRateLimit persists settings and retunes the engine buckets" {
     applyGlobalRateLimit(core, .download, 0);
     try testing.expectEqual(@as(u64, 0), core.engine.global_down.rate);
     try testing.expectEqual(@as(u64, 0), core.settings.rate_limit_down);
+}
+
+// --- background transfer-failure notifications (pure coalescing) ----------
+
+test "shouldNotify gates on foreground" {
+    try testing.expect(shouldNotify(false)); // background → notify
+    try testing.expect(!shouldNotify(true)); // foreground → silent
+}
+
+test "plan collapses 1 vs N" {
+    try testing.expectEqual(NotifyPlan.none, plan(0, "a", "b"));
+    const one = plan(1, "report.csv", "550 denied");
+    try testing.expectEqualStrings("report.csv", one.single.name);
+    try testing.expectEqualStrings("550 denied", one.single.reason);
+    try testing.expectEqual(@as(u32, 3), plan(3, "x", "y").summary.count);
+}
+
+test "failureReason prefers the payload message, then the row copy, then a default" {
+    try testing.expectEqualStrings(
+        "421 timeout",
+        failureReason(.{ .class = .transient, .message = "421 timeout" }, "stale"),
+    );
+    // Empty payload message → fall back to the row's stored text.
+    try testing.expectEqualStrings("row text", failureReason(.{ .class = .permanent, .message = "" }, "row text"));
+    try testing.expectEqualStrings("row text", failureReason(null, "row text"));
+    // Nothing usable anywhere → a non-empty default (never an empty body).
+    try testing.expectEqualStrings("Transfer failed", failureReason(null, ""));
+}
+
+const ActiveProbe = struct {
+    active: bool,
+    fn get(ctx: ?*anyopaque) bool {
+        return @as(*const ActiveProbe, @ptrCast(@alignCast(ctx.?))).active;
+    }
+};
+
+test "FailureNotifier: foreground failures are dropped, never coalesced" {
+    var probe = ActiveProbe{ .active = true }; // app is frontmost
+    var n = FailureNotifier{ .active_ctx = &probe, .active_fn = ActiveProbe.get };
+
+    // No `schedule` (null) — drive the flush by hand, as the headless seam.
+    try testing.expect(!n.recordFailure(true, "a.bin", "boom", null));
+    try testing.expect(!n.recordFailure(true, "b.bin", "boom", null));
+    try testing.expectEqual(@as(u32, 0), n.pending);
+    n.flush();
+    try testing.expectEqual(NotifyPlan.none, n.last_plan);
+}
+
+test "FailureNotifier: one background failure flushes as a single" {
+    var probe = ActiveProbe{ .active = false };
+    var n = FailureNotifier{ .active_ctx = &probe, .active_fn = ActiveProbe.get };
+
+    try testing.expect(n.recordFailure(false, "logs.tar.gz", "550 Permission denied", null));
+    try testing.expectEqual(@as(u32, 1), n.pending);
+    n.flush();
+    try testing.expectEqualStrings("logs.tar.gz", n.last_plan.single.name);
+    try testing.expectEqualStrings("550 Permission denied", n.last_plan.single.reason);
+    try testing.expectEqual(@as(u32, 0), n.pending); // reset after flush
+    try testing.expect(!n.flush_scheduled);
+}
+
+test "FailureNotifier: a burst of N background failures coalesces into one summary" {
+    var probe = ActiveProbe{ .active = false };
+    var n = FailureNotifier{ .active_ctx = &probe, .active_fn = ActiveProbe.get };
+
+    // Same-drain burst: 4 failures recorded before any flush.
+    try testing.expect(n.recordFailure(false, "1", "x", null));
+    try testing.expect(n.recordFailure(false, "2", "y", null));
+    try testing.expect(n.recordFailure(false, "3", "z", null));
+    try testing.expect(n.recordFailure(false, "4", "w", null));
+    try testing.expectEqual(@as(u32, 4), n.pending);
+    n.flush();
+    try testing.expectEqual(@as(u32, 4), n.last_plan.summary.count);
+    try testing.expectEqual(@as(u32, 1), n.flush_count); // ONE notification
+
+    // Next burst starts clean.
+    try testing.expect(n.recordFailure(false, "5", "v", null));
+    n.flush();
+    try testing.expectEqualStrings("5", n.last_plan.single.name);
+}
+
+test "FailureNotifier: schedule fires once per burst (coalesced)" {
+    const Sched = struct {
+        var calls: u32 = 0;
+        fn hit(_: *FailureNotifier) void {
+            calls += 1;
+        }
+    };
+    var probe = ActiveProbe{ .active = false };
+    var n = FailureNotifier{ .active_ctx = &probe, .active_fn = ActiveProbe.get };
+
+    Sched.calls = 0;
+    _ = n.recordFailure(false, "a", "1", Sched.hit);
+    _ = n.recordFailure(false, "b", "2", Sched.hit);
+    _ = n.recordFailure(false, "c", "3", Sched.hit);
+    try testing.expectEqual(@as(u32, 1), Sched.calls); // one flush scheduled
+    try testing.expect(n.flush_scheduled);
+
+    n.flush(); // clears the latch
+    try testing.expect(!n.flush_scheduled);
+    _ = n.recordFailure(false, "d", "4", Sched.hit);
+    try testing.expectEqual(@as(u32, 2), Sched.calls); // next burst re-arms
+}
+
+test "FailureNotifier: app returning to foreground before flush suppresses the burst" {
+    var probe = ActiveProbe{ .active = false }; // background when recorded
+    var n = FailureNotifier{ .active_ctx = &probe, .active_fn = ActiveProbe.get };
+
+    _ = n.recordFailure(false, "a", "1", null);
+    _ = n.recordFailure(false, "b", "2", null);
+    probe.active = true; // user came forward between drain and flush
+    n.flush();
+    try testing.expectEqual(NotifyPlan.none, n.last_plan);
+    try testing.expectEqual(@as(u32, 0), n.pending);
+}
+
+test "FailureNotifier: name and reason are clamped to their caps" {
+    var probe = ActiveProbe{ .active = false };
+    var n = FailureNotifier{ .active_ctx = &probe, .active_fn = ActiveProbe.get };
+
+    const long_name = "n" ** (notify_name_cap + 40);
+    const long_reason = "r" ** (notify_reason_cap + 40);
+    _ = n.recordFailure(false, long_name, long_reason, null);
+    n.flush();
+    try testing.expectEqual(notify_name_cap, n.last_plan.single.name.len);
+    try testing.expectEqual(notify_reason_cap, n.last_plan.single.reason.len);
 }
 
 test "target class defines and round-trips state (headless)" {

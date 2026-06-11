@@ -57,6 +57,7 @@ const split_view = mac.appkit.split_view;
 const panels = mac.appkit.panels;
 const window_mod = mac.appkit.window;
 const drag = mac.appkit.drag;
+const banner_mod = mac.appkit.banner;
 
 const vfs_mod = relay.vfs.iface;
 const path_mod = relay.vfs.path;
@@ -968,6 +969,12 @@ pub const BrowserPane = struct {
     sync_label: objc.Object = undefined,
     /// 2pt per-site accent strip under the path bar (striped when prod).
     strip_view: objc.Object = undefined,
+    /// Inline, non-modal error/warning bar drawn ABOVE the file table. The
+    /// always-visible surface for async failures (connect refused/timeout,
+    /// the FTPS data-channel listing timeout, listing failures on the current
+    /// dir). Hidden (height 0) until shown; auto-clears on a successful
+    /// (re)list/connect or the user's dismiss "×".
+    banner: *banner_mod.Banner = undefined,
     table: *table_source.TableView = undefined,
 
     // Listing state.
@@ -1199,6 +1206,10 @@ pub const BrowserPane = struct {
                 pane.controller.stopSyncBrowsing("Sync stopped — folder missing in this pane");
                 return;
             }
+            // Surface on the inline banner so the reason persists visibly after
+            // the sheet is dismissed (auto-clears on the next successful list).
+            // The sheet still fires for immediate, in-context attention.
+            pane.showBanner(.@"error", failure.message);
             panels.presentErrorSheet(pane.controller.win, "Couldn't open folder", failure.message);
             return;
         }
@@ -1251,6 +1262,8 @@ pub const BrowserPane = struct {
         pane.clearCompareTints(); // entry indexes remapped; recompute below
         pane.vim_cursor = null;
         pane.vim_anchor = null;
+        // A successful (re)list of this pane retires any stale error banner.
+        pane.hideBanner();
         pane.rebuildVisible();
         pane.table.reloadData();
         pane.applyPendingAlpha();
@@ -1415,6 +1428,53 @@ pub const BrowserPane = struct {
             (pane.accent != .none or pane.env_prod);
         chrome.setHidden(pane.strip_view, !visible);
         chrome.setNeedsDisplay(pane.strip_view);
+    }
+
+    // ------------------------------------------------------------------ //
+    // Inline error banner (the always-visible async-failure surface)
+
+    /// Surface `message` on the pane's inline banner and reflow the table to
+    /// reserve banner_height. Empty messages are ignored (nothing to show).
+    fn showBanner(pane: *BrowserPane, kind: banner_mod.Kind, message: []const u8) void {
+        if (message.len == 0) return;
+        pane.banner.show(kind, message);
+        pane.layoutBannerArea();
+    }
+
+    /// Hide the banner (auto-clear on a successful (re)list/connect, or the
+    /// user's dismiss "×") and give the reclaimed strip back to the table.
+    fn hideBanner(pane: *BrowserPane) void {
+        if (!pane.banner.isVisible()) return;
+        pane.banner.hide();
+        pane.layoutBannerArea();
+    }
+
+    /// Reframe the table so its top edge sits below the banner while the
+    /// banner is visible, and fills the reserved strip again once it hides.
+    /// Computed from the container's CURRENT bounds so it stays correct after
+    /// the split view resizes the pane.
+    fn layoutBannerArea(pane: *BrowserPane) void {
+        const bounds = chrome.boundsOf(pane.container);
+        const w = bounds.size.width;
+        const h = bounds.size.height;
+        const bh: f64 = if (pane.banner.isVisible()) banner_mod.banner_height else 0;
+        // Path bar/strip live in the top `bar_h`; status bar in the bottom
+        // `status_h`. The banner takes `bh` just under the path bar; the
+        // table gets whatever is left between the banner and the status bar.
+        const table_view = objc.Object.fromId(pane.table.view());
+        chrome.setFrame(table_view, foundation.rect(0, status_h, w, h - bar_h - status_h - bh));
+        if (pane.banner.isVisible()) {
+            const banner_view = objc.Object.fromId(pane.banner.view());
+            chrome.setFrame(banner_view, foundation.rect(0, h - bar_h - bh, w, bh));
+        }
+    }
+
+    /// Dismiss "×": hide the banner and clear the chip's explanatory tooltip
+    /// (the error is acknowledged; the chip text stays "Offline").
+    fn onBannerDismiss(ctx: *anyopaque) void {
+        const pane: *BrowserPane = @ptrCast(@alignCast(ctx));
+        pane.hideBanner();
+        chrome.setToolTip(pane.status_label, "");
     }
 
     // ------------------------------------------------------------------ //
@@ -2471,6 +2531,8 @@ pub const BrowserController = struct {
         pane.vim_state = .{};
         pane.vim_anchor = null;
         pane.vim_cursor = null;
+        // Fresh bind/unbind/role-restore: drop any stale error banner.
+        pane.hideBanner();
     }
 
     // ------------------------------------------------------------------ //
@@ -2777,8 +2839,30 @@ pub const BrowserController = struct {
             if (site != e.site_id) continue;
             pane.chip = e.status;
             pane.updateStatus();
+            // Error surfacing: a `.offline`/`.reconnecting` carrying an
+            // `error_class` is a real failure (connect refused/timeout/auth/
+            // dropped link) — distinct from a clean user disconnect (no class,
+            // even if `reason` is non-empty). Show it on the inline banner and
+            // explain the chip via its NSView tooltip. `.connected` clears both
+            // (the subsequent successful (re)list also clears the banner).
+            switch (e.status) {
+                .connected => {
+                    pane.hideBanner();
+                    chrome.setToolTip(pane.status_label, "");
+                },
+                .offline, .reconnecting => {
+                    if (e.error_class != null and e.reason.len > 0) {
+                        pane.showBanner(.@"error", e.reason);
+                        chrome.setToolTip(pane.status_label, e.reason);
+                    } else if (e.status == .offline) {
+                        // Clean disconnect (no error_class): nothing to surface.
+                        chrome.setToolTip(pane.status_label, "");
+                    }
+                },
+            }
             // Active-pane connects: a role-switched local pane returns to
-            // its local role (and path) when the site disconnects.
+            // its local role (and path) when the site disconnects. (That
+            // navigates a local listing whose success clears the banner.)
             if (e.status == .offline) self.restoreLocalRole(pane);
         }
     }
@@ -2875,6 +2959,23 @@ pub const BrowserController = struct {
         chrome.setAutoresizing(pane.strip_view, chrome.width_sizable | chrome.min_y_margin);
         chrome.setHidden(pane.strip_view, true);
 
+        // Inline error banner, pinned just below the path bar/strip and ABOVE
+        // the table. Created hidden (banner_height reserved only while shown);
+        // its dismiss "×" routes back here to hide it + clear the chip tooltip.
+        pane.banner = banner_mod.Banner.create(pane.gpa) catch
+            @panic("relay/browser: failed to create error banner");
+        const banner_view = objc.Object.fromId(pane.banner.view());
+        chrome.setFrame(banner_view, foundation.rect(
+            0,
+            pane_h - bar_h - banner_mod.banner_height,
+            pane_w,
+            banner_mod.banner_height,
+        ));
+        // Top-pinned: width tracks the pane; the strip stays just under the
+        // path bar as the container grows downward.
+        chrome.setAutoresizing(banner_view, chrome.width_sizable | chrome.min_y_margin);
+        pane.banner.setDismissHandler(pane, BrowserPane.onBannerDismiss);
+
         const table_view = objc.Object.fromId(pane.table.view());
         chrome.setFrame(table_view, foundation.rect(0, status_h, pane_w, pane_h - bar_h - status_h));
         chrome.setAutoresizing(table_view, chrome.width_sizable | chrome.height_sizable);
@@ -2891,6 +2992,7 @@ pub const BrowserController = struct {
         chrome.addSubview(pane.container, pane.sync_label);
         chrome.addSubview(pane.container, pane.filter_field);
         chrome.addSubview(pane.container, table_view);
+        chrome.addSubview(pane.container, banner_view); // above the table
         chrome.addSubview(pane.container, pane.strip_view); // over the table edge
         chrome.addSubview(pane.container, pane.status_label);
     }
@@ -2899,6 +3001,7 @@ pub const BrowserController = struct {
         const gpa = pane.gpa;
         chrome.clearControlWiring(pane.path_field);
         chrome.clearControlWiring(pane.filter_field);
+        pane.banner.deinit();
         pane.table.deinit();
         chrome.release(pane.path_field);
         chrome.release(pane.filter_field);
@@ -3825,6 +3928,148 @@ test "sync browsing, compare mode, vim layer (headless)" {
     bc.setVimMode(false);
     try testing.expect(BrowserPane.dsKeyDown(ctx0, kev("j")));
     try testing.expectEqual(@as(usize, 1), p0.ts_len);
+
+    core.shutdown();
+    bc.destroy();
+    win.release();
+}
+
+/// Read an NSView's toolTip back as an owned UTF-8 slice ("" when unset).
+fn toolTipOf(gpa: Allocator, view: objc.Object) ![]u8 {
+    const tip = view.msgSend(objc.Object, "toolTip", .{});
+    if (tip.value == null) return gpa.dupe(u8, "");
+    return foundation.utf8FromNSString(gpa, tip);
+}
+
+test "inline error banner + chip tooltip: status/listing event transitions (headless)" {
+    const pool = foundation.AutoreleasePool.init();
+    defer pool.deinit();
+    const gpa = testing.allocator;
+
+    var tmp_conf = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_conf.cleanup();
+    var tmp_root = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_root.cleanup();
+    var fake = FakeStore.init(gpa);
+    defer fake.deinit();
+
+    const core = try bridge.AppCore.initOptions(gpa, .{
+        .pump = .manual,
+        .config_dir = tmp_conf.dir,
+        .local_root = tmp_root.dir,
+        .cred_store = fake.credStore(),
+    });
+
+    const io = core.io;
+    try tmp_root.dir.createDir(io, "srv", .default_dir);
+    try tmp_root.dir.writeFile(io, .{ .sub_path = "srv/file.txt", .data = "x" });
+
+    const win = window_mod.Window.create(
+        foundation.rect(0, 0, 1000, 600),
+        "relay-browser-banner-test",
+        window_mod.StyleMask.standard,
+    );
+
+    const bc = try BrowserController.create(gpa, core, win, .{ .initial_local_path = "/" });
+    win.setContentView(objc.Object.fromId(bc.view()));
+
+    // Bind the right pane to the local backend so it is a real .remote-role
+    // pane (home_role .remote, so an offline never role-restores it away).
+    const remote = bc.remotePane();
+    bc.bindRemoteToPane(remote.token(), item_mod.local_site_id, "/srv");
+    var settled: PaneSettled = .{ .pane = remote, .path = "/srv" };
+    try drainUntil(core, &settled, PaneSettled.ready);
+
+    // Baseline: a successful initial listing leaves no banner.
+    try testing.expect(!remote.banner.isVisible());
+
+    // --- Real connect failure: offline WITH an error_class --------------
+    // Shows the banner with the reason and sets the chip tooltip.
+    bc.onSiteStatus(.{
+        .site_id = item_mod.local_site_id,
+        .status = .offline,
+        .reason = "Connection refused",
+        .error_class = .transient,
+    });
+    try testing.expect(remote.banner.isVisible());
+    try testing.expectEqualStrings("Connection refused", remote.banner.currentMessage());
+    {
+        const tip = try toolTipOf(gpa, remote.status_label);
+        defer gpa.free(tip);
+        try testing.expectEqualStrings("Connection refused", tip);
+    }
+
+    // --- Reconnect succeeds: connected clears banner + tooltip ----------
+    bc.onSiteStatus(.{
+        .site_id = item_mod.local_site_id,
+        .status = .connected,
+        .reason = "",
+    });
+    try testing.expect(!remote.banner.isVisible());
+    {
+        const tip = try toolTipOf(gpa, remote.status_label);
+        defer gpa.free(tip);
+        try testing.expectEqualStrings("", tip);
+    }
+
+    // --- Clean user disconnect: offline with NO error_class -------------
+    // (a non-empty reason is allowed but must NOT raise the banner).
+    bc.onSiteStatus(.{
+        .site_id = item_mod.local_site_id,
+        .status = .offline,
+        .reason = "disconnected",
+    });
+    try testing.expect(!remote.banner.isVisible());
+
+    // --- Failure again, then a successful (re)list auto-clears it -------
+    bc.onSiteStatus(.{
+        .site_id = item_mod.local_site_id,
+        .status = .offline,
+        .reason = "421 service not available",
+        .error_class = .transient,
+    });
+    try testing.expect(remote.banner.isVisible());
+    // A real re-list of the current dir runs through adoptSnapshot → clears.
+    remote.refresh();
+    settled = .{ .pane = remote, .path = "/srv" };
+    try drainUntil(core, &settled, PaneSettled.ready);
+    try testing.expect(!remote.banner.isVisible());
+
+    // --- A listing failure on the current dir leaves a visible banner ---
+    // (drive handleListingDone with a failure for a pending request; the
+    // sheet is non-blocking with a window, the banner persists after it).
+    {
+        remote.pending_request = 9988;
+        remote.mirror_pending = false;
+        remote.handleListingDone(.{
+            .request_id = 9988,
+            .pane_token = remote.token(),
+            .snapshot = null,
+            .sort_index = &.{},
+            .failure = .{ .class = .permanent, .protocol_code = 550, .message = "550 permission denied" },
+        });
+        try testing.expect(remote.banner.isVisible());
+        try testing.expectEqualStrings("550 permission denied", remote.banner.currentMessage());
+    }
+
+    // --- Dismiss "×" hides the banner and clears the chip tooltip -------
+    chrome.setToolTip(remote.status_label, "lingering reason");
+    BrowserPane.onBannerDismiss(@ptrCast(remote));
+    try testing.expect(!remote.banner.isVisible());
+    {
+        const tip = try toolTipOf(gpa, remote.status_label);
+        defer gpa.free(tip);
+        try testing.expectEqualStrings("", tip);
+    }
+
+    // --- A background (unmatched site) status never touches this pane ---
+    bc.onSiteStatus(.{
+        .site_id = item_mod.local_site_id + 4242,
+        .status = .offline,
+        .reason = "other site",
+        .error_class = .transient,
+    });
+    try testing.expect(!remote.banner.isVisible());
 
     core.shutdown();
     bc.destroy();

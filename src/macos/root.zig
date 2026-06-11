@@ -29,6 +29,7 @@ pub const appkit = struct {
     pub const split_view = @import("appkit/split_view.zig");
     pub const panels = @import("appkit/panels.zig");
     pub const drag = @import("appkit/drag.zig");
+    pub const banner = @import("appkit/banner.zig");
 };
 
 const std = @import("std");
@@ -49,4 +50,5 @@ test {
     _ = appkit.split_view;
     _ = appkit.panels;
     _ = appkit.drag;
+    _ = appkit.banner;
 }

@@ -1072,6 +1072,20 @@ pub const AppCore = struct {
         return .{ .user = user_buf[0..user_len], .host = host_buf[0..host_len] };
     }
 
+    /// Human label for `site_id`, copied into `buf` (UI titles like the
+    /// connect-failure sheet "Couldn't connect to <label>"). Prefers the
+    /// site nickname, falling back to the host; "" if the site is unknown or
+    /// `buf` is empty. Caller owns `buf`; the returned slice points into it.
+    pub fn siteLabel(self: *AppCore, site_id: u64, buf: []u8) []const u8 {
+        self.sites_mutex.lockUncancelable(self.io);
+        defer self.sites_mutex.unlock(self.io);
+        const site = self.findSite(site_id) orelse return "";
+        const src = if (site.name.len > 0) site.name else site.host;
+        const n = @min(src.len, buf.len);
+        @memcpy(buf[0..n], src[0..n]);
+        return buf[0..n];
+    }
+
     /// Worker-side password prompt for `site_id` with the real user/host.
     /// True = the sheet stored a secret and asked to retry; the caller
     /// re-fetches from the cred store (see `invalidateSiteSecret`).
@@ -1227,10 +1241,14 @@ fn connectWorker(rt: *SiteRuntime) void {
     // back from a connect click.
     var lease = rt.pool.checkout(core.io, &rt.pool.cancel_token, &diag, .browse) catch |err| {
         if (err != error.Canceled) {
+            // A user-initiated connect failed: carry both the verbatim reason
+            // and the classified cause so the UI can surface (banner + sheet)
+            // an unambiguous error rather than a bare "Offline" chip.
             core.postEvent(.{ .site_status = .{
                 .site_id = rt.site_id,
                 .status = .offline,
                 .reason = diag.message,
+                .error_class = diag.class,
             } });
         }
         return;
@@ -1969,11 +1987,13 @@ test "connectSite without a wired factory reports a classified offline status" {
     const StatusRecorder = struct {
         offline: usize = 0,
         reason_ok: bool = false,
+        error_class: ?diag_mod.ErrorClass = null,
 
         fn onStatus(self: *@This(), e: events_mod.CoreEvent.SiteStatusChange) void {
             if (e.site_id != 5 or e.status != .offline) return;
             self.offline += 1;
             if (std.mem.indexOf(u8, e.reason, "factory not wired") != null) self.reason_ok = true;
+            self.error_class = e.error_class;
         }
         fn isOffline(self: *@This()) bool {
             return self.offline >= 1;
@@ -1985,6 +2005,13 @@ test "connectSite without a wired factory reports a classified offline status" {
     try h.core.connectSite(5);
     try h.waitUntil(&rec, StatusRecorder.isOffline);
     try testing.expect(rec.reason_ok);
+    // A failure carries a classified cause, not just a reason string.
+    try testing.expect(rec.error_class != null);
+
+    // siteLabel falls back to the host when no nickname is set.
+    var label_buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("unwired.example", h.core.siteLabel(5, &label_buf));
+    try testing.expectEqualStrings("", h.core.siteLabel(9999, &label_buf));
 }
 
 test "respondPrompt and queue control wrappers are safe no-ops on empty state" {

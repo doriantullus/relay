@@ -385,7 +385,7 @@ pub const SitePool = struct {
         if (!pool.breaker_open) {
             pool.breaker_open = true;
             pool.site_online = false;
-            pool.postStatus(.offline, diag.message);
+            pool.postStatus(.offline, diag.message, diag.class);
             pool.note("circuit breaker open after {d} consecutive connect failures", .{
                 pool.consecutive_failures,
             });
@@ -401,7 +401,7 @@ pub const SitePool = struct {
         }
         if (!pool.site_online) {
             pool.site_online = true;
-            pool.postStatus(.connected, "");
+            pool.postStatus(.connected, "", null);
         }
     }
 
@@ -448,18 +448,29 @@ pub const SitePool = struct {
         pool.mutex.unlock(io);
 
         for (to_close[0..n]) |conn| conn.close(io);
-        pool.postStatus(.offline, "disconnected");
+        // Clean user-initiated disconnect: a reason for the transcript, but
+        // null error_class so the UI does not surface it as an error.
+        pool.postStatus(.offline, "disconnected", null);
     }
 
     // ------------------------------------------------------------------ //
     // Hook plumbing
 
-    fn postStatus(pool: *SitePool, status: events_mod.SiteStatus, reason: []const u8) void {
+    /// `error_class` is the unambiguous failure signal: non-null only when
+    /// `status` reflects a real failure (breaker trip). A clean disconnect
+    /// posts .offline with a reason but a null class.
+    fn postStatus(
+        pool: *SitePool,
+        status: events_mod.SiteStatus,
+        reason: []const u8,
+        error_class: ?diag_mod.ErrorClass,
+    ) void {
         const queue = pool.hooks.events orelse return;
         _ = queue.post(.{ .site_status = .{
             .site_id = pool.config.site_id,
             .status = status,
             .reason = reason,
+            .error_class = error_class,
         } }) catch {};
     }
 
@@ -798,6 +809,9 @@ test "circuit breaker: trips after 3 failures, fast-fails, recovers after backof
     try testing.expectEqual(@as(usize, 1), batch.len);
     try testing.expectEqual(events_mod.SiteStatus.offline, batch[0].site_status.status);
     try testing.expectEqual(@as(u64, 42), batch[0].site_status.site_id);
+    // Breaker trip is a real failure: it must carry a classified cause.
+    try testing.expect(batch[0].site_status.error_class != null);
+    try testing.expectEqual(diag_mod.ErrorClass.transient, batch[0].site_status.error_class.?);
 
     // After the backoff elapses the half-open probe goes through and the
     // breaker closes.

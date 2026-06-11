@@ -102,6 +102,12 @@ pub const CoreEvent = union(enum) {
         status: SiteStatus,
         /// Why (e.g. the disconnect cause while .reconnecting/.offline).
         reason: []const u8 = "",
+        /// Set ONLY when this status reflects a real failure (connect refused,
+        /// auth, breaker trip, dropped link). `null` = clean/expected (a user
+        /// disconnect still posts .offline, but with no error_class). This is
+        /// the unambiguous error signal: `reason` alone is unreliable because
+        /// a clean disconnect can also carry a non-empty reason string.
+        error_class: ?diag_mod.ErrorClass = null,
     };
 
     pub const PromptNeeded = struct {
@@ -246,6 +252,7 @@ fn dupeEvent(arena: std.mem.Allocator, event: CoreEvent) error{OutOfMemory}!Core
             .site_id = e.site_id,
             .status = e.status,
             .reason = try arena.dupe(u8, e.reason),
+            .error_class = e.error_class,
         } },
         .prompt_needed => |e| .{ .prompt_needed = .{
             .site_id = e.site_id,
@@ -301,6 +308,7 @@ test "event queue: payload copy, post order, drain-scheduled coalescing" {
         .site_id = 1,
         .status = .reconnecting,
         .reason = reason_buf[0..7],
+        .error_class = .transient,
     } }));
     // A drain is already scheduled: second post must not schedule another.
     try std.testing.expect(!try queue.post(.{ .transfer_progress = .{
@@ -315,6 +323,7 @@ test "event queue: payload copy, post order, drain-scheduled coalescing" {
     try std.testing.expectEqual(@as(usize, 2), batch.len);
     try std.testing.expectEqual(@as(u64, 1), batch[0].site_status.site_id);
     try std.testing.expectEqualStrings("timeout", batch[0].site_status.reason);
+    try std.testing.expectEqual(diag_mod.ErrorClass.transient, batch[0].site_status.error_class.?);
     try std.testing.expectEqual(@as(u64, 1024), batch[1].transfer_progress.bytes_done);
 
     // Flag re-arms after a drain; empty drains are fine.
@@ -328,6 +337,41 @@ test "event queue: payload copy, post order, drain-scheduled coalescing" {
     try std.testing.expectEqual(diag_mod.ErrorClass.transient, batch2[0].transfer_state.failure.?.class);
     try std.testing.expectEqualStrings("421 busy", batch2[0].transfer_state.failure.?.message);
     try std.testing.expectEqual(@as(usize, 0), queue.drain().len);
+}
+
+test "event queue: site_status error_class distinguishes clean disconnect from failure" {
+    var queue: EventQueue = .init(std.testing.allocator);
+    defer queue.deinit();
+
+    // Clean user disconnect: offline, a non-empty reason is allowed, but
+    // error_class stays null — NOT an error to surface.
+    _ = try queue.post(.{ .site_status = .{
+        .site_id = 7,
+        .status = .offline,
+        .reason = "disconnected",
+    } });
+    // Real failure: offline with a classified cause and a reason.
+    var reason_buf: [32]u8 = undefined;
+    const reason = std.fmt.bufPrint(&reason_buf, "421 connection refused", .{}) catch unreachable;
+    _ = try queue.post(.{ .site_status = .{
+        .site_id = 7,
+        .status = .offline,
+        .reason = reason,
+        .error_class = .transient,
+    } });
+    // Producer reuses its buffer; the failure reason must have been copied.
+    @memset(&reason_buf, 'x');
+
+    const batch = queue.drain();
+    try std.testing.expectEqual(@as(usize, 2), batch.len);
+
+    // Clean disconnect: error_class round-trips as null through dupeEvent.
+    try std.testing.expectEqual(@as(?diag_mod.ErrorClass, null), batch[0].site_status.error_class);
+    try std.testing.expectEqualStrings("disconnected", batch[0].site_status.reason);
+
+    // Failure: error_class and reason both round-trip.
+    try std.testing.expectEqual(diag_mod.ErrorClass.transient, batch[1].site_status.error_class.?);
+    try std.testing.expectEqualStrings("421 connection refused", batch[1].site_status.reason);
 }
 
 test "event queue: prompt payloads are deep-copied" {

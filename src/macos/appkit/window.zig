@@ -57,6 +57,14 @@ pub const App = struct {
         self.obj.msgSend(void, "activateIgnoringOtherApps:", .{true});
     }
 
+    /// True when Relay is the frontmost (active) app. Used to gate
+    /// background-only surfaces (e.g. transfer-failure notifications):
+    /// foreground UI already shows the result, so notify only when this is
+    /// false. Main thread only.
+    pub fn isActive(self: App) bool {
+        return foundation.toBool(self.obj.msgSend(foundation.BOOL, "isActive", .{}));
+    }
+
     /// Install the NSApplicationDelegate. NSApplication holds it weakly;
     /// the caller keeps the strong reference (see app_delegate.AppDelegate).
     pub fn setDelegate(self: App, delegate: objc.Object) void {

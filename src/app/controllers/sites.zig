@@ -1167,6 +1167,12 @@ pub const SitesController = struct {
 
     /// Last site_status per site id (sidebar suffix + `siteStatus()`).
     statuses: std.AutoHashMapUnmanaged(u64, events_mod.SiteStatus) = .empty,
+    /// Site ids with an in-flight USER-initiated connect (set by
+    /// connectAndList, cleared by the first terminal site_status). Gates the
+    /// connect-failure sheet so background reconnect/breaker churn never
+    /// sheet-spams: only a pending attempt's first .offline-with-error_class
+    /// pops the popup, and the flag is gone before the next status arrives.
+    pending_connects: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// pane token -> site id of the last connect issued there (Cmd+Shift+K).
     pane_sites: std.AutoHashMapUnmanaged(bridge.PaneToken, u64) = .empty,
     /// "Save in Keychain: No" secrets — deleted once the connect resolves.
@@ -1268,6 +1274,7 @@ pub const SitesController = struct {
         self.meta.deinit();
         self.ssh.deinit();
         self.statuses.deinit(self.gpa);
+        self.pending_connects.deinit(self.gpa);
         self.pane_sites.deinit(self.gpa);
         self.clearTransients();
         self.transients.deinit(self.gpa);
@@ -1565,6 +1572,13 @@ pub const SitesController = struct {
             self.showError("Could not start the connection", @errorName(err));
             return;
         };
+        // Arm the connect-failure sheet for THIS attempt only. The async
+        // result lands later as a site_status; until then a failure is
+        // "the user just clicked Connect and it went offline" and earns a
+        // popup. put() (not getOrPut) refreshes a stale flag from an earlier
+        // attempt that never produced a terminal status. OOM = no sheet, the
+        // inline banner/chip still surface the reason.
+        self.pending_connects.put(self.gpa, site_id, {}) catch {};
         const initial: []const u8 = blk: {
             if (path_override) |p| {
                 if (p.len > 0) break :blk p;
@@ -1663,8 +1677,43 @@ pub const SitesController = struct {
 
     fn onSiteStatus(self: *SitesController, e: events_mod.CoreEvent.SiteStatusChange) void {
         self.statuses.put(self.gpa, e.site_id, e.status) catch {};
+        if (self.connectFailureSheetEligible(e)) {
+            self.showConnectFailure(e.site_id, e.reason);
+        }
         self.resolveTransients(e.site_id, e.status);
         if (self.sidebar) |sb| sb.reloadSection(section_servers);
+    }
+
+    /// Pure pending-connect lifecycle (headless-tested): a site_status for a
+    /// site with a PENDING user-initiated connect is terminal unless it is
+    /// .reconnecting (the attempt is still in flight). On the first terminal
+    /// status the flag clears; the function returns true ONLY when that
+    /// terminal status is a real failure (.offline with error_class != null),
+    /// i.e. exactly one popup per user click. Background reconnect/breaker
+    /// offline churn never reaches here because the flag is already gone, so
+    /// a second offline cannot re-trigger.
+    fn connectFailureSheetEligible(self: *SitesController, e: events_mod.CoreEvent.SiteStatusChange) bool {
+        if (e.status == .reconnecting) return false; // not yet terminal
+        if (!self.pending_connects.remove(e.site_id)) return false; // not a user attempt
+        // Terminal: .connected (silent) or .offline. Sheet only a classified
+        // failure; a clean offline (error_class == null) clears silently.
+        return e.status == .offline and e.error_class != null;
+    }
+
+    /// Present the connect-failure popup for a user-initiated attempt.
+    /// Title uses the friendly site label (nickname, else host); the reason
+    /// is the diagnostic message. Headless (no window) just logs.
+    fn showConnectFailure(self: *SitesController, site_id: u64, reason: []const u8) void {
+        var label_buf: [256]u8 = undefined;
+        const label = self.core.siteLabel(site_id, &label_buf);
+        var title_buf: [320]u8 = undefined;
+        const title = std.fmt.bufPrint(
+            &title_buf,
+            "Couldn't connect to {s}",
+            .{if (label.len > 0) label else "the server"},
+        ) catch "Couldn't connect to the server";
+        const detail = if (reason.len > 0) reason else "The connection failed.";
+        self.showError(title, detail);
     }
 
     fn onPromptNeeded(self: *SitesController, e: events_mod.CoreEvent.PromptNeeded) void {
@@ -3414,6 +3463,122 @@ test "controller: applyImport without consent never touches the cred store" {
         .port = 21,
         .account = "alice",
     }));
+}
+
+test "controller: connect-failure sheet fires once per user-initiated attempt" {
+    var h: Harness = undefined;
+    try h.start(.{ .sites = &.{.{
+        .id = 1,
+        .name = "Prod Web",
+        .protocol = .sftp,
+        .host = "web.example.com",
+        .port = 2222,
+        .account = "deploy",
+    }} });
+
+    const ctrl = try SitesController.create(testing.allocator, h.core, .{
+        .window = null, // headless: showError logs, never blocks on a sheet
+        .home = "/nonexistent-relay-home",
+        .build_sidebar = false,
+    });
+    defer ctrl.destroy();
+    defer h.stop();
+
+    const site_id: u64 = 1;
+
+    // Arming: connectAndList records the in-flight user attempt.
+    ctrl.connectAndList(site_id, null);
+    try testing.expect(ctrl.pending_connects.contains(site_id));
+
+    // A .reconnecting tick mid-attempt is NOT terminal: still pending, no sheet.
+    try testing.expect(!ctrl.connectFailureSheetEligible(.{
+        .site_id = site_id,
+        .status = .reconnecting,
+        .reason = "handshake retry",
+        .error_class = .transient,
+    }));
+    try testing.expect(ctrl.pending_connects.contains(site_id));
+
+    // First terminal status is a classified failure: sheet-eligible ONCE,
+    // and the pending flag clears.
+    try testing.expect(ctrl.connectFailureSheetEligible(.{
+        .site_id = site_id,
+        .status = .offline,
+        .reason = "Connection refused",
+        .error_class = .transient,
+    }));
+    try testing.expect(!ctrl.pending_connects.contains(site_id));
+
+    // A SECOND background offline (breaker churn) must NOT re-trigger.
+    try testing.expect(!ctrl.connectFailureSheetEligible(.{
+        .site_id = site_id,
+        .status = .offline,
+        .reason = "breaker open",
+        .error_class = .permanent,
+    }));
+
+    // The friendly title prefers the site nickname.
+    var label_buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("Prod Web", h.core.siteLabel(site_id, &label_buf));
+}
+
+test "controller: pending-connect terminal-status variants (connected, clean offline, non-pending)" {
+    var h: Harness = undefined;
+    try h.start(.{ .sites = &.{.{
+        .id = 1,
+        .name = "Box",
+        .protocol = .sftp,
+        .host = "box.example.com",
+    }} });
+
+    const ctrl = try SitesController.create(testing.allocator, h.core, .{
+        .window = null,
+        .home = "/nonexistent-relay-home",
+        .build_sidebar = false,
+    });
+    defer ctrl.destroy();
+    defer h.stop();
+
+    const site_id: u64 = 1;
+
+    // .connected clears the flag silently (no sheet).
+    try ctrl.pending_connects.put(testing.allocator, site_id, {});
+    try testing.expect(!ctrl.connectFailureSheetEligible(.{
+        .site_id = site_id,
+        .status = .connected,
+    }));
+    try testing.expect(!ctrl.pending_connects.contains(site_id));
+
+    // A clean user disconnect (.offline, error_class == null) clears silently.
+    try ctrl.pending_connects.put(testing.allocator, site_id, {});
+    try testing.expect(!ctrl.connectFailureSheetEligible(.{
+        .site_id = site_id,
+        .status = .offline,
+        .reason = "disconnected",
+        .error_class = null,
+    }));
+    try testing.expect(!ctrl.pending_connects.contains(site_id));
+
+    // A classified offline with NO pending flag (background reconnect that
+    // tripped while the site was idle) is never sheet-eligible.
+    try testing.expect(!ctrl.connectFailureSheetEligible(.{
+        .site_id = site_id,
+        .status = .offline,
+        .reason = "421 dropped",
+        .error_class = .transient,
+    }));
+
+    // onSiteStatus end-to-end: a pending failure runs the (headless) sheet
+    // path without panicking and clears the flag.
+    try ctrl.pending_connects.put(testing.allocator, site_id, {});
+    ctrl.onSiteStatus(.{
+        .site_id = site_id,
+        .status = .offline,
+        .reason = "auth failed",
+        .error_class = .permanent,
+    });
+    try testing.expect(!ctrl.pending_connects.contains(site_id));
+    try testing.expectEqual(@as(?events_mod.SiteStatus, .offline), ctrl.siteStatus(site_id));
 }
 
 test "visual: sidebar in a real window (set RELAY_SITES_VISUAL=1)" {

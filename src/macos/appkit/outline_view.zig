@@ -105,6 +105,7 @@ var g_helper_state_ivar: c.Ivar = null;
 var g_outline_state_ivar: c.Ivar = null;
 var g_cell_state_ivar: c.Ivar = null;
 var g_cell_ref_ivar: c.Ivar = null;
+var g_cell_bg_ivar: c.Ivar = null;
 
 fn stateFromIvar(comptime T: type, target: c.id, ivar: c.Ivar) *T {
     const raw = c.object_getIvar(target, ivar) orelse @panic("relay outline state ivar is null");
@@ -165,16 +166,25 @@ pub fn ensureClasses() void {
     }
 
     {
-        const cls = objc.allocateClassPair(getClass("NSView"), "RelayOutlineCellView") orelse
+        // NSTableCellView (not bare NSView): the outline view sets
+        // backgroundStyle on it when row selection changes, which is how the
+        // cell learns to redraw its text in the selected vs normal color.
+        // Without this, deselecting leaves white text on a white row (the
+        // sidebar row "disappears").
+        const cls = objc.allocateClassPair(getClass("NSTableCellView"), "RelayOutlineCellView") orelse
             @panic("allocateClassPair(RelayOutlineCellView)");
         if (!cls.addIvar("relayState")) @panic("addIvar(RelayOutlineCellView)");
         if (!cls.addIvar("relayItemRef")) @panic("addIvar(cell relayItemRef)");
+        if (!cls.addIvar("relayBg")) @panic("addIvar(cell relayBg)");
         if (!cls.addMethod("drawRect:", cellDrawRect)) @panic("addMethod(outline drawRect:)");
         if (!cls.addMethod("isFlipped", cellIsFlipped)) @panic("addMethod(outline isFlipped)");
+        if (!cls.addMethod("setBackgroundStyle:", cellSetBackgroundStyle))
+            @panic("addMethod(outline setBackgroundStyle:)");
         objc.registerClassPair(cls);
         g_cell_state_ivar = c.class_getInstanceVariable(cls.value, "relayState");
         g_cell_ref_ivar = c.class_getInstanceVariable(cls.value, "relayItemRef");
-        if (g_cell_state_ivar == null or g_cell_ref_ivar == null)
+        g_cell_bg_ivar = c.class_getInstanceVariable(cls.value, "relayBg");
+        if (g_cell_state_ivar == null or g_cell_ref_ivar == null or g_cell_bg_ivar == null)
             @panic("ivar lookup (RelayOutlineCellView)");
         g_cell_class = cls;
     }
@@ -711,18 +721,24 @@ fn makeAttrs(font: objc.Object, color: objc.Object) objc.Object {
     return attrs;
 }
 
-/// Same semantic selection-aware color rule as the table cells.
+/// NSOutlineView sets this when row selection/emphasis changes. Store it and
+/// force a redraw so custom-drawn text switches between the normal and
+/// selected color — without this, deselecting a sidebar row leaves stale
+/// (white) text on the now-white background (the row goes blank).
+fn cellSetBackgroundStyle(target: c.id, _: c.SEL, style: NSInteger) callconv(.c) void {
+    const v: usize = if (style < 0) 0 else @intCast(style);
+    // ts.indexToIvar encodes (v+1)<<3 — the <<3 keeps the fake pointer
+    // 8-byte aligned, which Debug/Safe @ptrFromInt checks enforce.
+    c.object_setIvar(target, g_cell_bg_ivar, ts.indexToIvar(v));
+    objc.Object.fromId(target).msgSend(void, "setNeedsDisplay:", .{true});
+}
+
+/// Same semantic selection-aware color rule as the table cells, driven by the
+/// stored backgroundStyle (NSBackgroundStyleEmphasized == 1 → white text).
 fn rowTextColor(cell: objc.Object) objc.Object {
-    const row_view = cell.msgSend(objc.Object, "superview", .{});
-    if (row_view.value != null) {
-        const responds = row_view.msgSend(c.BOOL, "respondsToSelector:", .{objc.sel("isSelected")});
-        if (responds != 0) {
-            const is_selected = row_view.msgSend(c.BOOL, "isSelected", .{}) != 0;
-            const emphasized = row_view.msgSend(c.BOOL, "isEmphasized", .{}) != 0;
-            if (is_selected and emphasized)
-                return getClass("NSColor").msgSend(objc.Object, "alternateSelectedControlTextColor", .{});
-        }
-    }
+    const style = ts.indexFromIvar(@intFromPtr(c.object_getIvar(cell.value, g_cell_bg_ivar))) orelse 0;
+    if (style == 1) // NSBackgroundStyleEmphasized: selected in a key view
+        return getClass("NSColor").msgSend(objc.Object, "alternateSelectedControlTextColor", .{});
     return getClass("NSColor").msgSend(objc.Object, "labelColor", .{});
 }
 

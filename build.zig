@@ -158,6 +158,7 @@ pub fn build(b: *std.Build) void {
 
         const run_app = b.addRunArtifact(app_exe);
         run_app.step.dependOn(b.getInstallStep());
+        if (b.args) |args| run_app.addArgs(args); // zig build run -- --smoke
         b.step("run", "Run Relay").dependOn(&run_app.step);
 
         // Spike: ui — NSTableView with a Zig data source via zig-objc (the M0 gate).

@@ -20,11 +20,16 @@ Native macOS FTP/FTPS/SFTP client in Zig 0.16. Target: macOS 15+, aarch64.
 ## Layers
 
 ```
-app (exe, main thread)   NSApplication run loop, controllers,
-                         zig-objc delegate classes
-relay_mac (module)       zig-objc AppKit wrappers, dispatch/CF/Security,
-                         FSEvents, QuickLook, drag & drop
-── UI bridge: C-ABI-clean event/command boundary ──
+app (exe, main thread)   main.zig window assembly · app_delegate ·
+                         bridge.zig (AppCore) · controllers/ (browser,
+                         sites, transfers+transcript, prefs+commands+menus,
+                         inspector) · factories.zig (production connect
+                         factories: known_hosts/auth/prompts) · --smoke driver
+relay_mac (module)       zig-objc AppKit wrappers: window/table/outline/
+                         menu/toolbar/split_view/panels/drag · libdispatch
+                         glue · foundation+runtime kits (all selector
+                         strings live here; FSEvents/QuickLook are post-M2)
+── UI bridge: src/app/bridge.zig — the ONLY core↔UI crossing ──
 relay_core (module)      vfs · pool · queue · cred · settings · transcript
                          proto/ftp (first-party) · proto/sftp (libssh2)
                          proto/ssh (pure-Zig agent/keys/known_hosts/config)

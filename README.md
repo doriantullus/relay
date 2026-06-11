@@ -3,11 +3,18 @@
 A native macOS FTP / FTPS / SFTP client written in Zig — Transmit-level polish
 with ForkLift-level keyboard power, for programmers who dislike FileZilla.
 
-**Status: M1 complete (headless protocol core).** FTP/FTPS/SFTP engines,
-SSH userland (agent/keys/known_hosts/ssh_config), VFS, connection pool, and
-transfer queue are implemented and tested (321 unit tests + a 50-case live
-Docker integration matrix incl. FTPS TLS session reuse against vsftpd
-`require_ssl_reuse=YES`). No GUI yet — that's M2.
+**Status: M2 complete (native GUI shell).** The M1 protocol core (FTP/FTPS/
+SFTP engines, SSH userland, VFS, pool, queue; 321 unit tests + the live
+Docker integration matrix) now drives a pure-Zig AppKit app: dual-pane
+browser, sites sidebar (saved sites · ~/.ssh/config · history), transfer
+panel with Failed/Transcript tabs, inspector, settings window, full menu
+bar + keyboard map per docs/UX.md. Production connect factories
+(src/app/factories.zig) wire real FTP/FTPS/SFTP connects: known_hosts
+verification with a host-key sheet, agent/key-file/password auth, and
+Keychain-backed password prompts with retry. `zig build run -- --smoke`
+runs a scripted end-to-end self test (50-file local transfer through the
+real GUI path); `--smoke-sftp` does the same against a dockerized OpenSSH
+server.
 
 ## Building
 

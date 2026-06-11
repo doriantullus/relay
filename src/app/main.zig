@@ -542,12 +542,15 @@ fn onChmodStaged(_: ?*anyopaque, pane_token: bridge.PaneToken, path: []const u8,
 // --- PaneHost: connects land in the ACTIVE pane (docs/UX.md) ----------------
 
 fn paneHostActiveToken(_: ?*anyopaque) bridge.PaneToken {
-    // The browser's focused pane receives the connect; either pane can
-    // host a remote site (role switching in BrowserController). Fallback
-    // when focus is ambiguous (window not assembled yet): the historical
-    // right-hand remote pane.
+    // Connects land in the right-hand remote pane by default (the
+    // conventional local-left / remote-right layout) so browsing the local
+    // pane and connecting never clobbers it. Exception: when the FOCUSED
+    // pane is already remote, target it — that preserves switching servers
+    // in place and remote↔remote workflows.
     if (!g_ui_built) return @as(bridge.PaneToken, 2); // panes[1].token()
-    return g_ui.browser.activePane().token();
+    const active = g_ui.browser.activePane();
+    if (active.isRemote()) return active.token();
+    return g_ui.browser.remotePane().token();
 }
 
 fn paneHostConnecting(_: ?*anyopaque, pane_token: bridge.PaneToken, site_id: u64) void {

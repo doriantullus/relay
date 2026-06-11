@@ -1038,6 +1038,13 @@ pub const BrowserPane = struct {
         return @as(bridge.PaneToken, pane.index) + 1;
     }
 
+    /// True when this pane currently hosts a connected remote site (not the
+    /// local filesystem and not empty).
+    pub fn isRemote(pane: *const BrowserPane) bool {
+        const site = pane.site orelse return false;
+        return site != item_mod.local_site_id;
+    }
+
     pub fn currentPath(pane: *const BrowserPane) ?[]const u8 {
         return pane.history.current();
     }

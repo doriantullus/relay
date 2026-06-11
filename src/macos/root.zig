@@ -15,6 +15,10 @@ pub const objc = @import("objc");
 pub const foundation = @import("foundation.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const runtime = @import("runtime.zig");
+pub const fsevents = @import("fsevents.zig");
+pub const app_nap = @import("app_nap.zig");
+pub const quicklook = @import("quicklook.zig");
+pub const notifications = @import("notifications.zig");
 
 pub const appkit = struct {
     pub const window = @import("appkit/window.zig");
@@ -33,6 +37,10 @@ test {
     _ = foundation;
     _ = dispatch;
     _ = runtime;
+    _ = fsevents;
+    _ = app_nap;
+    _ = quicklook;
+    _ = notifications;
     _ = appkit.window;
     _ = appkit.table_source;
     _ = appkit.outline_view;

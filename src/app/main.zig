@@ -25,6 +25,8 @@ const mac = @import("relay_mac");
 pub const bridge = @import("bridge.zig");
 pub const factories = @import("factories.zig");
 pub const app_delegate = @import("app_delegate.zig");
+pub const fuzzy = @import("fuzzy.zig");
+pub const temp_cache = @import("temp_cache.zig");
 pub const controllers = struct {
     pub const browser = @import("controllers/browser.zig");
     pub const sites = @import("controllers/sites.zig");
@@ -32,6 +34,9 @@ pub const controllers = struct {
     pub const transcript = @import("controllers/transcript.zig");
     pub const prefs = @import("controllers/prefs.zig");
     pub const inspector = @import("controllers/inspector.zig");
+    pub const edit_sessions = @import("controllers/edit_sessions.zig");
+    pub const palette = @import("controllers/palette.zig");
+    pub const terminal = @import("controllers/terminal.zig");
 };
 
 const objc = mac.objc;
@@ -1121,4 +1126,9 @@ test {
     _ = controllers.transcript;
     _ = controllers.prefs;
     _ = controllers.inspector;
+    _ = controllers.edit_sessions;
+    _ = controllers.palette;
+    _ = controllers.terminal;
+    _ = fuzzy;
+    _ = temp_cache;
 }

@@ -20,7 +20,7 @@
 //!
 //! Connect flow: Return/double-click connects in the ACTIVE pane
 //! (bridge.connectSite + listPath of the initial dir); `site_status` events
-//! are tracked per site (sidebar row suffix now; the path-bar chip reads
+//! are tracked per site (sidebar status dot; the path-bar chip reads
 //! `siteStatus()`); `prompt_needed` events present host-key / password /
 //! keyboard-interactive sheets and reply through bridge.respondPrompt —
 //! host-key acceptance persists via the core callback reply (known_hosts
@@ -1347,12 +1347,14 @@ pub const SitesController = struct {
         };
     }
 
-    fn statusSuffix(self: *const SitesController, site_id: u64) []const u8 {
-        const status = self.statuses.get(site_id) orelse return "";
+    /// Sidebar connection-status dot for a site (green/orange in the cell;
+    /// offline and never-seen sites draw nothing).
+    fn statusDot(self: *const SitesController, site_id: u64) outline_mod.StatusDot {
+        const status = self.statuses.get(site_id) orelse return .none;
         return switch (status) {
-            .connected => " — connected",
-            .reconnecting => " — reconnecting…",
-            .offline => "",
+            .connected => .connected,
+            .reconnecting => .reconnecting,
+            .offline => .none,
         };
     }
 
@@ -1361,11 +1363,11 @@ pub const SitesController = struct {
         switch (section) {
             section_servers => {
                 const entry = self.store.persistedAt(row) orelse return .{ .title = "" };
-                const label = siteLabel(entry.site);
-                const title = std.fmt.bufPrint(buf, "{s}{s}", .{
-                    label, self.statusSuffix(entry.site.id),
-                }) catch label;
-                return .{ .title = title, .symbol = "server.rack" };
+                return .{
+                    .title = siteLabel(entry.site),
+                    .symbol = "server.rack",
+                    .status = self.statusDot(entry.site.id),
+                };
             },
             section_ssh => {
                 if (row >= self.ssh.aliases.items.len) return .{ .title = "" };
@@ -1377,7 +1379,11 @@ pub const SitesController = struct {
                 const title = std.fmt.bufPrint(buf, "{s} · {s}", .{
                     entry.label, entry.path,
                 }) catch entry.label;
-                return .{ .title = title, .symbol = "clock" };
+                return .{
+                    .title = title,
+                    .symbol = "clock",
+                    .status = self.statusDot(entry.site_id),
+                };
             },
             else => return .{ .title = "" },
         }
@@ -1681,7 +1687,12 @@ pub const SitesController = struct {
             self.showConnectFailure(e.site_id, e.reason);
         }
         self.resolveTransients(e.site_id, e.status);
-        if (self.sidebar) |sb| sb.reloadSection(section_servers);
+        // Every transition (incl. reconnecting→connected) redraws the
+        // status dots; History rows carry them too.
+        if (self.sidebar) |sb| {
+            sb.reloadSection(section_servers);
+            sb.reloadSection(section_history);
+        }
     }
 
     /// Pure pending-connect lifecycle (headless-tested): a site_status for a
@@ -3100,6 +3111,7 @@ test "controller: sidebar vtable, connect flow, history persistence, status trac
     try testing.expectEqual(@as(usize, 0), SitesController.dsRowCount(ctx, section_history));
     const row = SitesController.dsRowItem(ctx, section_servers, 0, &buf);
     try testing.expectEqualStrings("box", row.title);
+    try testing.expectEqual(outline_mod.StatusDot.none, row.status); // no status yet
     try testing.expect(ctrl.sidebarView() != null);
 
     // Return/double-click on the Servers row = connect in the active pane.
@@ -3156,6 +3168,56 @@ test "controller: sidebar vtable, connect flow, history persistence, status trac
     try testing.expectEqualStrings("Connect to Server…", items[0].leaf.title);
     try testing.expectEqualStrings("k", items[0].leaf.key);
     try testing.expect(items[1].leaf.mods.shift);
+}
+
+test "controller: dsRowItem maps site status to the sidebar dot" {
+    var h: Harness = undefined;
+    try h.start(.{ .sites = &.{.{
+        .id = 7,
+        .name = "box",
+        .protocol = .sftp,
+        .host = "box.example",
+        .account = "root",
+    }} });
+
+    const ctrl = try SitesController.create(testing.allocator, h.core, .{
+        .window = null,
+        .home = "/nonexistent-relay-home",
+        .build_sidebar = false,
+    });
+    defer ctrl.destroy();
+    defer h.stop();
+
+    const ctx: *anyopaque = @ptrCast(ctrl);
+    var buf: [256]u8 = undefined;
+
+    ctrl.onSiteStatus(.{ .site_id = 7, .status = .connected, .reason = "" });
+    var server_row = SitesController.dsRowItem(ctx, section_servers, 0, &buf);
+    try testing.expectEqual(outline_mod.StatusDot.connected, server_row.status);
+    // The dot replaced the old " — connected" title suffix.
+    try testing.expectEqualStrings("box", server_row.title);
+
+    ctrl.onSiteStatus(.{ .site_id = 7, .status = .reconnecting, .reason = "" });
+    server_row = SitesController.dsRowItem(ctx, section_servers, 0, &buf);
+    try testing.expectEqual(outline_mod.StatusDot.reconnecting, server_row.status);
+
+    // History rows carry the same dot via their recorded site id.
+    try ctrl.history.push(7, "box", "/srv");
+    try testing.expectEqual(
+        outline_mod.StatusDot.reconnecting,
+        SitesController.dsRowItem(ctx, section_history, 0, &buf).status,
+    );
+
+    // Offline (and never-seen) sites draw no dot.
+    ctrl.onSiteStatus(.{ .site_id = 7, .status = .offline, .reason = "test" });
+    try testing.expectEqual(
+        outline_mod.StatusDot.none,
+        SitesController.dsRowItem(ctx, section_servers, 0, &buf).status,
+    );
+    try testing.expectEqual(
+        outline_mod.StatusDot.none,
+        SitesController.dsRowItem(ctx, section_history, 0, &buf).status,
+    );
 }
 
 test "controller: site CRUD propagates to sites.zon, the core list, and the keychain" {

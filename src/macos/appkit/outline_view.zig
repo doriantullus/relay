@@ -1,7 +1,7 @@
 //! outline_view — source-list sidebar wrapper (NSOutlineView) driven by a
 //! Zig vtable: non-selectable section headers + rows with SF Symbol icon,
-//! title, and optional badge count. Single selection. Custom-drawn cells
-//! (law: no per-row subview stacks).
+//! title, optional badge count and optional connection-status dot. Single
+//! selection. Custom-drawn cells (law: no per-row subview stacks).
 //!
 //! Item identity: NSOutlineView keys its internal state on the item pointers
 //! the data source hands out, so each visible section/row gets a tiny
@@ -31,6 +31,10 @@ const nsStrBytes = ts.nsStrBytes;
 
 pub const SectionRow = struct { section: usize, row: usize };
 
+/// Connection-status dot drawn at the row's right edge (green = connected,
+/// orange = reconnecting; semantic system colors, dark-mode safe).
+pub const StatusDot = enum { none, connected, reconnecting };
+
 /// One sidebar row as produced by the vtable. `title` points into the
 /// caller-provided buffer and is only read during the call.
 pub const Item = struct {
@@ -38,6 +42,7 @@ pub const Item = struct {
     /// SF Symbol name (NSImage(systemSymbolName:)); null for no icon.
     symbol: ?[*:0]const u8 = null,
     badge: ?u64 = null,
+    status: StatusDot = .none,
 };
 
 /// The vtable the app implements. All callbacks fire on the main thread.
@@ -617,10 +622,14 @@ fn cellIsFlipped(_: c.id, _: c.SEL) callconv(.c) c.BOOL {
 
 const NSFontAttributeName = @extern(*const c.id, .{ .name = "NSFontAttributeName" });
 const NSForegroundColorAttributeName = @extern(*const c.id, .{ .name = "NSForegroundColorAttributeName" });
+const NSParagraphStyleAttributeName = @extern(*const c.id, .{ .name = "NSParagraphStyleAttributeName" });
+const line_break_truncating_tail: NSInteger = 4; // NSLineBreakByTruncatingTail
 
 const h_pad: f64 = 6;
 const icon_edge: f64 = 15;
 const icon_text_gap: f64 = 6;
+const status_dot_diameter: f64 = 7;
+const status_dot_gap: f64 = 6;
 const compositing_source_over: NSUInteger = 2;
 
 fn cellDrawRect(target: c.id, _: c.SEL, _: NSRect) callconv(.c) void {
@@ -674,6 +683,10 @@ fn cellDrawRect(target: c.id, _: c.SEL, _: NSRect) callconv(.c) void {
                 text_x += icon_edge + icon_text_gap;
             }
 
+            // Trailing accessories consume width from the right edge inward;
+            // the title truncates against whatever is left.
+            var trail_x: f64 = bounds.size.width - h_pad;
+
             // Badge (right-aligned, monospaced digits, secondary color).
             if (item.badge) |badge| {
                 var bbuf: [24]u8 = undefined;
@@ -687,31 +700,63 @@ fn cellDrawRect(target: c.id, _: c.SEL, _: NSRect) callconv(.c) void {
                     );
                     const bstr = nsStrBytes(btext);
                     const bsize = bstr.msgSend(NSSize, "sizeWithAttributes:", .{battrs});
+                    trail_x -= bsize.width;
                     bstr.msgSend(void, "drawAtPoint:withAttributes:", .{
-                        NSPoint{
-                            .x = bounds.size.width - h_pad - bsize.width,
-                            .y = (bounds.size.height - bsize.height) / 2,
-                        },
+                        NSPoint{ .x = trail_x, .y = (bounds.size.height - bsize.height) / 2 },
                         battrs,
                     });
                 }
             }
 
-            // Title starts after the icon; badge overlap is impossible at
-            // sidebar widths (M2 simplification).
+            // Connection-status dot: small filled circle, vertically
+            // centered at the right edge (left of the badge when both are
+            // present). Semantic system colors only (dark-mode safe).
+            if (item.status != .none) {
+                if (item.badge != null) trail_x -= status_dot_gap;
+                trail_x -= status_dot_diameter;
+                const dot = rect(
+                    trail_x,
+                    (bounds.size.height - status_dot_diameter) / 2,
+                    status_dot_diameter,
+                    status_dot_diameter,
+                );
+                statusDotColor(item.status).msgSend(void, "setFill", .{});
+                getClass("NSBezierPath")
+                    .msgSend(objc.Object, "bezierPathWithOvalInRect:", .{dot})
+                    .msgSend(void, "fill", .{});
+            }
+
+            // Title starts after the icon and tail-truncates before the
+            // trailing accessories so text never overlaps the dot/badge.
             if (item.title.len == 0) return;
             const attrs = makeAttrs(
                 getClass("NSFont").msgSend(objc.Object, "systemFontOfSize:", .{@as(f64, 13)}),
                 rowTextColor(self),
             );
+            const para = getClass("NSMutableParagraphStyle").msgSend(objc.Object, "alloc", .{})
+                .msgSend(objc.Object, "init", .{});
+            defer para.msgSend(void, "release", .{});
+            para.msgSend(void, "setLineBreakMode:", .{line_break_truncating_tail});
+            attrs.msgSend(void, "setObject:forKey:", .{ para.value, NSParagraphStyleAttributeName.* });
+            const has_trailing = item.badge != null or item.status != .none;
+            const text_right = if (has_trailing) trail_x - status_dot_gap else trail_x;
             const str = nsStrBytes(item.title);
             const size = str.msgSend(NSSize, "sizeWithAttributes:", .{attrs});
-            str.msgSend(void, "drawAtPoint:withAttributes:", .{
-                NSPoint{ .x = text_x, .y = (bounds.size.height - size.height) / 2 },
+            str.msgSend(void, "drawInRect:withAttributes:", .{
+                rect(text_x, (bounds.size.height - size.height) / 2, @max(0.0, text_right - text_x), size.height),
                 attrs,
             });
         },
     }
+}
+
+/// Semantic system colors only (dark-mode safe).
+fn statusDotColor(status: StatusDot) objc.Object {
+    return switch (status) {
+        .none => unreachable, // callers gate on != .none
+        .connected => getClass("NSColor").msgSend(objc.Object, "systemGreenColor", .{}),
+        .reconnecting => getClass("NSColor").msgSend(objc.Object, "systemOrangeColor", .{}),
+    };
 }
 
 fn makeAttrs(font: objc.Object, color: objc.Object) objc.Object {

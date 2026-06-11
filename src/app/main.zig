@@ -476,15 +476,19 @@ fn buildUi() !void {
 }
 
 /// Re-apply the saved panel states and reconnect saved remote panes.
-/// Reconnects never prompt: a site is restored only when its auth is
-/// provably silent (SSH agent, or a secret already in the keychain).
+/// Remote reconnects run only when the "Reconnect to servers at launch"
+/// pref is on, and even then never prompt: a site is restored only when
+/// its auth is provably silent (SSH agent, or a secret already in the
+/// keychain).
 fn restoreSession(session: prefs_mod.SessionState) void {
     if (session.sidebar_collapsed) g_ui.root_split.collapse(0);
     if (!session.transfers_collapsed) g_ui.content_split.uncollapse(1);
     if (!session.inspector_collapsed) g_ui.inner_split.uncollapse(1);
 
-    restorePaneSite(0, session.pane0_site, session.pane0_path);
-    restorePaneSite(1, session.pane1_site, session.pane1_path);
+    if (g_ui.prefs.uiPrefs().reconnect_on_launch) {
+        restorePaneSite(0, session.pane0_site, session.pane0_path);
+        restorePaneSite(1, session.pane1_site, session.pane1_path);
+    }
 
     g_ui.browser.focusPane(if (session.focused_pane < 2) session.focused_pane else 0);
 }

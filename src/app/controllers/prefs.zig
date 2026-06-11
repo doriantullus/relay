@@ -704,6 +704,10 @@ pub const UiPrefs = struct {
     date_format: DateFormat = .iso,
     /// Pref "ui.vimMode" (View ▸ Vim Key Bindings; off by default).
     vim_mode: bool = false,
+    /// Reconnect saved remote panes at launch (off by default). Even when
+    /// on, reconnects only happen when auth is provably prompt-free (see
+    /// main.zig reconnectIsPromptFree).
+    reconnect_on_launch: bool = false,
     /// Last session's pane/panel layout (saved on quit by main.zig).
     session: SessionState = .{},
 };
@@ -783,7 +787,7 @@ pub const ChangeListener = struct {
 
 // Fixed-frame layout (sheet-style; the window does not resize in M2).
 const win_w: f64 = 470;
-const win_h: f64 = 372;
+const win_h: f64 = 402;
 const label_x: f64 = 20;
 const label_w: f64 = 130;
 const control_x: f64 = 160;
@@ -805,6 +809,7 @@ pub const PrefsController = struct {
     target: ?*controls.ControlTarget = null,
     download_path_label: objc.Object = undefined,
     confirm_check: objc.Object = undefined,
+    reconnect_check: objc.Object = undefined,
     conns_slider: objc.Object = undefined,
     conns_field: objc.Object = undefined,
     rate_down_check: objc.Object = undefined,
@@ -888,6 +893,13 @@ pub const PrefsController = struct {
     pub fn setDensity(self: *PrefsController, density: Density) void {
         if (self.ui.density == density) return;
         self.ui.density = density;
+        self.persistUi();
+        self.changed();
+    }
+
+    pub fn setReconnectOnLaunch(self: *PrefsController, on: bool) void {
+        if (self.ui.reconnect_on_launch == on) return;
+        self.ui.reconnect_on_launch = on;
         self.persistUi();
         self.changed();
     }
@@ -1039,20 +1051,27 @@ pub const PrefsController = struct {
         controls.addSubview(content, self.confirm_check);
         try target.wire(self.confirm_check, self, onConfirmToggled);
 
+        self.reconnect_check = controls.makeCheckbox(
+            "Reconnect to servers at launch",
+            foundation.rect(control_x, fromTop(108, 18), 250, 18),
+        );
+        controls.addSubview(content, self.reconnect_check);
+        try target.wire(self.reconnect_check, self, onReconnectToggled);
+
         // --- Transfers ---------------------------------------------------------
         controls.addSubview(content, controls.makeLabel(
             "Transfers",
-            foundation.rect(label_x, fromTop(112, 17), 200, 17),
+            foundation.rect(label_x, fromTop(142, 17), 200, 17),
             .{ .bold = true },
         ));
 
         controls.addSubview(content, controls.makeLabel(
             "Connections per site:",
-            foundation.rect(label_x, fromTop(141, 17), label_w, 17),
+            foundation.rect(label_x, fromTop(171, 17), label_w, 17),
             .{ .right = true },
         ));
         self.conns_slider = controls.makeSlider(
-            foundation.rect(control_x, fromTop(140, 21), 170, 21),
+            foundation.rect(control_x, fromTop(170, 21), 170, 21),
             @floatFromInt(conns_min),
             @floatFromInt(conns_max),
             @floatFromInt(self.core.settings.connections_per_site),
@@ -1060,70 +1079,70 @@ pub const PrefsController = struct {
         controls.addSubview(content, self.conns_slider);
         try target.wire(self.conns_slider, self, onConnsSlider);
         self.conns_field = controls.makeTextField(
-            foundation.rect(control_x + 178, fromTop(139, 22), 44, 22),
+            foundation.rect(control_x + 178, fromTop(169, 22), 44, 22),
             "",
         );
         controls.addSubview(content, self.conns_field);
         try target.wire(self.conns_field, self, onConnsField);
         controls.addSubview(content, controls.makeLabel(
             "1–32",
-            foundation.rect(control_x + 230, fromTop(141, 16), 50, 16),
+            foundation.rect(control_x + 230, fromTop(171, 16), 50, 16),
             .{ .secondary = true, .small = true },
         ));
 
         self.rate_down_check = controls.makeCheckbox(
             "Limit download rate",
-            foundation.rect(control_x, fromTop(173, 18), 160, 18),
+            foundation.rect(control_x, fromTop(203, 18), 160, 18),
         );
         controls.addSubview(content, self.rate_down_check);
         try target.wire(self.rate_down_check, self, onRateDownChanged);
         self.rate_down_field = controls.makeTextField(
-            foundation.rect(control_x + 170, fromTop(171, 22), 70, 22),
+            foundation.rect(control_x + 170, fromTop(201, 22), 70, 22),
             "",
         );
         controls.addSubview(content, self.rate_down_field);
         try target.wire(self.rate_down_field, self, onRateDownChanged);
         controls.addSubview(content, controls.makeLabel(
             "KB/s",
-            foundation.rect(control_x + 246, fromTop(173, 16), 40, 16),
+            foundation.rect(control_x + 246, fromTop(203, 16), 40, 16),
             .{ .secondary = true, .small = true },
         ));
 
         self.rate_up_check = controls.makeCheckbox(
             "Limit upload rate",
-            foundation.rect(control_x, fromTop(203, 18), 160, 18),
+            foundation.rect(control_x, fromTop(233, 18), 160, 18),
         );
         controls.addSubview(content, self.rate_up_check);
         try target.wire(self.rate_up_check, self, onRateUpChanged);
         self.rate_up_field = controls.makeTextField(
-            foundation.rect(control_x + 170, fromTop(201, 22), 70, 22),
+            foundation.rect(control_x + 170, fromTop(231, 22), 70, 22),
             "",
         );
         controls.addSubview(content, self.rate_up_field);
         try target.wire(self.rate_up_field, self, onRateUpChanged);
         controls.addSubview(content, controls.makeLabel(
             "KB/s",
-            foundation.rect(control_x + 246, fromTop(203, 16), 40, 16),
+            foundation.rect(control_x + 246, fromTop(233, 16), 40, 16),
             .{ .secondary = true, .small = true },
         ));
 
         // --- Appearance --------------------------------------------------------
         controls.addSubview(content, controls.makeLabel(
             "Appearance",
-            foundation.rect(label_x, fromTop(237, 17), 200, 17),
+            foundation.rect(label_x, fromTop(267, 17), 200, 17),
             .{ .bold = true },
         ));
 
         controls.addSubview(content, controls.makeLabel(
             "Density:",
-            foundation.rect(label_x, fromTop(266, 17), label_w, 17),
+            foundation.rect(label_x, fromTop(296, 17), label_w, 17),
             .{ .right = true },
         ));
         const radio_titles = [3][]const u8{ "Comfortable", "Compact", "Dense" };
         const radio_x = [3]f64{ control_x, control_x + 112, control_x + 206 };
         const radio_w = [3]f64{ 108, 90, 76 };
         for (radio_titles, radio_x, radio_w, 0..) |title, x, w, i| {
-            const radio = controls.makeRadio(title, foundation.rect(x, fromTop(266, 18), w, 18));
+            const radio = controls.makeRadio(title, foundation.rect(x, fromTop(296, 18), w, 18));
             controls.addSubview(content, radio);
             try target.wire(radio, self, onDensityRadio);
             self.density_radios[i] = radio;
@@ -1131,18 +1150,18 @@ pub const PrefsController = struct {
 
         self.mono_check = controls.makeCheckbox(
             "Monospaced file lists",
-            foundation.rect(control_x, fromTop(296, 18), 250, 18),
+            foundation.rect(control_x, fromTop(326, 18), 250, 18),
         );
         controls.addSubview(content, self.mono_check);
         try target.wire(self.mono_check, self, onMonoToggled);
 
         controls.addSubview(content, controls.makeLabel(
             "Date format:",
-            foundation.rect(label_x, fromTop(330, 17), label_w, 17),
+            foundation.rect(label_x, fromTop(360, 17), label_w, 17),
             .{ .right = true },
         ));
         self.date_popup = controls.makePopup(
-            foundation.rect(control_x, fromTop(328, 25), 170, 25),
+            foundation.rect(control_x, fromTop(358, 25), 170, 25),
             &.{ "ISO 8601", "Relative" },
         );
         controls.addSubview(content, self.date_popup);
@@ -1163,6 +1182,7 @@ pub const PrefsController = struct {
         var dir_buf: [1024]u8 = undefined;
         controls.setLabelText(self.download_path_label, self.effectiveDownloadDir(&dir_buf));
         controls.setChecked(self.confirm_check, self.ui.confirm_delete);
+        controls.setChecked(self.reconnect_check, self.ui.reconnect_on_launch);
 
         const conns = self.core.settings.connections_per_site;
         controls.setSliderValue(self.conns_slider, @floatFromInt(conns));
@@ -1291,6 +1311,11 @@ pub const PrefsController = struct {
     fn onMonoToggled(ctx: ?*anyopaque, sender: c.id) void {
         const self: *PrefsController = @ptrCast(@alignCast(ctx.?));
         self.setMonospaceLists(controls.isChecked(objc.Object.fromId(sender)));
+    }
+
+    fn onReconnectToggled(ctx: ?*anyopaque, sender: c.id) void {
+        const self: *PrefsController = @ptrCast(@alignCast(ctx.?));
+        self.setReconnectOnLaunch(controls.isChecked(objc.Object.fromId(sender)));
     }
 
     fn onDateFormatChanged(ctx: ?*anyopaque, sender: c.id) void {
@@ -1510,11 +1535,12 @@ test "ui prefs: save/load round-trip; corrupt or missing file degrades to defaul
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    // Missing file → defaults.
+    // Missing file → defaults (reconnect-on-launch ships OFF).
     var missing = try loadUiPrefs(io, tmp.dir, testing.allocator);
     defer freeUiPrefs(testing.allocator, &missing);
     try testing.expectEqual(Density.compact, missing.density);
     try testing.expect(missing.confirm_delete);
+    try testing.expect(!missing.reconnect_on_launch);
 
     const custom: UiPrefs = .{
         .download_dir = "/Users/relay/Downloads",
@@ -1523,6 +1549,7 @@ test "ui prefs: save/load round-trip; corrupt or missing file degrades to defaul
         .monospace_lists = true,
         .date_format = .relative,
         .vim_mode = true,
+        .reconnect_on_launch = true,
         .session = .{
             .pane0_site = 0,
             .pane0_path = "/Users/relay/projects",
@@ -1543,6 +1570,7 @@ test "ui prefs: save/load round-trip; corrupt or missing file degrades to defaul
     try testing.expectEqual(custom.monospace_lists, loaded.monospace_lists);
     try testing.expectEqual(custom.date_format, loaded.date_format);
     try testing.expectEqual(custom.vim_mode, loaded.vim_mode);
+    try testing.expectEqual(custom.reconnect_on_launch, loaded.reconnect_on_launch);
     // M3 session restoration block round-trips, strings included.
     try testing.expectEqualStrings(custom.session.pane0_path, loaded.session.pane0_path);
     try testing.expectEqualStrings(custom.session.pane1_path, loaded.session.pane1_path);
@@ -1557,6 +1585,24 @@ test "ui prefs: save/load round-trip; corrupt or missing file degrades to defaul
     var corrupt = try loadUiPrefs(io, tmp.dir, testing.allocator);
     defer freeUiPrefs(testing.allocator, &corrupt);
     try testing.expectEqual(Density.compact, corrupt.density);
+}
+
+test "ui prefs: a pre-reconnect ui.zon (field absent) parses with the default" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // A minimal file written before reconnect_on_launch existed: missing
+    // fields take their ZON defaults instead of failing the parse.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ui_prefs_file,
+        .data = ".{ .density = .dense, .vim_mode = true }",
+    });
+    var loaded = try loadUiPrefs(io, tmp.dir, testing.allocator);
+    defer freeUiPrefs(testing.allocator, &loaded);
+    try testing.expectEqual(Density.dense, loaded.density);
+    try testing.expect(loaded.vim_mode);
+    try testing.expect(!loaded.reconnect_on_launch);
 }
 
 const ChangeCounter = struct {
@@ -1596,6 +1642,7 @@ test "PrefsController: every setter persists immediately and fires listeners" {
     pc.setMonospaceLists(true);
     pc.setConfirmDelete(false);
     pc.setVimMode(true);
+    pc.setReconnectOnLaunch(true);
     try pc.setDownloadDir("/tmp/relay-downloads");
     // Quit-time session snapshot (M3): persists, fires NO listener.
     try pc.setSessionState(.{
@@ -1612,6 +1659,7 @@ test "PrefsController: every setter persists immediately and fires listeners" {
     try testing.expect(loaded.monospace_lists);
     try testing.expect(!loaded.confirm_delete);
     try testing.expect(loaded.vim_mode);
+    try testing.expect(loaded.reconnect_on_launch);
     try testing.expectEqualStrings("/tmp/relay-downloads", loaded.download_dir);
     try testing.expectEqualStrings("/srv/data", loaded.session.pane0_path);
     try testing.expectEqual(@as(u64, 3), loaded.session.pane1_site);
@@ -1621,11 +1669,12 @@ test "PrefsController: every setter persists immediately and fires listeners" {
 
     // One notification per persisted change; no-change setters are silent
     // (setSessionState is always silent — it runs on the terminate path).
-    try testing.expectEqual(@as(u32, 10), counter.count);
+    try testing.expectEqual(@as(u32, 11), counter.count);
     pc.setDensity(.dense);
     pc.setConnectionsPerSite(32);
     pc.setVimMode(true);
-    try testing.expectEqual(@as(u32, 10), counter.count);
+    pc.setReconnectOnLaunch(true);
+    try testing.expectEqual(@as(u32, 11), counter.count);
 
     // Effective download dir honors the explicit setting.
     var buf: [1024]u8 = undefined;

@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FileZilla3 version="3.66.4" platform="mac">
+    <Servers>
+        <Server>
+            <Host>web1.example.com</Host>
+            <Port>2222</Port>
+            <Protocol>1</Protocol>
+            <Type>0</Type>
+            <User>deploy</User>
+            <Pass encoding="base64">c2VjcmV0IHBhNTUh</Pass>
+            <Logontype>1</Logontype>
+            <EncodingType>Auto</EncodingType>
+            <BypassProxy>0</BypassProxy>
+            <Name>Prod Web</Name>
+            <SyncBrowsing>0</SyncBrowsing>
+            <DirectoryComparison>0</DirectoryComparison>
+        </Server>
+        <Server>
+            <Host>ftp.example.org</Host>
+            <Port>21</Port>
+            <Protocol>0</Protocol>
+            <Type>0</Type>
+            <User>alice</User>
+            <Pass>plain&amp;old</Pass>
+            <Logontype>1</Logontype>
+            <Name>Legacy FTP &amp; Friends</Name>
+            <LocalDir>/Users/alice/Sites &amp; Stuff</LocalDir>
+        </Server>
+        <Folder expanded="1">
+            Customer Boxes
+            <Server>
+                <Host>secure.example.net</Host>
+                <Port>990</Port>
+                <Protocol>3</Protocol>
+                <Type>0</Type>
+                <User>café-user</User>
+                <Pass encoding="base64">S2V5JkNhZsOpIHBhc3Mnd29yZA==</Pass>
+                <Logontype>4</Logontype>
+                <Account>billing</Account>
+                <Name>Implicit TLS</Name>
+            </Server>
+            <Folder expanded="0">
+                Nested
+                <Server>
+                    <Host>ask.example.com</Host>
+                    <Port>2121</Port>
+                    <Protocol>4</Protocol>
+                    <Type>0</Type>
+                    <User>bob</User>
+                    <Pass encoding="base64">aWdub3JlZA==</Pass>
+                    <Logontype>2</Logontype>
+                    <Name>Explicit TLS, ask password</Name>
+                </Server>
+            </Folder>
+        </Folder>
+        <Server>
+            <Host>mirror.example.com</Host>
+            <Port>21</Port>
+            <Protocol>6</Protocol>
+            <Type>0</Type>
+            <User></User>
+            <Logontype>0</Logontype>
+            <Name>Anonymous Mirror</Name>
+        </Server>
+        <Server>
+            <Host>key.example.com</Host>
+            <Port>22</Port>
+            <Protocol>1</Protocol>
+            <Type>0</Type>
+            <User>git</User>
+            <Logontype>5</Logontype>
+            <Keyfile>/Users/alice/.ssh/id_ed25519</Keyfile>
+            <Name>Key Auth Box</Name>
+        </Server>
+        <Server>
+            <Host>bucket.s3.amazonaws.com</Host>
+            <Port>443</Port>
+            <Protocol>7</Protocol>
+            <Type>0</Type>
+            <User>AKIA123</User>
+            <Logontype>1</Logontype>
+            <Name>S3 Bucket (unsupported)</Name>
+        </Server>
+        <Server>
+            <Host>corrupt.example.com</Host>
+            <Port>21</Port>
+            <Protocol>0</Protocol>
+            <User>carol</User>
+            <Pass encoding="base64">!!!not-base64!!!</Pass>
+            <Logontype>1</Logontype>
+            <Name>Corrupt Password</Name>
+        </Server>
+        <Server>
+            <Host></Host>
+            <Port>21</Port>
+            <Protocol>0</Protocol>
+            <User>nobody</User>
+            <Logontype>1</Logontype>
+            <Name>Empty Host (skipped)</Name>
+        </Server>
+    </Servers>
+</FileZilla3>

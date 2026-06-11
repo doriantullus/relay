@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Protocol</key>
+	<string>sftp</string>
+	<key>Provider</key>
+	<string>iterate GmbH</string>
+	<key>Nickname</key>
+	<string>Prod Web &amp; API</string>
+	<key>UUID</key>
+	<string>7df0a7a4-1111-4d63-a2a3-1a3b8e3c0001</string>
+	<key>Hostname</key>
+	<string>web1.example.com</string>
+	<key>Port</key>
+	<string>2222</string>
+	<key>Username</key>
+	<string>deploy</string>
+	<key>Path</key>
+	<string>/var/www/my site</string>
+	<key>Access Timestamp</key>
+	<string>1749600000000</string>
+</dict>
+</plist>

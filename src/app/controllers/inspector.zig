@@ -68,6 +68,12 @@ pub const Selection = struct {
     items: []const SelectedItem = &.{},
 };
 
+/// Per-dispatched-chmod notification (path borrowed for the call).
+pub const ChmodStageHook = struct {
+    ctx: ?*anyopaque = null,
+    stage: ?*const fn (ctx: ?*anyopaque, pane_token: bridge.PaneToken, path: []const u8, mode: u16) void = null,
+};
+
 // ---------------------------------------------------------------------------
 // Pure permission/format logic (headless-tested).
 // ---------------------------------------------------------------------------
@@ -176,6 +182,11 @@ pub const InspectorController = struct {
     /// Observability (tests + phase-3 smoke).
     chmod_dispatched: u64 = 0,
     chmod_failures: u64 = 0,
+
+    /// Optimistic-UI bridge to the browser: fired once per DISPATCHED
+    /// chmod so the owning pane can stage its mode overlay (pending-alpha
+    /// treatment) before op_done/re-list reconciles. main.zig binds it.
+    stage_hook: ChmodStageHook = .{},
 
     // Controls (all retained by the view tree).
     name_label: objc.Object = undefined,
@@ -325,6 +336,11 @@ pub const InspectorController = struct {
         return self.selection.site_id != 0 and self.selection.items.len > 0;
     }
 
+    /// Wire the per-dispatch staging hook (browser overlay; main.zig).
+    pub fn setChmodStageHook(self: *InspectorController, hook: ChmodStageHook) void {
+        self.stage_hook = hook;
+    }
+
     /// Apply (optimistic chmod) to every selected item; returns how many
     /// operations were dispatched. Results stream back as op_done events.
     pub fn applyToSelection(self: *InspectorController) usize {
@@ -342,6 +358,9 @@ pub const InspectorController = struct {
             };
             dispatched += 1;
             self.chmod_dispatched += 1;
+            // Optimistic overlay: only ops that really dispatched stage.
+            if (self.stage_hook.stage) |stage|
+                stage(self.stage_hook.ctx, self.selection.pane_token, item.path, self.pending_mode);
         }
         return dispatched;
     }
@@ -721,10 +740,32 @@ test "inspector: Apply dispatches chmod per selected item; refusals come back as
     try insp.setSelection(.{ .pane_token = 7, .site_id = 99, .items = &items });
     insp.setPendingMode(0o640);
 
+    // The optimistic-overlay hook fires once per dispatched chmod.
+    const StageRecorder = struct {
+        calls: usize = 0,
+        pane: bridge.PaneToken = 0,
+        mode: u16 = 0,
+        last_path_ok: bool = false,
+
+        fn onStage(ctx: ?*anyopaque, pane_token: bridge.PaneToken, path: []const u8, mode: u16) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            self.pane = pane_token;
+            self.mode = mode;
+            self.last_path_ok = std.mem.eql(u8, path, "/data/c.bin");
+        }
+    };
+    var stage_rec: StageRecorder = .{};
+    insp.setChmodStageHook(.{ .ctx = &stage_rec, .stage = StageRecorder.onStage });
+
     // Site 99 is not connected: every op must come back as a classified
     // chmod failure through the bridge (optimistic UI's refusal path).
     try testing.expectEqual(@as(usize, 3), insp.applyToSelection());
     try testing.expectEqual(@as(u64, 3), insp.chmod_dispatched);
+    try testing.expectEqual(@as(usize, 3), stage_rec.calls);
+    try testing.expectEqual(@as(bridge.PaneToken, 7), stage_rec.pane);
+    try testing.expectEqual(@as(u16, 0o640), stage_rec.mode);
+    try testing.expect(stage_rec.last_path_ok);
 
     const Wait = struct {
         fn allFailed(ctl: *InspectorController) bool {

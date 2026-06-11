@@ -109,6 +109,11 @@ pub const SiteFields = struct {
     initial_remote_path: []const u8 = "",
     initial_local_path: []const u8 = "",
     insecure_skip_verify: bool = false,
+    /// Visual accent + deployment tag (phase 2; consumed by browser.zig —
+    /// see its accentUiColor hook). The editor sheet preserves these like
+    /// insecure_skip_verify until it grows controls for them.
+    accent: sites_mod.Accent = .none,
+    environment: sites_mod.Environment = .none,
 };
 
 pub const AuthMethod = enum { agent, key_file, password };
@@ -323,6 +328,8 @@ pub const SiteStore = struct {
                 .initial_remote_path = site.initial_remote_path,
                 .initial_local_path = site.initial_local_path,
                 .insecure_skip_verify = site.insecure_skip_verify,
+                .accent = site.accent,
+                .environment = site.environment,
             });
             try self.entries.append(self.gpa, .{ .site = owned, .persisted = true });
             if (site.id >= self.next_id) self.next_id = site.id + 1;
@@ -341,6 +348,8 @@ pub const SiteStore = struct {
             .initial_remote_path = try a.dupe(u8, fields.initial_remote_path),
             .initial_local_path = try a.dupe(u8, fields.initial_local_path),
             .insecure_skip_verify = fields.insecure_skip_verify,
+            .accent = fields.accent,
+            .environment = fields.environment,
         };
     }
 
@@ -790,6 +799,320 @@ fn readWholeFile(gpa: Allocator, io: std.Io, abs_path: []const u8) ![]u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Importers (File ▸ Import): FileZilla sitemanager.xml + Cyberduck .duck
+// bookmarks. Parsing is pure (hand-rolled minimal XML / plist-subset scans,
+// headless-tested against test/fixtures/importers/); the controller glue
+// below adds the non-duplicate sites as persisted entries and — with
+// explicit consent — FileZilla's base64 passwords into the Keychain.
+// Duplicate detection: SiteStore.findMatching, i.e. the connection identity
+// (protocol, host, effective port, user). SECURITY: decoded passwords live
+// only inside the ImportResult arena and the cred store — never sites.zon.
+// ---------------------------------------------------------------------------
+
+/// One parsed bookmark: site fields plus (FileZilla only) the decoded
+/// password. All slices are owned by the enclosing ImportResult's arena.
+pub const ImportedSite = struct {
+    fields: SiteFields,
+    password: ?[]const u8 = null,
+};
+
+/// Arena-per-result (one deinit frees everything, passwords included).
+pub const ImportResult = struct {
+    arena: std.heap.ArenaAllocator,
+    sites: []const ImportedSite = &.{},
+    /// Entries the parser had to skip (unsupported protocol, missing host).
+    skipped: usize = 0,
+
+    pub fn deinit(self: *ImportResult) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn passwordCount(self: *const ImportResult) usize {
+        var n: usize = 0;
+        for (self.sites) |site| {
+            if (site.password) |pw| n += @intFromBool(pw.len > 0);
+        }
+        return n;
+    }
+};
+
+/// What an import did (sheet summary + tests).
+pub const ImportStats = struct {
+    imported: usize = 0,
+    duplicates: usize = 0,
+    skipped: usize = 0,
+    passwords_stored: usize = 0,
+};
+
+// --- minimal XML helpers (shared by both importers) --------------------------
+
+const XmlTag = struct {
+    /// Raw attribute text of the open tag (between the name and '>').
+    attrs: []const u8,
+    /// Raw inner text (undecoded); empty for self-closing tags.
+    text: []const u8,
+};
+
+/// First `<tag …>text</tag>` inside `block`. Minimal by design: no nesting
+/// of the SAME tag inside itself (true for every field FileZilla/Cyberduck
+/// write), attributes are returned raw for the caller to scan.
+fn xmlTag(block: []const u8, comptime tag: []const u8) ?XmlTag {
+    const open = "<" ++ tag;
+    const close = "</" ++ tag ++ ">";
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, block, search, open)) |start| {
+        const after = start + open.len;
+        if (after >= block.len) return null;
+        // "<Pass" must not match "<Password>": the name must end here.
+        const ch = block[after];
+        if (ch != '>' and ch != ' ' and ch != '\t' and ch != '/' and ch != '\n' and ch != '\r') {
+            search = after;
+            continue;
+        }
+        const open_end = std.mem.indexOfScalarPos(u8, block, after, '>') orelse return null;
+        if (open_end > 0 and block[open_end - 1] == '/') {
+            return .{ .attrs = block[after .. open_end - 1], .text = "" };
+        }
+        const text_start = open_end + 1;
+        const text_end = std.mem.indexOfPos(u8, block, text_start, close) orelse return null;
+        return .{ .attrs = block[after..open_end], .text = block[text_start..text_end] };
+    }
+    return null;
+}
+
+fn xmlTagText(block: []const u8, comptime tag: []const u8) ?[]const u8 {
+    const found = xmlTag(block, tag) orelse return null;
+    return found.text;
+}
+
+/// Decode the five named XML entities plus decimal/hex character
+/// references (ASCII range only — enough for FileZilla/Cyberduck output);
+/// malformed references are copied verbatim.
+fn xmlDecode(a: Allocator, raw: []const u8) error{OutOfMemory}![]const u8 {
+    if (std.mem.indexOfScalar(u8, raw, '&') == null) return a.dupe(u8, raw);
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < raw.len) {
+        if (raw[i] != '&') {
+            try out.append(a, raw[i]);
+            i += 1;
+            continue;
+        }
+        const semi = std.mem.indexOfScalarPos(u8, raw, i, ';') orelse {
+            try out.append(a, raw[i]);
+            i += 1;
+            continue;
+        };
+        const name = raw[i + 1 .. semi];
+        const decoded: ?u8 = blk: {
+            if (std.mem.eql(u8, name, "amp")) break :blk '&';
+            if (std.mem.eql(u8, name, "lt")) break :blk '<';
+            if (std.mem.eql(u8, name, "gt")) break :blk '>';
+            if (std.mem.eql(u8, name, "quot")) break :blk '"';
+            if (std.mem.eql(u8, name, "apos")) break :blk '\'';
+            if (name.len > 1 and name[0] == '#') {
+                const v = if (name[1] == 'x' or name[1] == 'X')
+                    std.fmt.parseInt(u8, name[2..], 16) catch break :blk null
+                else
+                    std.fmt.parseInt(u8, name[1..], 10) catch break :blk null;
+                break :blk v;
+            }
+            break :blk null;
+        };
+        if (decoded) |ch| {
+            try out.append(a, ch);
+            i = semi + 1;
+        } else {
+            try out.append(a, raw[i]);
+            i += 1;
+        }
+    }
+    return out.items;
+}
+
+// --- FileZilla sitemanager.xml ------------------------------------------------
+
+/// FileZilla's ServerProtocol values we can represent. 0 = FTP,
+/// 1 = SFTP, 3 = FTPS (implicit TLS), 4 = FTPES (explicit TLS),
+/// 6 = "insecure FTP". Everything else (HTTP, S3, Storj, …) is skipped.
+fn fzProtocol(value: i32) ?sites_mod.Protocol {
+    return switch (value) {
+        0, 6 => .ftp,
+        1 => .sftp,
+        3, 4 => .ftps,
+        else => null,
+    };
+}
+
+/// Scan every `<Server>…</Server>` block (folders nest them; nesting depth
+/// is irrelevant to a linear scan). Passwords: `<Pass encoding="base64">`
+/// is decoded; legacy plaintext `<Pass>` is taken verbatim; passwords are
+/// only kept for Logontype 1 (normal) and 4 (account). Logontype 0
+/// (anonymous) maps to user "anonymous" without a password; ask (2),
+/// interactive (3) and key (5) keep the user and drop any stored secret.
+/// RemoteDir is skipped (FileZilla's segment encoding, not a plain path);
+/// LocalDir is a plain path and maps to initial_local_path.
+pub fn parseFileZilla(gpa: Allocator, xml: []const u8) error{OutOfMemory}!ImportResult {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    var sites: std.ArrayList(ImportedSite) = .empty;
+    var skipped: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, pos, "<Server")) |start| {
+        const after = start + "<Server".len;
+        if (after >= xml.len) break;
+        const ch = xml[after];
+        if (ch != '>' and ch != ' ' and ch != '\t') {
+            pos = after; // "<Servers>" wrapper, keep scanning inside it
+            continue;
+        }
+        const open_end = std.mem.indexOfScalarPos(u8, xml, after, '>') orelse break;
+        const body_end = std.mem.indexOfPos(u8, xml, open_end + 1, "</Server>") orelse break;
+        const block = xml[open_end + 1 .. body_end];
+        pos = body_end + "</Server>".len;
+
+        if (try parseFzServer(a, block)) |site| {
+            try sites.append(a, site);
+        } else {
+            skipped += 1;
+        }
+    }
+    return .{ .arena = arena, .sites = sites.items, .skipped = skipped };
+}
+
+fn parseFzServer(a: Allocator, block: []const u8) error{OutOfMemory}!?ImportedSite {
+    const host_raw = xmlTagText(block, "Host") orelse return null;
+    const host = try xmlDecode(a, std.mem.trim(u8, host_raw, " \t\r\n"));
+    if (host.len == 0) return null;
+
+    const proto_text = std.mem.trim(u8, xmlTagText(block, "Protocol") orelse "0", " \t\r\n");
+    const proto_num = std.fmt.parseInt(i32, proto_text, 10) catch return null;
+    const protocol = fzProtocol(proto_num) orelse return null;
+
+    const port_text = std.mem.trim(u8, xmlTagText(block, "Port") orelse "", " \t\r\n");
+    var port = std.fmt.parseInt(u16, port_text, 10) catch 0;
+    if (port == sites_mod.defaultPort(protocol)) port = 0; // store "default" canonically
+
+    const logontype_text = std.mem.trim(u8, xmlTagText(block, "Logontype") orelse "1", " \t\r\n");
+    const logontype = std.fmt.parseInt(u8, logontype_text, 10) catch 1;
+
+    var user: []const u8 = try xmlDecode(a, xmlTagText(block, "User") orelse "");
+    var password: ?[]const u8 = null;
+    switch (logontype) {
+        0 => user = "anonymous", // FileZilla's anonymous login identity
+        1, 4 => {
+            if (xmlTag(block, "Pass")) |pass| {
+                password = try decodeFzPass(a, pass);
+            }
+        },
+        else => {}, // ask / interactive / key: identity only, no secret
+    }
+
+    const name = try xmlDecode(a, xmlTagText(block, "Name") orelse "");
+    const local_dir = try xmlDecode(a, xmlTagText(block, "LocalDir") orelse "");
+
+    return .{
+        .fields = .{
+            .name = name,
+            .protocol = protocol,
+            .host = host,
+            .port = port,
+            .account = user,
+            .initial_local_path = local_dir,
+        },
+        .password = password,
+    };
+}
+
+/// `<Pass encoding="base64">…</Pass>` → decoded; legacy plaintext is taken
+/// verbatim; a corrupt base64 payload yields null (site still imports).
+fn decodeFzPass(a: Allocator, pass: XmlTag) error{OutOfMemory}!?[]const u8 {
+    const text = std.mem.trim(u8, pass.text, " \t\r\n");
+    if (text.len == 0) return null;
+    if (std.mem.indexOf(u8, pass.attrs, "base64") == null) return try xmlDecode(a, text);
+    const decoder = std.base64.standard.Decoder;
+    const size = decoder.calcSizeForSlice(text) catch return null;
+    const buf = try a.alloc(u8, size);
+    decoder.decode(buf, text) catch return null;
+    return buf;
+}
+
+// --- Cyberduck .duck bookmarks --------------------------------------------------
+
+/// Cyberduck protocol identifiers we can represent; everything else
+/// (s3, dav(s), azure, …) is skipped. Cyberduck stores secrets in its own
+/// keychain items, so .duck imports never carry passwords.
+fn duckProtocol(value: []const u8) ?sites_mod.Protocol {
+    if (std.mem.eql(u8, value, "sftp")) return .sftp;
+    if (std.mem.eql(u8, value, "ftps")) return .ftps;
+    if (std.mem.eql(u8, value, "ftp")) return .ftp;
+    return null;
+}
+
+/// `<key>K</key>` followed by `<string>…</string>` (or `<integer>`), the
+/// XML-plist subset .duck files use. Returns the raw (undecoded) value.
+fn plistValue(text: []const u8, comptime key: []const u8) ?[]const u8 {
+    const needle = "<key>" ++ key ++ "</key>";
+    const key_at = std.mem.indexOf(u8, text, needle) orelse return null;
+    var i = key_at + needle.len;
+    while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '\n' or text[i] == '\r')) i += 1;
+    const rest = text[i..];
+    inline for (.{ "string", "integer" }) |value_tag| {
+        const open = "<" ++ value_tag ++ ">";
+        const close = "</" ++ value_tag ++ ">";
+        if (std.mem.startsWith(u8, rest, open)) {
+            const end = std.mem.indexOf(u8, rest, close) orelse return null;
+            return rest[open.len..end];
+        }
+    }
+    return null;
+}
+
+/// Parse a batch of .duck file contents (one bookmark per file). Files
+/// with unsupported protocols or no hostname count as `skipped`.
+pub fn parseCyberduck(gpa: Allocator, files: []const []const u8) error{OutOfMemory}!ImportResult {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    var sites: std.ArrayList(ImportedSite) = .empty;
+    var skipped: usize = 0;
+    for (files) |text| {
+        if (try parseDuck(a, text)) |site| {
+            try sites.append(a, site);
+        } else {
+            skipped += 1;
+        }
+    }
+    return .{ .arena = arena, .sites = sites.items, .skipped = skipped };
+}
+
+fn parseDuck(a: Allocator, text: []const u8) error{OutOfMemory}!?ImportedSite {
+    const proto_raw = plistValue(text, "Protocol") orelse return null;
+    const protocol = duckProtocol(std.mem.trim(u8, proto_raw, " \t\r\n")) orelse return null;
+
+    const host_raw = plistValue(text, "Hostname") orelse return null;
+    const host = try xmlDecode(a, std.mem.trim(u8, host_raw, " \t\r\n"));
+    if (host.len == 0) return null;
+
+    const port_text = std.mem.trim(u8, plistValue(text, "Port") orelse "", " \t\r\n");
+    var port = std.fmt.parseInt(u16, port_text, 10) catch 0;
+    if (port == sites_mod.defaultPort(protocol)) port = 0;
+
+    return .{ .fields = .{
+        .name = try xmlDecode(a, plistValue(text, "Nickname") orelse ""),
+        .protocol = protocol,
+        .host = host,
+        .port = port,
+        .account = try xmlDecode(a, plistValue(text, "Username") orelse ""),
+        .initial_remote_path = try xmlDecode(a, plistValue(text, "Path") orelse ""),
+    } };
+}
+
+// ---------------------------------------------------------------------------
 // SitesController
 // ---------------------------------------------------------------------------
 
@@ -816,6 +1139,9 @@ pub const SitesController = struct {
     history: History,
     meta: AuthMetaStore,
     ssh: SshGroup,
+    /// mtime of {home}/.ssh/config at the last (re)parse; 0 = no file.
+    /// Gates the cheap re-parse on app activation.
+    ssh_config_mtime_ns: i96 = 0,
 
     /// Last site_status per site id (sidebar suffix + `siteStatus()`).
     statuses: std.AutoHashMapUnmanaged(u64, events_mod.SiteStatus) = .empty,
@@ -878,6 +1204,7 @@ pub const SitesController = struct {
         self.history.load(core.io, core.config_dir, history_file);
         self.meta.load(core.io, core.config_dir, meta_file);
         self.ssh.refresh(core.io, self.home);
+        self.ssh_config_mtime_ns = self.sshConfigMtimeNs();
 
         if (options.build_sidebar) {
             self.menu_reg = try menu_mod.Registry.create(gpa);
@@ -1268,8 +1595,26 @@ pub const SitesController = struct {
     }
 
     pub fn refreshSshConfig(self: *SitesController) void {
+        self.ssh_config_mtime_ns = self.sshConfigMtimeNs();
         self.ssh.refresh(self.core.io, self.home);
         if (self.sidebar) |sb| sb.reloadSection(section_ssh);
+    }
+
+    /// applicationDidBecomeActive hook (main.zig): cheap mtime stat first;
+    /// the smart group re-parses only when ~/.ssh/config really changed.
+    /// (The proper FSEvents watcher arrives with M3's edit-in-editor.)
+    pub fn refreshSshConfigIfChanged(self: *SitesController) void {
+        if (self.sshConfigMtimeNs() == self.ssh_config_mtime_ns) return;
+        self.refreshSshConfig();
+    }
+
+    /// mtime of {home}/.ssh/config in ns; 0 when missing/unstatable (a
+    /// file appearing or vanishing both read as a change).
+    fn sshConfigMtimeNs(self: *const SitesController) i96 {
+        var path_buf: [1024]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/.ssh/config", .{self.home}) catch return 0;
+        const st = std.Io.Dir.cwd().statFile(self.core.io, path, .{}) catch return 0;
+        return st.mtime.nanoseconds;
     }
 
     // ------------------------------------------------------------------ //
@@ -1433,8 +1778,14 @@ pub const SitesController = struct {
     /// prefers workers, but the sheet flows are rare, short generic-password
     /// writes; M2 accepts the trade for a race-free UX.
     fn storeSecret(self: *SitesController, site_id: u64, secret: []const u8, keep: bool) void {
-        const site = self.store.get(site_id) orelse return;
-        if (site.account.len == 0) return; // no account name = no cred key
+        _ = self.storeSecretChecked(site_id, secret, keep);
+    }
+
+    /// True exactly when the credential landed in the store (importers
+    /// count successes; the sheet flows ignore the result).
+    fn storeSecretChecked(self: *SitesController, site_id: u64, secret: []const u8, keep: bool) bool {
+        const site = self.store.get(site_id) orelse return false;
+        if (site.account.len == 0) return false; // no account name = no cred key
         const key: cred_store_mod.Key = .{
             .protocol = credProtocol(site.protocol),
             .host = site.host,
@@ -1444,9 +1795,10 @@ pub const SitesController = struct {
         var diag: Diagnostics = .{};
         self.core.cred_store.set(&diag, key, secret) catch {
             self.showError("Could not store the credential", diag.message);
-            return;
+            return false;
         };
         if (!keep) self.rememberTransient(site_id, key);
+        return true;
     }
 
     fn rememberTransient(self: *SitesController, site_id: u64, key: cred_store_mod.Key) void {
@@ -1659,6 +2011,16 @@ pub const SitesController = struct {
                     const old = self.store.get(id) orelse break :blk false;
                     break :blk old.insecure_skip_verify;
                 } else false,
+                // No editor controls yet (phase 2): preserve like
+                // insecure_skip_verify so hand-edited sites.zon survives.
+                .accent = if (s.site_id) |id| blk: {
+                    const old = self.store.get(id) orelse break :blk .none;
+                    break :blk old.accent;
+                } else .none,
+                .environment = if (s.site_id) |id| blk: {
+                    const old = self.store.get(id) orelse break :blk .none;
+                    break :blk old.environment;
+                } else .none,
             };
             var site_id: u64 = undefined;
             if (s.site_id) |id| {
@@ -1821,6 +2183,262 @@ pub const SitesController = struct {
             },
         }
     }
+
+    // ------------------------------------------------------------------ //
+    // Import (File ▸ Import ▸ FileZilla… / Cyberduck…)
+    //
+    // TODO(m3-integrate): the menu tree (controllers/prefs.zig, not this
+    // task's file) has no File ▸ Import submenu yet; phase 3 installs
+    // `importMenuItems()` there (the items are plain menu_mod.Item values,
+    // same contract as serverMenuItems()).
+
+    pub fn importMenuItems(self: *SitesController) [2]menu_mod.Item {
+        return .{
+            menu_mod.Item.call("From FileZilla…", .{ .ctx = self, .f = cmImportFileZilla }, "", .{}),
+            menu_mod.Item.call("From Cyberduck…", .{ .ctx = self, .f = cmImportCyberduck }, "", .{}),
+        };
+    }
+
+    fn cmImportFileZilla(ctx: ?*anyopaque) void {
+        fromMenuCtx(ctx).importFileZilla();
+    }
+
+    fn cmImportCyberduck(ctx: ?*anyopaque) void {
+        fromMenuCtx(ctx).importCyberduck();
+    }
+
+    /// Add every non-duplicate parsed site as a persisted entry; with
+    /// `import_passwords` the FileZilla secrets go to the Keychain (the UI
+    /// flow asks for consent first; headless callers decide directly).
+    pub fn applyImport(self: *SitesController, result: *const ImportResult, import_passwords: bool) ImportStats {
+        var stats: ImportStats = .{ .skipped = result.skipped };
+        for (result.sites) |site| {
+            if (self.store.findMatching(site.fields) != null) {
+                stats.duplicates += 1;
+                continue;
+            }
+            const site_id = self.store.add(site.fields, true) catch {
+                stats.skipped += 1;
+                continue;
+            };
+            stats.imported += 1;
+            if (import_passwords) {
+                if (site.password) |pw| {
+                    if (pw.len > 0 and self.storeSecretChecked(site_id, pw, true)) {
+                        stats.passwords_stored += 1;
+                    }
+                }
+            }
+        }
+        if (stats.imported > 0) {
+            self.persistSites();
+            self.syncCore();
+            if (self.sidebar) |sb| sb.reload();
+        }
+        return stats;
+    }
+
+    pub fn importFileZilla(self: *SitesController) void {
+        const session = self.gpa.create(ImportPickSession) catch return;
+        session.* = .{ .c = self, .kind = .filezilla };
+        _ = panels.beginOpenPanel(self.win, .{
+            .choose_files = true,
+            .message = "Choose FileZilla's sitemanager.xml (File ▸ Export… in FileZilla)",
+            .prompt = "Import",
+        }, session, ImportPickSession.onChosen);
+    }
+
+    pub fn importCyberduck(self: *SitesController) void {
+        const session = self.gpa.create(ImportPickSession) catch return;
+        session.* = .{ .c = self, .kind = .cyberduck };
+        _ = panels.beginOpenPanel(self.win, .{
+            .choose_files = true,
+            .choose_directories = true,
+            .allows_multiple = true,
+            .message = "Choose Cyberduck .duck bookmarks (or the whole Bookmarks folder)",
+            .prompt = "Import",
+        }, session, ImportPickSession.onChosen);
+    }
+
+    const ImportKind = enum { filezilla, cyberduck };
+
+    const ImportPickSession = struct {
+        c: *SitesController,
+        kind: ImportKind,
+
+        fn onChosen(s: *ImportPickSession, paths: []const []const u8) void {
+            const self = s.c;
+            defer self.gpa.destroy(s);
+            if (paths.len == 0) return;
+            switch (s.kind) {
+                .filezilla => self.finishFileZillaImport(paths[0]),
+                .cyberduck => self.finishCyberduckImport(paths),
+            }
+        }
+    };
+
+    fn finishFileZillaImport(self: *SitesController, path: []const u8) void {
+        const xml = readWholeFile(self.gpa, self.core.io, path) catch |err| {
+            self.showError("Could not read the FileZilla export", @errorName(err));
+            return;
+        };
+        defer self.gpa.free(xml);
+        var result = parseFileZilla(self.gpa, xml) catch return;
+
+        if (result.sites.len == 0) {
+            result.deinit();
+            self.showError("Nothing to import", "The file contains no supported FTP/FTPS/SFTP entries.");
+            return;
+        }
+
+        // Consent before any secret leaves the export: the alert names the
+        // exact count; "Sites Only" imports without touching the Keychain.
+        const win = self.win orelse {
+            // Headless: no consent surface = no secrets (askPrompt precedent).
+            const stats = self.applyImport(&result, false);
+            result.deinit();
+            std.log.info("relay sites: imported {d} FileZilla site(s) ({d} duplicates)", .{
+                stats.imported, stats.duplicates,
+            });
+            return;
+        };
+        const pw_count = result.passwordCount();
+        if (pw_count == 0) {
+            const stats = self.applyImport(&result, false);
+            result.deinit();
+            self.presentImportSummary(stats);
+            return;
+        }
+        const session = self.gpa.create(ImportConsentSession) catch {
+            result.deinit();
+            return;
+        };
+        session.* = .{ .c = self, .result = result };
+        var msg_buf: [160]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "Import {d} saved password{s} to the Keychain?", .{
+            pw_count, if (pw_count == 1) "" else "s",
+        }) catch "Import saved passwords to the Keychain?";
+        panels.beginAlertSheet(win, .{
+            .message = msg,
+            .informative = "FileZilla stores passwords base64-encoded in the export. " ++
+                "Relay keeps credentials only in the macOS Keychain — never in its config files.",
+            .buttons = &.{ "Import with Passwords", "Sites Only", "Cancel" },
+        }, session, ImportConsentSession.onAnswer);
+    }
+
+    const ImportConsentSession = struct {
+        c: *SitesController,
+        result: ImportResult,
+
+        fn onAnswer(s: *ImportConsentSession, alert: panels.AlertResult) void {
+            const self = s.c;
+            defer {
+                s.result.deinit();
+                self.gpa.destroy(s);
+            }
+            switch (alert.button) {
+                0, 1 => {
+                    const stats = self.applyImport(&s.result, alert.button == 0);
+                    self.presentImportSummary(stats);
+                },
+                else => {}, // Cancel: nothing imported
+            }
+        }
+    };
+
+    fn finishCyberduckImport(self: *SitesController, paths: []const []const u8) void {
+        const gpa = self.gpa;
+        const io = self.core.io;
+
+        var files: std.ArrayList([]u8) = .empty;
+        defer {
+            for (files.items) |file| gpa.free(file);
+            files.deinit(gpa);
+        }
+        var unreadable: usize = 0;
+        for (paths) |path| {
+            if (std.mem.endsWith(u8, path, ".duck")) {
+                appendOwnedFile(gpa, io, &files, path) catch {
+                    unreadable += 1;
+                };
+                continue;
+            }
+            // A folder selection: scan it (flat — Cyberduck's bookmark dir).
+            var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch {
+                unreadable += 1;
+                continue;
+            };
+            defer dir.close(io);
+            var it = dir.iterate();
+            var name_buf: [2048]u8 = undefined;
+            while (it.next(io) catch null) |entry| {
+                if (entry.kind != .file) continue;
+                if (!std.mem.endsWith(u8, entry.name, ".duck")) continue;
+                const full = std.fmt.bufPrint(&name_buf, "{s}/{s}", .{ path, entry.name }) catch continue;
+                appendOwnedFile(gpa, io, &files, full) catch {
+                    unreadable += 1;
+                };
+            }
+        }
+
+        if (files.items.len == 0) {
+            self.showError("Nothing to import", "No readable .duck bookmarks in the selection.");
+            return;
+        }
+        var result = parseCyberduck(gpa, contentsSlice(files.items)) catch return;
+        defer result.deinit();
+        var stats = self.applyImport(&result, false); // .duck files carry no secrets
+        stats.skipped += unreadable;
+        if (self.win != null) {
+            self.presentImportSummary(stats);
+        } else {
+            std.log.info("relay sites: imported {d} Cyberduck bookmark(s) ({d} duplicates)", .{
+                stats.imported, stats.duplicates,
+            });
+        }
+    }
+
+    fn appendOwnedFile(gpa: Allocator, io: std.Io, files: *std.ArrayList([]u8), path: []const u8) !void {
+        const data = try readWholeFile(gpa, io, path);
+        errdefer gpa.free(data);
+        try files.append(gpa, data);
+    }
+
+    fn contentsSlice(files: []const []u8) []const []const u8 {
+        return @ptrCast(files);
+    }
+
+    fn presentImportSummary(self: *SitesController, stats: ImportStats) void {
+        const win = self.win orelse return;
+        var msg_buf: [96]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "Imported {d} site{s}", .{
+            stats.imported, if (stats.imported == 1) "" else "s",
+        }) catch "Import complete";
+        var info_buf: [192]u8 = undefined;
+        const info = std.fmt.bufPrint(
+            &info_buf,
+            "{d} duplicate{s} skipped · {d} unsupported entr{s} skipped · {d} password{s} stored",
+            .{
+                stats.duplicates,       if (stats.duplicates == 1) "" else "s",
+                stats.skipped,          if (stats.skipped == 1) "y" else "ies",
+                stats.passwords_stored, if (stats.passwords_stored == 1) "" else "s",
+            },
+        ) catch "";
+        const session = self.gpa.create(ImportAckSession) catch return;
+        session.* = .{ .c = self };
+        panels.beginAlertSheet(win, .{
+            .message = msg,
+            .informative = info,
+        }, session, ImportAckSession.onAck);
+    }
+
+    const ImportAckSession = struct {
+        c: *SitesController,
+
+        fn onAck(s: *ImportAckSession, _: panels.AlertResult) void {
+            s.c.gpa.destroy(s);
+        }
+    };
 
     // ------------------------------------------------------------------ //
     // Errors
@@ -2157,6 +2775,150 @@ test "SshGroup: concrete aliases only; materialization resolves the config" {
     try testing.expect(!SshGroup.isConcreteAlias(""));
 }
 
+// --- importer tests (fixture corpus: test/fixtures/importers/) --------------
+
+/// Walks up from the test cwd to the repo root (marked by build.zig.zon),
+/// because `zig build` does not normalize the runner's cwd — the same
+/// pattern as the ftp listing corpus loaders.
+fn readImporterFixture(gpa: Allocator, name: []const u8) ![]u8 {
+    const io = std.testing.io;
+    var prefix: [30]u8 = ("../" ** 10).*;
+    var prefix_len: usize = 0;
+    while (prefix_len <= prefix.len) : (prefix_len += 3) {
+        var path_buf: [512]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}test/fixtures/importers/{s}", .{
+            prefix[0..prefix_len], name,
+        });
+        return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch |err|
+            switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+    }
+    return error.FileNotFound;
+}
+
+fn findImported(sites: []const ImportedSite, host: []const u8) ?*const ImportedSite {
+    for (sites) |*site| {
+        if (std.mem.eql(u8, site.fields.host, host)) return site;
+    }
+    return null;
+}
+
+test "xmlDecode: named entities + character references (ASCII range)" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings("a&b<c>d\"e'f", try xmlDecode(a, "a&amp;b&lt;c&gt;d&quot;e&apos;f"));
+    try testing.expectEqualStrings("A/Z", try xmlDecode(a, "&#65;/&#x5A;"));
+    // Malformed references copy verbatim instead of erroring.
+    try testing.expectEqualStrings("&nope;&#xZZ;&", try xmlDecode(a, "&nope;&#xZZ;&"));
+    // No-entity fast path.
+    try testing.expectEqualStrings("plain", try xmlDecode(a, "plain"));
+}
+
+test "parseFileZilla: fixture corpus maps protocols, logontypes, ports, passwords" {
+    const xml = try readImporterFixture(testing.allocator, "filezilla_sitemanager.xml");
+    defer testing.allocator.free(xml);
+
+    var result = try parseFileZilla(testing.allocator, xml);
+    defer result.deinit();
+
+    // 9 <Server> blocks: 7 supported, S3 (protocol 7) + empty host skipped.
+    try testing.expectEqual(@as(usize, 7), result.sites.len);
+    try testing.expectEqual(@as(usize, 2), result.skipped);
+    try testing.expectEqual(@as(usize, 3), result.passwordCount());
+
+    // Logontype 1 + base64 password; custom port survives.
+    const web1 = findImported(result.sites, "web1.example.com").?;
+    try testing.expectEqual(sites_mod.Protocol.sftp, web1.fields.protocol);
+    try testing.expectEqual(@as(u16, 2222), web1.fields.port);
+    try testing.expectEqualStrings("deploy", web1.fields.account);
+    try testing.expectEqualStrings("Prod Web", web1.fields.name);
+    try testing.expectEqualStrings("secret pa55!", web1.password.?);
+
+    // Legacy plaintext password (entity-decoded); default port stored as 0;
+    // LocalDir maps to initial_local_path.
+    const legacy = findImported(result.sites, "ftp.example.org").?;
+    try testing.expectEqual(sites_mod.Protocol.ftp, legacy.fields.protocol);
+    try testing.expectEqual(@as(u16, 0), legacy.fields.port);
+    try testing.expectEqualStrings("Legacy FTP & Friends", legacy.fields.name);
+    try testing.expectEqualStrings("/Users/alice/Sites & Stuff", legacy.fields.initial_local_path);
+    try testing.expectEqualStrings("plain&old", legacy.password.?);
+
+    // Folder-nested server; protocol 3 = implicit FTPS (990 = default = 0);
+    // Logontype 4 (account) keeps the password; UTF-8 user survives.
+    const secure = findImported(result.sites, "secure.example.net").?;
+    try testing.expectEqual(sites_mod.Protocol.ftps, secure.fields.protocol);
+    try testing.expectEqual(@as(u16, 0), secure.fields.port);
+    try testing.expectEqualStrings("café-user", secure.fields.account);
+    try testing.expectEqualStrings("Key&Café pass'word", secure.password.?);
+
+    // Protocol 4 = explicit TLS → ftps; Logontype 2 (ask) drops the stored
+    // secret but keeps the identity; non-default port survives.
+    const ask = findImported(result.sites, "ask.example.com").?;
+    try testing.expectEqual(sites_mod.Protocol.ftps, ask.fields.protocol);
+    try testing.expectEqual(@as(u16, 2121), ask.fields.port);
+    try testing.expectEqualStrings("bob", ask.fields.account);
+    try testing.expectEqual(@as(?[]const u8, null), ask.password);
+
+    // Protocol 6 = insecure FTP; Logontype 0 = anonymous identity.
+    const mirror = findImported(result.sites, "mirror.example.com").?;
+    try testing.expectEqual(sites_mod.Protocol.ftp, mirror.fields.protocol);
+    try testing.expectEqualStrings("anonymous", mirror.fields.account);
+    try testing.expectEqual(@as(?[]const u8, null), mirror.password);
+
+    // Logontype 5 (key file): identity only.
+    const key = findImported(result.sites, "key.example.com").?;
+    try testing.expectEqualStrings("git", key.fields.account);
+    try testing.expectEqual(@as(?[]const u8, null), key.password);
+
+    // Corrupt base64 yields a null password but the site still imports.
+    const corrupt = findImported(result.sites, "corrupt.example.com").?;
+    try testing.expectEqual(@as(?[]const u8, null), corrupt.password);
+}
+
+test "parseCyberduck: fixture bookmarks map the plist subset" {
+    const gpa = testing.allocator;
+    const names = [_][]const u8{
+        "prod_web.duck", "mirror_ftp.duck", "secure_drop.duck", "s3_bucket.duck",
+    };
+    var files: [names.len][]u8 = undefined;
+    var loaded: usize = 0;
+    defer for (files[0..loaded]) |file| gpa.free(file);
+    for (names, 0..) |name, i| {
+        files[i] = try readImporterFixture(gpa, name);
+        loaded = i + 1;
+    }
+
+    var result = try parseCyberduck(gpa, &.{ files[0], files[1], files[2], files[3] });
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 3), result.sites.len);
+    try testing.expectEqual(@as(usize, 1), result.skipped); // the s3 bookmark
+    try testing.expectEqual(@as(usize, 0), result.passwordCount()); // never any
+
+    const prod = findImported(result.sites, "web1.example.com").?;
+    try testing.expectEqual(sites_mod.Protocol.sftp, prod.fields.protocol);
+    try testing.expectEqual(@as(u16, 2222), prod.fields.port);
+    try testing.expectEqualStrings("deploy", prod.fields.account);
+    try testing.expectEqualStrings("Prod Web & API", prod.fields.name);
+    try testing.expectEqualStrings("/var/www/my site", prod.fields.initial_remote_path);
+
+    // <integer> port at the protocol default canonicalizes to 0.
+    const mirror = findImported(result.sites, "mirror.example.org").?;
+    try testing.expectEqual(sites_mod.Protocol.ftp, mirror.fields.protocol);
+    try testing.expectEqual(@as(u16, 0), mirror.fields.port);
+    try testing.expectEqualStrings("anonymous", mirror.fields.account);
+
+    const secure = findImported(result.sites, "secure.example.net").?;
+    try testing.expectEqual(sites_mod.Protocol.ftps, secure.fields.protocol);
+    try testing.expectEqual(@as(u16, 0), secure.fields.port); // 990 = default
+    try testing.expectEqualStrings("café-user", secure.fields.account);
+    try testing.expectEqualStrings("/drop", secure.fields.initial_remote_path);
+}
+
 // --- controller-level tests (real AppCore, manual pump, no window) ---------
 
 const Harness = struct {
@@ -2437,6 +3199,191 @@ test "controller: ssh-config rows materialize ephemeral sftp sites" {
     // Reconnecting the same alias reuses the ephemeral site.
     ctrl.connectSshAlias(0);
     try testing.expectEqual(@as(usize, 1), ctrl.store.entries.items.len);
+}
+
+test "controller: ssh-config re-parse on activation is mtime-gated" {
+    var h: Harness = undefined;
+    try h.start(null);
+
+    // A real on-disk home (absolute path) so the mtime stat exercises the
+    // same code path the app-activation hook uses.
+    const io = std.testing.io;
+    var home_buf: [64]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buf, "/tmp/relay-ssh-test-{d}", .{std.c.getpid()});
+    var path_buf: [96]u8 = undefined;
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, try std.fmt.bufPrint(&path_buf, "{s}/.ssh", .{home}));
+    defer cwd.deleteTree(io, home) catch {};
+    const config_path = try std.fmt.bufPrint(&path_buf, "{s}/.ssh/config", .{home});
+    try cwd.writeFile(io, .{ .sub_path = config_path, .data = "Host one\n  HostName one.example\n" });
+
+    const ctrl = try SitesController.create(testing.allocator, h.core, .{
+        .window = null,
+        .home = home,
+        .build_sidebar = false,
+    });
+    defer ctrl.destroy();
+    defer h.stop();
+
+    try testing.expectEqual(@as(usize, 1), ctrl.ssh.aliases.items.len);
+    try testing.expect(ctrl.ssh_config_mtime_ns != 0);
+
+    // Unchanged mtime: the activation hook short-circuits after the stat.
+    ctrl.refreshSshConfigIfChanged();
+    try testing.expectEqual(@as(usize, 1), ctrl.ssh.aliases.items.len);
+
+    // Changed file: force a recorded-mtime mismatch (filesystem mtime
+    // granularity makes "wait for a newer stamp" flaky) and re-parse.
+    try cwd.writeFile(io, .{
+        .sub_path = config_path,
+        .data = "Host one\n  HostName one.example\nHost two\n  HostName two.example\n",
+    });
+    ctrl.ssh_config_mtime_ns = -1; // simulate "stat differs"
+    ctrl.refreshSshConfigIfChanged();
+    try testing.expectEqual(@as(usize, 2), ctrl.ssh.aliases.items.len);
+    try testing.expect(ctrl.ssh_config_mtime_ns != -1); // stamp re-recorded
+
+    // Deleting the file reads as a change too (stat = 0) and empties the
+    // group instead of erroring.
+    try cwd.deleteFile(io, config_path);
+    ctrl.refreshSshConfigIfChanged();
+    try testing.expectEqual(@as(usize, 0), ctrl.ssh.aliases.items.len);
+    try testing.expectEqual(@as(i96, 0), ctrl.ssh_config_mtime_ns);
+}
+
+test "controller: applyImport dedupes by connection identity and stores passwords only with consent" {
+    var h: Harness = undefined;
+    // Stage one persisted site that collides with the fixture's first
+    // FileZilla server AND with prod_web.duck (cross-importer dupes).
+    try h.start(.{ .sites = &.{.{
+        .id = 1,
+        .name = "existing",
+        .protocol = .sftp,
+        .host = "web1.example.com",
+        .port = 2222,
+        .account = "deploy",
+    }} });
+
+    const ctrl = try SitesController.create(testing.allocator, h.core, .{
+        .window = null,
+        .home = "/nonexistent-relay-home",
+        .build_sidebar = false,
+    });
+    defer ctrl.destroy();
+    defer h.stop();
+
+    const xml = try readImporterFixture(testing.allocator, "filezilla_sitemanager.xml");
+    defer testing.allocator.free(xml);
+
+    // Consent given: passwords of NON-duplicate sites land in the store
+    // (web1's secret is skipped with its duplicate site).
+    var fz = try parseFileZilla(testing.allocator, xml);
+    var stats = ctrl.applyImport(&fz, true);
+    fz.deinit();
+    try testing.expectEqual(@as(usize, 6), stats.imported);
+    try testing.expectEqual(@as(usize, 1), stats.duplicates);
+    try testing.expectEqual(@as(usize, 2), stats.skipped);
+    try testing.expectEqual(@as(usize, 2), stats.passwords_stored);
+    try testing.expectEqual(@as(usize, 7), ctrl.store.persistedCount());
+
+    var diag: Diagnostics = .{};
+    const alice = try h.fake.credStore().get(testing.allocator, &diag, .{
+        .protocol = .ftp,
+        .host = "ftp.example.org",
+        .port = 21, // effectivePort: the canonical 0 keys as the default
+        .account = "alice",
+    });
+    defer cred_store_mod.freeSecret(testing.allocator, alice);
+    try testing.expectEqualStrings("plain&old", alice);
+    const cafe = try h.fake.credStore().get(testing.allocator, &diag, .{
+        .protocol = .ftps,
+        .host = "secure.example.net",
+        .port = 990,
+        .account = "café-user",
+    });
+    defer cred_store_mod.freeSecret(testing.allocator, cafe);
+    try testing.expectEqualStrings("Key&Café pass'word", cafe);
+    // The duplicate's password was NOT written.
+    try testing.expectError(error.NotFound, h.fake.credStore().get(testing.allocator, &diag, .{
+        .protocol = .sftp,
+        .host = "web1.example.com",
+        .port = 2222,
+        .account = "deploy",
+    }));
+
+    // Imports propagate like CRUD: core list + persisted sites.zon.
+    const mirror_id = ctrl.store.findMatching(.{
+        .protocol = .ftp,
+        .host = "mirror.example.com",
+        .account = "anonymous",
+    }).?;
+    try testing.expect(h.core.findSite(mirror_id) != null);
+    var loaded = try sites_mod.load(h.core.io, h.core.config_dir, bridge.sites_file, testing.allocator);
+    defer loaded.deinit();
+    try testing.expectEqual(@as(usize, 7), loaded.value.sites.len);
+
+    // Cyberduck round on top: prod_web.duck and secure_drop.duck now hit
+    // duplicates (one staged, one just imported); s3 skipped; mirror.org new.
+    const duck_names = [_][]const u8{ "prod_web.duck", "mirror_ftp.duck", "secure_drop.duck", "s3_bucket.duck" };
+    var ducks: [duck_names.len][]u8 = undefined;
+    var loaded_ducks: usize = 0;
+    defer for (ducks[0..loaded_ducks]) |file| testing.allocator.free(file);
+    for (duck_names, 0..) |name, i| {
+        ducks[i] = try readImporterFixture(testing.allocator, name);
+        loaded_ducks = i + 1;
+    }
+    var duck = try parseCyberduck(testing.allocator, &.{ ducks[0], ducks[1], ducks[2], ducks[3] });
+    stats = ctrl.applyImport(&duck, false);
+    duck.deinit();
+    try testing.expectEqual(@as(usize, 1), stats.imported);
+    try testing.expectEqual(@as(usize, 2), stats.duplicates);
+    try testing.expectEqual(@as(usize, 1), stats.skipped);
+    try testing.expectEqual(@as(usize, 0), stats.passwords_stored);
+    try testing.expectEqual(@as(usize, 8), ctrl.store.persistedCount());
+
+    // Re-importing the same FileZilla export is now a pure-duplicate no-op.
+    var again = try parseFileZilla(testing.allocator, xml);
+    stats = ctrl.applyImport(&again, true);
+    again.deinit();
+    try testing.expectEqual(@as(usize, 0), stats.imported);
+    try testing.expectEqual(@as(usize, 7), stats.duplicates);
+    try testing.expectEqual(@as(usize, 0), stats.passwords_stored);
+    try testing.expectEqual(@as(usize, 8), ctrl.store.persistedCount());
+}
+
+test "controller: applyImport without consent never touches the cred store" {
+    var h: Harness = undefined;
+    try h.start(null);
+
+    const ctrl = try SitesController.create(testing.allocator, h.core, .{
+        .window = null,
+        .home = "/nonexistent-relay-home",
+        .build_sidebar = false,
+    });
+    defer ctrl.destroy();
+    defer h.stop();
+
+    const xml = try readImporterFixture(testing.allocator, "filezilla_sitemanager.xml");
+    defer testing.allocator.free(xml);
+    var fz = try parseFileZilla(testing.allocator, xml);
+    const stats = ctrl.applyImport(&fz, false);
+    fz.deinit();
+
+    try testing.expectEqual(@as(usize, 7), stats.imported);
+    try testing.expectEqual(@as(usize, 0), stats.passwords_stored);
+    var diag: Diagnostics = .{};
+    try testing.expectError(error.NotFound, h.fake.credStore().get(testing.allocator, &diag, .{
+        .protocol = .sftp,
+        .host = "web1.example.com",
+        .port = 2222,
+        .account = "deploy",
+    }));
+    try testing.expectError(error.NotFound, h.fake.credStore().get(testing.allocator, &diag, .{
+        .protocol = .ftp,
+        .host = "ftp.example.org",
+        .port = 21,
+        .account = "alice",
+    }));
 }
 
 test "visual: sidebar in a real window (set RELAY_SITES_VISUAL=1)" {

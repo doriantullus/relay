@@ -20,10 +20,16 @@ pub const StyleMask = struct {
     pub const closable: NSUInteger = 1 << 1;
     pub const miniaturizable: NSUInteger = 1 << 2;
     pub const resizable: NSUInteger = 1 << 3;
+    /// NSWindowStyleMaskNonactivatingPanel (NSPanel only): the panel takes
+    /// key without activating the app — palette/HUD panels.
+    pub const nonactivating_panel: NSUInteger = 1 << 7;
     pub const full_size_content_view: NSUInteger = 1 << 15;
     /// titled | closable | miniaturizable | resizable — the document default.
     pub const standard: NSUInteger = titled | closable | miniaturizable | resizable;
 };
+
+/// NSFloatingWindowLevel — palette/utility panels above document windows.
+pub const level_floating: NSInteger = 3;
 
 const backing_store_buffered: NSUInteger = 2;
 const activation_policy_regular: NSInteger = 0;
@@ -109,15 +115,28 @@ pub const Window = struct {
     obj: objc.Object,
 
     /// Caller-owned NSWindow (releasedWhenClosed disabled, retain count 1).
-    pub fn create(frame: NSRect, title_text: []const u8, style: NSUInteger) Window {
+    pub fn create(content_frame: NSRect, title_text: []const u8, style: NSUInteger) Window {
         const win = foundation.class("NSWindow").msgSend(objc.Object, "alloc", .{})
             .msgSend(objc.Object, "initWithContentRect:styleMask:backing:defer:", .{
-            frame, style, backing_store_buffered, false,
+            content_frame, style, backing_store_buffered, false,
         });
         win.msgSend(void, "setReleasedWhenClosed:", .{false});
         const self: Window = .{ .obj = win };
         self.setTitle(title_text);
         return self;
+    }
+
+    /// Like `create`, but instantiating `cls` — an NSWindow/NSPanel
+    /// subclass, typically runtime-defined (M3 palette: a panel overriding
+    /// canBecomeKeyWindow so a borderless panel can take key). Same
+    /// ownership: caller-owned, releasedWhenClosed disabled.
+    pub fn createWithClass(cls: objc.Class, content_frame: NSRect, style: NSUInteger) Window {
+        const win = cls.msgSend(objc.Object, "alloc", .{})
+            .msgSend(objc.Object, "initWithContentRect:styleMask:backing:defer:", .{
+            content_frame, style, backing_store_buffered, false,
+        });
+        win.msgSend(void, "setReleasedWhenClosed:", .{false});
+        return .{ .obj = win };
     }
 
     /// Wrap an NSWindow that arrived from AppKit (delegate args, sheets).
@@ -168,6 +187,21 @@ pub const Window = struct {
 
     pub fn isVisible(self: Window) bool {
         return foundation.toBool(self.obj.msgSend(foundation.BOOL, "isVisible", .{}));
+    }
+
+    /// Window frame in screen coordinates.
+    pub fn frame(self: Window) NSRect {
+        return self.obj.msgSend(NSRect, "frame", .{});
+    }
+
+    /// Move (bottom-left origin, screen coordinates) without resizing.
+    pub fn setFrameOrigin(self: Window, origin: foundation.NSPoint) void {
+        self.obj.msgSend(void, "setFrameOrigin:", .{origin});
+    }
+
+    /// NSWindowLevel (see `level_floating`).
+    pub fn setLevel(self: Window, level: NSInteger) void {
+        self.obj.msgSend(void, "setLevel:", .{level});
     }
 
     /// Frame persistence across launches (docs/UX.md: every split/window
@@ -287,6 +321,28 @@ test "Window create + title round-trip + content view" {
     win.setContentView(view);
     try testing.expectEqual(view.value, win.contentView().value);
     try testing.expect(!win.isVisible());
+}
+
+test "createWithClass + frame/level primitives (headless)" {
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const win = Window.createWithClass(
+        foundation.class("NSPanel"),
+        foundation.rect(10, 20, 300, 200),
+        StyleMask.borderless | StyleMask.nonactivating_panel,
+    );
+    defer win.release();
+    try testing.expectEqualStrings("NSPanel", win.obj.getClassName());
+
+    win.setLevel(level_floating);
+    try testing.expectEqual(level_floating, win.obj.msgSend(NSInteger, "level", .{}));
+
+    win.setFrameOrigin(foundation.point(50, 60));
+    const f = win.frame();
+    try testing.expectEqual(@as(foundation.CGFloat, 50), f.origin.x);
+    try testing.expectEqual(@as(foundation.CGFloat, 60), f.origin.y);
+    try testing.expectEqual(@as(foundation.CGFloat, 300), f.size.width);
 }
 
 var g_close_calls: u32 = 0;

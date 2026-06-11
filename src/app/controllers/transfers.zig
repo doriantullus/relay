@@ -4,6 +4,14 @@
 //! Failed / Clear Completed, Cmd+J collapse via the split_view wrapper, and
 //! one-shot auto-expand when the first transfer of the session starts.
 //!
+//! M3 adds the bandwidth limits surface: a "Limits" header button toggling
+//! a compact controls row (download/upload on/off + KB/s value) wired to
+//! the queue engine's global token buckets. With a PrefsController
+//! attached (`attachPrefs`) the strip routes through its `setRateLimit`,
+//! so the Settings pane, settings.zon and the prefs change listeners all
+//! stay coherent; standalone it falls back to `applyGlobalRateLimit`
+//! below. Per-site concurrency stays in Settings (per the M3 brief).
+//!
 //! Tabs:
 //!  - Transfers: table_source rows (filename, direction-arrow SF Symbol,
 //!    flat progress tint, rate, ETA from the engine's EWMA rate, state),
@@ -25,6 +33,9 @@ const relay = @import("relay_core");
 const mac = @import("relay_mac");
 const bridge = @import("../bridge.zig");
 const transcript_mod = @import("transcript.zig");
+const prefs_mod = @import("prefs.zig");
+
+const controls = prefs_mod.controls;
 
 const objc = mac.objc;
 const c = objc.c;
@@ -105,6 +116,67 @@ pub fn errorClassLabel(class: diag_mod.ErrorClass) []const u8 {
         .auth => "Auth",
         .cancel => "Canceled",
     };
+}
+
+// ---------------------------------------------------------------------------
+// Bandwidth limits (M3): pure helpers + the apply seam
+// ---------------------------------------------------------------------------
+
+/// Checked-but-empty limit fields fall back here so the limiter is
+/// observable instead of silently unlimited (same constant as the
+/// Settings pane's applyRateRow).
+pub const default_rate_bytes: u64 = 1024 * 1024;
+
+/// Strip-field KB/s text → bytes/s; null = empty/invalid/zero (the caller
+/// substitutes `default_rate_bytes`, mirroring the Settings pane).
+pub fn rateFieldToBytes(text: []const u8) ?u64 {
+    const trimmed = std.mem.trim(u8, text, " \t");
+    const kb = std.fmt.parseInt(u64, trimmed, 10) catch 0;
+    if (kb == 0) return null;
+    return kb *| 1024;
+}
+
+/// Header-button caption summarizing the global caps (KB/s, the Settings
+/// pane's unit). "Limits" when both directions are unlimited.
+pub fn limitsButtonTitle(buf: []u8, down_bps: u64, up_bps: u64) []const u8 {
+    if (down_bps == 0 and up_bps == 0) return "Limits";
+    if (up_bps == 0)
+        return std.fmt.bufPrint(buf, "Limits: ↓ {d} KB/s", .{down_bps / 1024}) catch "Limits";
+    if (down_bps == 0)
+        return std.fmt.bufPrint(buf, "Limits: ↑ {d} KB/s", .{up_bps / 1024}) catch "Limits";
+    return std.fmt.bufPrint(buf, "Limits: ↓ {d} ↑ {d} KB/s", .{
+        down_bps / 1024, up_bps / 1024,
+    }) catch "Limits";
+}
+
+/// Persist + live-apply a global rate cap (0 = unlimited) when no
+/// PrefsController is attached: settings slot → settings.zon → the queue
+/// engine's token bucket (`Engine.setGlobalRateLimit` is main-thread safe;
+/// it locks briefly, never across I/O).
+///
+/// TODO(m3-integrate): bridge.zig (not this task's file) still has no
+/// setGlobalRateLimit pass-through — both this function and
+/// prefs.PrefsController.setRateLimit reach `core.engine` directly (the
+/// pre-existing TODO(m2-dedupe) in prefs.zig). When the integrator
+/// promotes it to a bridge command, both call sites collapse onto it.
+pub fn applyGlobalRateLimit(
+    core: *bridge.AppCore,
+    direction: prefs_mod.RateDirection,
+    bytes_per_s: u64,
+) void {
+    const slot = switch (direction) {
+        .download => &core.settings.rate_limit_down,
+        .upload => &core.settings.rate_limit_up,
+    };
+    if (slot.* == bytes_per_s) return;
+    slot.* = bytes_per_s;
+    core.saveSettings() catch |err| {
+        std.log.warn("transfers: failed to persist rate limits: {t}", .{err});
+    };
+    core.engine.setGlobalRateLimit(switch (direction) {
+        .download => .download,
+        .upload => .upload,
+    }, bytes_per_s);
 }
 
 // ---------------------------------------------------------------------------
@@ -344,7 +416,8 @@ fn targetClass() runtime.Error!runtime.DefinedClass {
 }
 
 const header_h: f64 = 30;
-const default_w: f64 = 900;
+const limits_bar_h: f64 = 28;
+const default_w: f64 = 980;
 const default_h: f64 = 240;
 const max_sel = 512;
 
@@ -415,6 +488,20 @@ pub const TransfersController = struct {
     reveal_ctx: ?*anyopaque = null,
     reveal_fn: ?RevealFn = null,
 
+    // Bandwidth limits strip (M3). When a PrefsController is attached the
+    // strip routes every change through its setRateLimit (single writer:
+    // persist + engine + change listeners → the Settings pane stays in
+    // sync); standalone it falls back to applyGlobalRateLimit.
+    prefs: ?*prefs_mod.PrefsController = null,
+    control_target: *controls.ControlTarget,
+    limits_btn: objc.Object,
+    limits_bar: objc.Object,
+    limit_down_check: objc.Object,
+    limit_down_field: objc.Object,
+    limit_up_check: objc.Object,
+    limit_up_field: objc.Object,
+    limits_visible: bool = false,
+
     pub fn create(gpa: Allocator, core: *bridge.AppCore) !*TransfersController {
         const self = try gpa.create(TransfersController);
         errdefer gpa.destroy(self);
@@ -440,6 +527,13 @@ pub const TransfersController = struct {
             .target = undefined,
             .icon_up = null,
             .icon_down = null,
+            .control_target = undefined,
+            .limits_btn = undefined,
+            .limits_bar = undefined,
+            .limit_down_check = undefined,
+            .limit_down_field = undefined,
+            .limit_up_check = undefined,
+            .limit_up_field = undefined,
         };
         errdefer self.model.deinit();
 
@@ -509,7 +603,10 @@ pub const TransfersController = struct {
         self.icon_down = uiglue.retainId(table_source.systemSymbolImage("arrow.down.circle.fill"));
         self.icon_up = uiglue.retainId(table_source.systemSymbolImage("arrow.up.circle.fill"));
 
-        self.buildViews();
+        self.control_target = try controls.ControlTarget.create(gpa);
+        errdefer self.control_target.destroy();
+
+        try self.buildViews();
 
         try core.registerListener(.transfer_state, self, onTransferState);
         try core.registerListener(.transfer_progress, self, onTransferProgress);
@@ -536,10 +633,12 @@ pub const TransfersController = struct {
         uiglue.release(self.retry_btn);
         uiglue.release(self.clear_btn);
         uiglue.release(self.agg_label);
+        uiglue.release(self.limits_bar);
         uiglue.release(self.header);
         uiglue.release(self.content);
         uiglue.release(self.root);
         uiglue.release(self.target);
+        self.control_target.destroy();
         self.failed.deinit(self.gpa);
         self.model.deinit();
         const gpa = self.gpa;
@@ -579,7 +678,7 @@ pub const TransfersController = struct {
 
     // --- view construction -------------------------------------------------
 
-    fn buildViews(self: *TransfersController) void {
+    fn buildViews(self: *TransfersController) error{OutOfMemory}!void {
         self.root = uiglue.makeView(foundation.rect(0, 0, default_w, default_h));
 
         // Header strip, pinned to the top edge.
@@ -597,15 +696,58 @@ pub const TransfersController = struct {
         self.resume_btn = uiglue.makeButton("Resume All", foundation.rect(390, 4, 94, 22), self.target.value, "relayTransfersResumeAll:");
         self.retry_btn = uiglue.makeButton("Retry Failed", foundation.rect(490, 4, 96, 22), self.target.value, "relayTransfersRetryFailed:");
         self.clear_btn = uiglue.makeButton("Clear Completed", foundation.rect(592, 4, 120, 22), self.target.value, "relayTransfersClearCompleted:");
-        self.agg_label = uiglue.makeLabel("Idle", foundation.rect(default_w - 188, 8, 180, 16), true);
+        self.agg_label = uiglue.makeLabel("Idle", foundation.rect(default_w - 158, 8, 150, 16), true);
         uiglue.setAutoresizing(self.agg_label, uiglue.mask_min_x_margin);
+
+        // Bandwidth limits toggle (the strip below carries the controls).
+        self.limits_btn = controls.makePushButton("Limits", foundation.rect(718, 4, 150, 22));
+        try self.control_target.wire(self.limits_btn, self, onLimitsToggle);
 
         uiglue.addSubview(self.header, self.seg);
         uiglue.addSubview(self.header, self.pause_btn);
         uiglue.addSubview(self.header, self.resume_btn);
         uiglue.addSubview(self.header, self.retry_btn);
         uiglue.addSubview(self.header, self.clear_btn);
+        uiglue.addSubview(self.header, self.limits_btn);
         uiglue.addSubview(self.header, self.agg_label);
+
+        // Bandwidth limits strip (hidden until the Limits button shows it),
+        // pinned right under the header.
+        self.limits_bar = uiglue.makeView(foundation.rect(
+            0,
+            default_h - header_h - limits_bar_h,
+            default_w,
+            limits_bar_h,
+        ));
+        uiglue.setAutoresizing(self.limits_bar, uiglue.mask_width_sizable | uiglue.mask_min_y_margin);
+        self.limit_down_check = controls.makeCheckbox("Limit download", foundation.rect(8, 5, 128, 18));
+        self.limit_down_field = controls.makeTextField(foundation.rect(140, 3, 64, 22), "");
+        self.limit_up_check = controls.makeCheckbox("Limit upload", foundation.rect(262, 5, 114, 18));
+        self.limit_up_field = controls.makeTextField(foundation.rect(380, 3, 64, 22), "");
+        try self.control_target.wire(self.limit_down_check, self, onLimitChanged);
+        try self.control_target.wire(self.limit_down_field, self, onLimitChanged);
+        try self.control_target.wire(self.limit_up_check, self, onLimitChanged);
+        try self.control_target.wire(self.limit_up_field, self, onLimitChanged);
+        controls.addSubview(self.limits_bar, self.limit_down_check);
+        controls.addSubview(self.limits_bar, self.limit_down_field);
+        controls.addSubview(self.limits_bar, controls.makeLabel(
+            "KB/s",
+            foundation.rect(208, 7, 40, 15),
+            .{ .secondary = true, .small = true },
+        ));
+        controls.addSubview(self.limits_bar, self.limit_up_check);
+        controls.addSubview(self.limits_bar, self.limit_up_field);
+        controls.addSubview(self.limits_bar, controls.makeLabel(
+            "KB/s",
+            foundation.rect(448, 7, 40, 15),
+            .{ .secondary = true, .small = true },
+        ));
+        controls.addSubview(self.limits_bar, controls.makeLabel(
+            "Global caps · per-site concurrency lives in Settings",
+            foundation.rect(508, 7, 340, 15),
+            .{ .secondary = true, .small = true },
+        ));
+        uiglue.setHidden(self.limits_bar, true);
 
         // Content area hosting the three tab views.
         const content_frame = foundation.rect(0, 0, default_w, default_h - header_h);
@@ -621,8 +763,107 @@ pub const TransfersController = struct {
         }
 
         uiglue.addSubview(self.root, self.header);
+        uiglue.addSubview(self.root, self.limits_bar);
         uiglue.addSubview(self.root, self.content);
         self.showTab(.transfers);
+        self.syncLimitsUi();
+    }
+
+    // --- bandwidth limits strip ----------------------------------------------
+
+    /// Phase 3: hand over the Settings controller so the strip and the
+    /// Settings pane share one writer + change feed.
+    pub fn attachPrefs(self: *TransfersController, pc: *prefs_mod.PrefsController) error{OutOfMemory}!void {
+        self.prefs = pc;
+        try pc.addChangeListener(self, onPrefsChanged);
+        self.syncLimitsUi();
+    }
+
+    fn onPrefsChanged(ctx: ?*anyopaque) void {
+        const self: *TransfersController = @ptrCast(@alignCast(ctx.?));
+        self.syncLimitsUi();
+    }
+
+    /// Show/hide the limits strip, taking its height from the content area.
+    pub fn setLimitsVisible(self: *TransfersController, visible: bool) void {
+        if (self.limits_visible == visible) return;
+        self.limits_visible = visible;
+        var frame = self.content.msgSend(foundation.NSRect, "frame", .{});
+        if (visible) {
+            frame.size.height -= limits_bar_h;
+        } else {
+            frame.size.height += limits_bar_h;
+        }
+        uiglue.setFrame(self.content, frame);
+        uiglue.setFrame(self.limits_bar, foundation.rect(
+            frame.origin.x,
+            frame.origin.y + frame.size.height,
+            frame.size.width,
+            limits_bar_h,
+        ));
+        uiglue.setHidden(self.limits_bar, !visible);
+        if (visible) self.syncLimitsUi();
+    }
+
+    fn onLimitsToggle(ctx: ?*anyopaque, sender: c.id) void {
+        _ = sender;
+        const self: *TransfersController = @ptrCast(@alignCast(ctx.?));
+        self.setLimitsVisible(!self.limits_visible);
+    }
+
+    fn onLimitChanged(ctx: ?*anyopaque, sender: c.id) void {
+        _ = sender;
+        const self: *TransfersController = @ptrCast(@alignCast(ctx.?));
+        self.applyLimitRow(.download, self.limit_down_check, self.limit_down_field);
+        self.applyLimitRow(.upload, self.limit_up_check, self.limit_up_field);
+        self.syncLimitsUi();
+    }
+
+    /// Same semantics as the Settings pane's applyRateRow: unchecked = 0
+    /// (unlimited); checked with no usable number = the observable 1 MB/s.
+    fn applyLimitRow(
+        self: *TransfersController,
+        direction: prefs_mod.RateDirection,
+        check: objc.Object,
+        field: objc.Object,
+    ) void {
+        var bytes: u64 = 0;
+        if (controls.isChecked(check)) {
+            const text = controls.textValue(self.gpa, field) catch return;
+            defer self.gpa.free(text);
+            bytes = rateFieldToBytes(text) orelse default_rate_bytes;
+        }
+        self.setGlobalRate(direction, bytes);
+    }
+
+    fn setGlobalRate(self: *TransfersController, direction: prefs_mod.RateDirection, bytes_per_s: u64) void {
+        if (self.prefs) |pc| {
+            pc.setRateLimit(direction, bytes_per_s); // persists + engine + listeners
+            return;
+        }
+        applyGlobalRateLimit(self.core, direction, bytes_per_s);
+    }
+
+    /// Push settings truth into the strip + the header button caption.
+    fn syncLimitsUi(self: *TransfersController) void {
+        const down = self.core.settings.rate_limit_down;
+        const up = self.core.settings.rate_limit_up;
+        var title_buf: [48]u8 = undefined;
+        self.limits_btn.msgSend(void, "setTitle:", .{
+            foundation.nsString(limitsButtonTitle(&title_buf, down, up)),
+        });
+        syncLimitRow(self.limit_down_check, self.limit_down_field, down);
+        syncLimitRow(self.limit_up_check, self.limit_up_field, up);
+    }
+
+    fn syncLimitRow(check: objc.Object, field: objc.Object, bytes_per_s: u64) void {
+        const on = bytes_per_s > 0;
+        controls.setChecked(check, on);
+        controls.setEnabled(field, on);
+        if (on) {
+            var buf: [24]u8 = undefined;
+            controls.setTextValue(field, std.fmt.bufPrint(&buf, "{d}", .{bytes_per_s / 1024}) catch "?");
+        }
     }
 
     // --- bridge events -------------------------------------------------------
@@ -1251,6 +1492,71 @@ test "queue model: allocation failures neither leak nor corrupt" {
     try testing.checkAllAllocationFailures(testing.allocator, Fns.cycle, .{});
 }
 
+test "rate field parsing mirrors the Settings pane semantics" {
+    try testing.expectEqual(@as(?u64, 512 * 1024), rateFieldToBytes("512"));
+    try testing.expectEqual(@as(?u64, 1024), rateFieldToBytes(" 1 "));
+    try testing.expectEqual(@as(?u64, null), rateFieldToBytes(""));
+    try testing.expectEqual(@as(?u64, null), rateFieldToBytes("0"));
+    try testing.expectEqual(@as(?u64, null), rateFieldToBytes("banana"));
+    try testing.expectEqual(@as(?u64, null), rateFieldToBytes("-3"));
+    // Saturating multiply: absurd input cannot overflow.
+    try testing.expectEqual(
+        @as(?u64, std.math.maxInt(u64)),
+        rateFieldToBytes("18446744073709551615"),
+    );
+}
+
+test "limits button title summarizes the caps" {
+    var buf: [48]u8 = undefined;
+    try testing.expectEqualStrings("Limits", limitsButtonTitle(&buf, 0, 0));
+    try testing.expectEqualStrings("Limits: ↓ 500 KB/s", limitsButtonTitle(&buf, 500 * 1024, 0));
+    try testing.expectEqualStrings("Limits: ↑ 250 KB/s", limitsButtonTitle(&buf, 0, 250 * 1024));
+    try testing.expectEqualStrings(
+        "Limits: ↓ 500 ↑ 250 KB/s",
+        limitsButtonTitle(&buf, 500 * 1024, 250 * 1024),
+    );
+}
+
+test "applyGlobalRateLimit persists settings and retunes the engine buckets" {
+    const gpa = testing.allocator;
+    var tmp_conf = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_conf.cleanup();
+    var tmp_root = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_root.cleanup();
+    var fake = relay.cred.fake.FakeStore.init(gpa);
+    defer fake.deinit();
+
+    const core = try bridge.AppCore.initOptions(gpa, .{
+        .pump = .manual,
+        .config_dir = tmp_conf.dir,
+        .local_root = tmp_root.dir,
+        .cred_store = fake.credStore(),
+    });
+    defer core.shutdown();
+
+    // Defaults: unlimited both ways.
+    try testing.expectEqual(@as(u64, 0), core.engine.global_down.rate);
+    try testing.expectEqual(@as(u64, 0), core.engine.global_up.rate);
+
+    applyGlobalRateLimit(core, .download, 512 * 1024);
+    applyGlobalRateLimit(core, .upload, 256 * 1024);
+    try testing.expectEqual(@as(u64, 512 * 1024), core.settings.rate_limit_down);
+    try testing.expectEqual(@as(u64, 512 * 1024), core.engine.global_down.rate);
+    try testing.expectEqual(@as(u64, 256 * 1024), core.engine.global_up.rate);
+
+    // Persisted: a fresh settings load sees both caps.
+    const on_disk = try relay.settings.load(core.io, tmp_conf.dir, bridge.settings_file, gpa);
+    try testing.expectEqual(@as(u64, 512 * 1024), on_disk.rate_limit_down);
+    try testing.expectEqual(@as(u64, 256 * 1024), on_disk.rate_limit_up);
+
+    // No-change calls are no-ops; switching off returns to unlimited.
+    applyGlobalRateLimit(core, .download, 512 * 1024);
+    try testing.expectEqual(@as(u64, 512 * 1024), core.engine.global_down.rate);
+    applyGlobalRateLimit(core, .download, 0);
+    try testing.expectEqual(@as(u64, 0), core.engine.global_down.rate);
+    try testing.expectEqual(@as(u64, 0), core.settings.rate_limit_down);
+}
+
 test "target class defines and round-trips state (headless)" {
     const pool = foundation.AutoreleasePool.init();
     defer pool.deinit();
@@ -1295,6 +1601,7 @@ test "visual smoke: transfer panel with synthetic events (set RELAY_VISUAL_SMOKE
     win.setContentView(objc.Object.fromId(tc.view()));
     win.makeKeyAndOrderFront();
     app.activate();
+    tc.setLimitsVisible(true); // bandwidth strip visible for the eyeball pass
 
     // Real queue items: two paused (driven synthetically below) and one
     // live local transfer whose source is missing → a real Failed row with

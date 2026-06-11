@@ -191,8 +191,8 @@ fn newMenuItem(title: [:0]const u8, action_sel: ?objc.Sel, key: [:0]const u8) ob
     const sel_val: c.SEL = if (action_sel) |s| s.value else null;
     return foundation.class("NSMenuItem").msgSend(objc.Object, "alloc", .{})
         .msgSend(objc.Object, "initWithTitle:action:keyEquivalent:", .{
-            foundation.nsStringZ(title), sel_val, foundation.nsStringZ(key),
-        });
+        foundation.nsStringZ(title), sel_val, foundation.nsStringZ(key),
+    });
 }
 
 fn addLeaf(menu: objc.Object, reg: *Registry, leaf: Leaf) std.mem.Allocator.Error!objc.Object {

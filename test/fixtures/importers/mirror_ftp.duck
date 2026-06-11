@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Protocol</key>
+	<string>ftp</string>
+	<key>Nickname</key>
+	<string>Public Mirror</string>
+	<key>UUID</key>
+	<string>7df0a7a4-2222-4d63-a2a3-1a3b8e3c0002</string>
+	<key>Hostname</key>
+	<string>mirror.example.org</string>
+	<key>Port</key>
+	<integer>21</integer>
+	<key>Username</key>
+	<string>anonymous</string>
+</dict>
+</plist>

@@ -123,6 +123,8 @@ pub fn build(b: *std.Build) void {
         });
         mac_mod.linkFramework("AppKit", .{});
         mac_mod.linkFramework("Foundation", .{});
+        mac_mod.linkFramework("QuickLookUI", .{}); // quicklook.zig (QLPreviewPanel)
+        mac_mod.linkFramework("CoreServices", .{}); // fsevents.zig (FSEventStream*)
 
         const mac_tests = b.addTest(.{ .root_module = mac_mod });
         test_step.dependOn(&b.addRunArtifact(mac_tests).step);

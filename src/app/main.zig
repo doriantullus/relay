@@ -1,4 +1,4 @@
-//! Relay — native macOS FTP/FTPS/SFTP client. M2 entry point.
+//! Relay — native macOS FTP/FTPS/SFTP client. M3 entry point.
 //!
 //! Boot sequence (docs/UX.md, docs/ARCHITECTURE.md):
 //!   AppCore (relay_core behind src/app/bridge.zig) → NSApplication +
@@ -7,11 +7,23 @@
 //!   panel (NSSplitViews with autosave names); all controllers; menu bar
 //!   bound through the CommandRegistry → [NSApp run].
 //!
+//! M3 integration owned here: command palette (Cmd+Shift+P / Cmd+P),
+//! edit-in-external-editor (Cmd+E), Quick Look (Space / Cmd+Y, remote files
+//! through the preview TempCache), terminal interop (Cmd+Opt+T + Copy as),
+//! site importers (File ▸ Import), sync browsing / compare / vim toggles,
+//! transfer notifications, and session state restoration (ui.zon: per-pane
+//! site+path, panel collapse states — remote reconnects only when they are
+//! provably prompt-free: agent auth or a stored keychain secret).
+//!
 //! Self-test modes (exercised by `zig build run -- --smoke`):
 //!   --smoke       scripted local→local transfer of a 50-file tmp tree
 //!                 through the real GUI path; asserts byte-identical
-//!                 copies, transfer-panel progress, settings window and
-//!                 the Cmd+K sheet; prints RELAY-SMOKE PASS and exits 0.
+//!                 copies, transfer-panel progress, settings window, the
+//!                 Cmd+K sheet, the command palette (open + fuzzy query +
+//!                 execute + close), a TempCache put/get round trip and a
+//!                 full local edit-session round trip (FSEvents watch →
+//!                 save → conflict re-stat on an unchanged mtime → upload);
+//!                 prints RELAY-SMOKE PASS and exits 0.
 //!   --smoke-sftp  same skeleton against a dockerized OpenSSH (atmoz/sftp)
 //!                 with a real libssh2 connect factory: list /upload and
 //!                 download one file end-to-end. Skips (exit 0) when no
@@ -53,6 +65,11 @@ const sites_mod = controllers.sites;
 const transfers_mod = controllers.transfers;
 const prefs_mod = controllers.prefs;
 const inspector_mod = controllers.inspector;
+const edit_mod = controllers.edit_sessions;
+const palette_mod = controllers.palette;
+const terminal_mod = controllers.terminal;
+const quicklook = mac.quicklook;
+const notifications = mac.notifications;
 
 const item_mod = relay.queue.item;
 const vfs_mod = relay.vfs.iface;
@@ -61,6 +78,8 @@ const site_pool_mod = relay.pool.site_pool;
 const session_mod = relay.sftp.session;
 const sftp_client_mod = relay.sftp.client;
 const diag_mod = relay.diag;
+const cred_store_mod = relay.cred.store;
+const core_sites_mod = relay.sites;
 const CancelToken = relay.cancel.CancelToken;
 
 const Allocator = std.mem.Allocator;
@@ -113,6 +132,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .core = g_core,
         .on_launch = onLaunch,
         .on_reopen = onReopen,
+        .on_did_become_active = onDidBecomeActive,
         .on_will_terminate = onWillTerminate,
     };
     g_delegate = try app_delegate.AppDelegate.init(&g_hooks);
@@ -135,8 +155,82 @@ fn onReopen(_: ?*anyopaque) void {
     if (g_ui_built) g_ui.win.makeKeyAndOrderFront();
 }
 
+fn onDidBecomeActive(_: ?*anyopaque) void {
+    // Cheap freshness check: the SSH-config smart group re-parses only
+    // when ~/.ssh/config's mtime moved (BACKLOG: live-ish smart group).
+    if (g_ui_built) g_ui.sites.refreshSshConfigIfChanged();
+}
+
+/// Runs inside applicationShouldTerminate, BEFORE the core teardown.
 fn onWillTerminate(_: ?*anyopaque) void {
+    // [NSApp terminate:] is silently swallowed while an NSAlert sheet is
+    // attached (verified live; BACKLOG hygiene): dismiss attached sheets
+    // first so the quit path always reaches teardown.
+    if (g_ui_built) {
+        dismissAttachedSheets(g_ui.win);
+        if (g_ui.prefs.built) dismissAttachedSheets(g_ui.prefs.win);
+        g_ui.palette.close();
+        g_ui.preview.close();
+        // Session restoration: persist per-pane (site, path) + panel
+        // states into ui.zon while the views are still alive.
+        if (g_mode == .normal) {
+            g_ui.prefs.setSessionState(captureSessionState()) catch {};
+        }
+        // End every edit session BEFORE AppCore.shutdown(): stops the
+        // FSEvents watchers, cancels in-flight items through the live
+        // core, deletes the per-session temp dirs, releases the App Nap
+        // activity. Idempotent.
+        g_ui.edit.deinit();
+    }
     if (g_mode != .normal) g_smoke.cleanup();
+}
+
+/// Quit-time snapshot for ui.zon (M3 state restoration). Remote sites are
+/// recorded only when they are persisted (saved sites) — ephemeral
+/// quick-connect ids are meaningless across runs.
+fn captureSessionState() prefs_mod.SessionState {
+    var session: prefs_mod.SessionState = .{
+        .focused_pane = g_ui.browser.focused,
+        .sidebar_collapsed = g_ui.root_split.isCollapsed(0),
+        .transfers_collapsed = g_ui.content_split.isCollapsed(1),
+        .inspector_collapsed = g_ui.inner_split.isCollapsed(1),
+    };
+    capturePane(0, &session.pane0_site, &session.pane0_path);
+    capturePane(1, &session.pane1_site, &session.pane1_path);
+    return session;
+}
+
+fn capturePane(index: u32, site_out: *u64, path_out: *[]const u8) void {
+    const pane = g_ui.browser.panes[index];
+    const site_id = pane.site orelse return;
+    const path = pane.currentPath() orelse return;
+    if (site_id != item_mod.local_site_id and !sitePersisted(site_id)) return;
+    site_out.* = site_id;
+    path_out.* = path;
+}
+
+fn sitePersisted(site_id: u64) bool {
+    var row: usize = 0;
+    while (g_ui.sites.store.persistedAt(row)) |entry| : (row += 1) {
+        if (entry.site.id == site_id) return true;
+    }
+    return false;
+}
+
+/// End every attached sheet (cancel). Sheets can stack (an alert over a
+/// form sheet) and endSheet detaches asynchronously, so the loop is
+/// bounded and stops when the same sheet stays attached.
+fn dismissAttachedSheets(win: windowkit.Window) void {
+    var last: ?windowkit.Window = null;
+    var guard: usize = 0;
+    while (guard < 8) : (guard += 1) {
+        const sheet = win.attachedSheet() orelse return;
+        if (last) |prev| {
+            if (prev.obj.value == sheet.obj.value) return; // detach pending
+        }
+        last = sheet;
+        win.endSheet(sheet, windowkit.modal_response_cancel);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +247,18 @@ const Ui = struct {
     transfers: *transfers_mod.TransfersController,
     inspector: *inspector_mod.InspectorController,
     sites: *sites_mod.SitesController,
+    // M3 controllers.
+    palette: *palette_mod.PaletteController,
+    edit: *edit_mod.EditSessionsController,
+    terminal: *terminal_mod.TerminalController,
+    preview: *quicklook.Preview,
+    notifier: *notifications.Notifier,
+    /// Preview cache for remote Quick Look (download once per
+    /// site/path/size/mtime). null = cache dir unavailable; remote
+    /// previews degrade to a no-op.
+    cache: ?temp_cache.TempCache,
+    /// Lazily built right-click menu for the browser pane tables.
+    pane_menu: ?objc.Object,
     /// sidebar | content.
     root_split: *split_view.SplitView,
     /// (panes+inspector) / bottom panel.
@@ -166,6 +272,13 @@ fn densityFromPrefs(d: prefs_mod.Density) table_source.Density {
         .comfortable => .comfortable,
         .compact => .compact,
         .dense => .dense,
+    };
+}
+
+fn dateFormatFromPrefs(f: prefs_mod.DateFormat) browser_mod.DateFormat {
+    return switch (f) {
+        .iso => .iso,
+        .relative => .relative,
     };
 }
 
@@ -183,9 +296,24 @@ fn buildUi() !void {
 
     g_ui.prefs = try prefs_mod.PrefsController.create(gpa, core);
 
+    const ui_prefs = g_ui.prefs.uiPrefs();
+    // Local-pane restore is silent: the saved path is statted first so a
+    // vanished directory degrades to $HOME instead of a launch error sheet.
+    const restored_local: ?[]const u8 = blk: {
+        if (g_mode != .normal) break :blk g_smoke.localStartPath();
+        const session = ui_prefs.session;
+        if (session.pane0_site == item_mod.local_site_id and
+            session.pane0_path.len > 0 and localDirExists(session.pane0_path))
+            break :blk session.pane0_path;
+        break :blk null;
+    };
     g_ui.browser = try browser_mod.BrowserController.create(gpa, core, g_ui.win, .{
-        .initial_local_path = if (g_mode != .normal) g_smoke.localStartPath() else null,
-        .density = densityFromPrefs(g_ui.prefs.uiPrefs().density),
+        .initial_local_path = restored_local,
+        .density = densityFromPrefs(ui_prefs.density),
+        .date_format = dateFormatFromPrefs(ui_prefs.date_format),
+        .confirm_delete = ui_prefs.confirm_delete,
+        .monospace_lists = ui_prefs.monospace_lists,
+        .vim_mode = ui_prefs.vim_mode,
     });
 
     g_ui.transfers = try transfers_mod.TransfersController.create(gpa, core);
@@ -203,6 +331,60 @@ fn buildUi() !void {
         },
     });
 
+    // --- M3 controllers -------------------------------------------------
+
+    g_ui.palette = try palette_mod.PaletteController.create(gpa, core, g_ui.commands);
+    g_ui.palette.setParentWindow(g_ui.win);
+    g_ui.palette.setIntegration(.{
+        .ctx = null,
+        .sites = paletteSites,
+        .connect = paletteConnect,
+        .pane_state = palettePaneState,
+        .navigate = paletteNavigate,
+    });
+
+    g_ui.edit = try edit_mod.EditSessionsController.create(gpa, core, .{
+        .cache_base = if (g_mode != .normal) g_smoke.editCachePath() else null,
+        // --smoke runs the real watcher/upload pipeline but must not
+        // launch an editor on the host.
+        .open_in_editor = g_mode == .normal,
+        .win = g_ui.win,
+    });
+    g_ui.edit.setTargetProvider(.{ .ctx = g_ui.browser, .collectFn = collectEditTargets });
+
+    g_ui.terminal = try terminal_mod.TerminalController.create(gpa, core, .{
+        .window = g_ui.win,
+        .provider = .{ .ctx = null, .f = terminalContext },
+    });
+
+    g_ui.preview = try quicklook.Preview.create(gpa);
+    g_ui.pane_menu = null;
+    g_ui.cache = blk: {
+        if (g_mode != .normal) {
+            break :blk temp_cache.TempCache.initAt(
+                gpa,
+                core.io,
+                std.Io.Dir.cwd(),
+                g_smoke.previewCachePath(),
+                temp_cache.default_budget_bytes,
+            ) catch null;
+        }
+        break :blk temp_cache.TempCache.openDefault(
+            gpa,
+            core.io,
+            bridge.app_support_bundle_id,
+            temp_cache.default_budget_bytes,
+        ) catch |err| no_cache: {
+            std.log.warn("relay: preview cache unavailable ({t}); remote Quick Look disabled", .{err});
+            break :no_cache null;
+        };
+    };
+    try core.registerListener(.transfer_state, &g_preview_pending, onPreviewTransferState);
+
+    g_ui.notifier = try notifications.Notifier.create(gpa);
+    try g_ui.notifier.attach(core);
+    if (g_mode == .normal) g_ui.notifier.requestAuthorization();
+
     if (g_mode == .normal) {
         // Production FTP/FTPS/SFTP connect factories: known_hosts + prompt
         // wiring through the bridge, per-site auth meta from the sites
@@ -212,15 +394,25 @@ fn buildUi() !void {
         core.setFactoryProvider(g_factories.provider());
     }
 
-    // Settings-window changes live-apply to open views (the View-menu
-    // density path already pushes directly; this covers the Settings
-    // radios). Prefs without a live consumer (date format, monospace
-    // lists, confirm-delete) only persist for now.
+    // Settings-window changes live-apply to open views: density, date
+    // format, confirm-delete and monospaced lists all push through this
+    // listener (the View-menu density path also pushes directly).
     try g_ui.prefs.addChangeListener(null, onPrefsChanged);
 
     // Inspector feed: focused-pane selection changes, snapshot swaps and
     // focus switches land in the Get Info panel (docs/UX.md).
     g_ui.browser.setSelectionHook(.{ .ctx = null, .notify = onPaneSelection });
+
+    // Inspector Apply → optimistic chmod overlay on the owning pane
+    // (pending-alpha Permissions cell until op_done/re-list reconciles).
+    g_ui.inspector.setChmodStageHook(.{ .ctx = null, .stage = onChmodStaged });
+
+    // M3 browser seams: successful navigations feed the palette frecency
+    // store; plain Space Quick Looks the selection; right-click serves the
+    // shared file context menu.
+    g_ui.browser.setVisitHook(.{ .ctx = null, .notify = onPaneVisit });
+    g_ui.browser.setSpaceHook(.{ .ctx = null, .handle = onPaneSpace });
+    g_ui.browser.setContextMenuHook(.{ .ctx = null, .provide = paneContextMenu });
 
     // Splits per docs/UX.md, every one with an autosave name.
     g_ui.inner_split = try split_view.hSplit(gpa, &.{
@@ -262,29 +454,110 @@ fn buildUi() !void {
     g_ui.transfers.refreshFromEngine();
 
     g_ui_built = true;
+
+    // Session restoration (normal mode): panel collapse states + remote
+    // pane reconnects. After g_ui_built so pane-host callbacks resolve the
+    // real focused pane.
+    if (g_mode == .normal) restoreSession(ui_prefs.session);
+}
+
+/// Re-apply the saved panel states and reconnect saved remote panes.
+/// Reconnects never prompt: a site is restored only when its auth is
+/// provably silent (SSH agent, or a secret already in the keychain).
+fn restoreSession(session: prefs_mod.SessionState) void {
+    if (session.sidebar_collapsed) g_ui.root_split.collapse(0);
+    if (!session.transfers_collapsed) g_ui.content_split.uncollapse(1);
+    if (!session.inspector_collapsed) g_ui.inner_split.uncollapse(1);
+
+    restorePaneSite(0, session.pane0_site, session.pane0_path);
+    restorePaneSite(1, session.pane1_site, session.pane1_path);
+
+    g_ui.browser.focusPane(if (session.focused_pane < 2) session.focused_pane else 0);
+}
+
+fn restorePaneSite(index: u32, site_id: u64, path: []const u8) void {
+    if (site_id == item_mod.local_site_id) return; // local: handled at create
+    const site = g_ui.sites.store.get(site_id) orelse return;
+    if (!sitePersisted(site_id)) return;
+    if (!reconnectIsPromptFree(site)) return;
+    // Connects land in the active pane (docs/UX.md): focus the saved one.
+    g_ui.browser.focusPane(index);
+    g_ui.sites.connectAndList(site_id, if (path.len > 0) path else null);
+}
+
+/// True when reconnecting `site` cannot pose a credential prompt: SFTP
+/// with agent auth, or any protocol whose secret loads silently from the
+/// keychain (our own items never trigger an ACL dialog). key_file SFTP is
+/// excluded — an encrypted key would prompt for its passphrase.
+fn reconnectIsPromptFree(site: *const core_sites_mod.Site) bool {
+    if (site.protocol == .sftp) {
+        if (g_ui.sites.meta.get(site.id)) |meta| switch (meta.method) {
+            .agent => return true,
+            .key_file => return false,
+            .password => {},
+        };
+    }
+    if (site.account.len == 0) return false;
+    var diag: diag_mod.Diagnostics = .{};
+    const secret = g_core.cred_store.get(gpa, &diag, .{
+        .protocol = switch (site.protocol) {
+            .ftp => .ftp,
+            .ftps => .ftps,
+            .sftp => .sftp,
+        },
+        .host = site.host,
+        .port = site.effectivePort(),
+        .account = site.account,
+    }) catch return false;
+    cred_store_mod.freeSecret(gpa, secret);
+    return true;
+}
+
+/// Saved-local-path probe through the core's local root (the same
+/// coordinate space the panes list).
+fn localDirExists(path: []const u8) bool {
+    if (path.len == 0 or path[0] != '/') return false;
+    const rel: []const u8 = if (path.len == 1) "." else path[1..];
+    const st = g_core.local_root.statFile(g_core.io, rel, .{}) catch return false;
+    return st.kind == .directory;
 }
 
 /// PrefsController change listener: re-read the prefs and push everything
-/// with a live-apply hook into the open views (currently just density).
+/// with a live-apply hook into the open views (density, date format,
+/// confirm-delete, monospaced lists).
 fn onPrefsChanged(_: ?*anyopaque) void {
-    g_ui.browser.setDensity(densityFromPrefs(g_ui.prefs.uiPrefs().density));
+    const ui_prefs = g_ui.prefs.uiPrefs();
+    g_ui.browser.setDensity(densityFromPrefs(ui_prefs.density));
+    g_ui.browser.setDateFormat(dateFormatFromPrefs(ui_prefs.date_format));
+    g_ui.browser.setConfirmDelete(ui_prefs.confirm_delete);
+    g_ui.browser.setMonospaceLists(ui_prefs.monospace_lists);
+    g_ui.browser.setVimMode(ui_prefs.vim_mode);
 }
 
-// --- PaneHost: connects land in the remote pane (M2: panes[1]) --------------
+/// InspectorController.ChmodStageHook → browser optimistic overlay.
+fn onChmodStaged(_: ?*anyopaque, pane_token: bridge.PaneToken, path: []const u8, mode: u16) void {
+    g_ui.browser.stageChmod(pane_token, path, mode);
+}
+
+// --- PaneHost: connects land in the ACTIVE pane (docs/UX.md) ----------------
 
 fn paneHostActiveToken(_: ?*anyopaque) bridge.PaneToken {
-    return @as(bridge.PaneToken, g_ui.browser.remotePane().index) + 1;
+    // The browser's focused pane receives the connect; either pane can
+    // host a remote site (role switching in BrowserController). Fallback
+    // when focus is ambiguous (window not assembled yet): the historical
+    // right-hand remote pane.
+    if (!g_ui_built) return @as(bridge.PaneToken, 2); // panes[1].token()
+    return g_ui.browser.activePane().token();
 }
 
-fn paneHostConnecting(_: ?*anyopaque, _: bridge.PaneToken, site_id: u64) void {
-    // Bind the chip target before status events start flowing.
-    const pane = g_ui.browser.remotePane();
-    pane.site = site_id;
-    pane.chip = null;
+fn paneHostConnecting(_: ?*anyopaque, pane_token: bridge.PaneToken, site_id: u64) void {
+    // Bind the chip target (and swap a local pane to the remote role)
+    // before status events start flowing.
+    g_ui.browser.prepareRemoteBind(pane_token, site_id);
 }
 
-fn paneHostNavigate(_: ?*anyopaque, _: bridge.PaneToken, site_id: u64, path: []const u8) void {
-    g_ui.browser.bindRemote(site_id, path);
+fn paneHostNavigate(_: ?*anyopaque, pane_token: bridge.PaneToken, site_id: u64, path: []const u8) void {
+    g_ui.browser.bindRemoteToPane(pane_token, site_id, path);
 }
 
 /// factories.MetaLookup → the sites controller's AuthMetaStore (main
@@ -351,12 +624,15 @@ fn paneSelection(
 }
 
 fn revealInPane(_: ?*anyopaque, site_id: u64, dir: []const u8) void {
-    if (site_id == item_mod.local_site_id) {
-        g_ui.browser.localPane().navigateTo(dir, .push);
-        g_ui.browser.focusPane(0);
-    } else if (g_ui.browser.remotePane().site == site_id) {
-        g_ui.browser.remotePane().navigateTo(dir, .push);
-        g_ui.browser.focusPane(1);
+    // Either pane can host either role (active-pane connects): reveal in
+    // whichever pane currently shows the item's site.
+    for (g_ui.browser.panes, 0..) |pane, i| {
+        const pane_site = pane.site orelse continue;
+        if (pane_site != site_id) continue;
+        if (site_id == item_mod.local_site_id and pane.role != .local) continue;
+        pane.navigateTo(dir, .push);
+        g_ui.browser.focusPane(@intCast(i));
+        return;
     }
 }
 
@@ -392,6 +668,17 @@ fn bindCommands() void {
     cmds.bind(.retry_failed_transfers, null, cmdRetryFailed);
     cmds.bind(.clear_completed_transfers, null, cmdClearCompleted);
     cmds.bind(.cancel_active, null, cmdCancelActive);
+    // M3.
+    cmds.bind(.quick_look, null, cmdQuickLook);
+    cmds.bind(.import_filezilla, null, cmdImportFileZilla);
+    cmds.bind(.import_cyberduck, null, cmdImportCyberduck);
+    cmds.bind(.palette_commands, g_ui.palette, palette_mod.PaletteController.showCommandsCommand);
+    cmds.bind(.palette_paths, g_ui.palette, palette_mod.PaletteController.showPathsCommand);
+    cmds.bind(.toggle_sync_browsing, null, cmdToggleSyncBrowsing);
+    cmds.bind(.toggle_compare, null, cmdToggleCompare);
+    cmds.bind(.toggle_vim, null, cmdToggleVim);
+    g_ui.edit.register(cmds); // .edit_external (Cmd+E)
+    g_ui.terminal.register(cmds); // .open_terminal + the four .copy_as_*
 }
 
 fn cmdNewWindow(_: ?*anyopaque) void {
@@ -480,6 +767,292 @@ fn cmdCancelActive(_: ?*anyopaque) void {
     g_ui.browser.cancelActiveListing();
     g_ui.transfers.cancelSelected();
 }
+fn cmdImportFileZilla(_: ?*anyopaque) void {
+    g_ui.sites.importFileZilla();
+}
+fn cmdImportCyberduck(_: ?*anyopaque) void {
+    g_ui.sites.importCyberduck();
+}
+fn cmdToggleSyncBrowsing(_: ?*anyopaque) void {
+    g_ui.browser.toggleSyncBrowsing();
+}
+fn cmdToggleCompare(_: ?*anyopaque) void {
+    g_ui.browser.toggleComparePanes();
+}
+fn cmdToggleVim(_: ?*anyopaque) void {
+    // Persisted pref ("ui.vimMode"); the change listener pushes it into
+    // the browser's keymap layer.
+    g_ui.prefs.setVimMode(!g_ui.prefs.uiPrefs().vim_mode);
+}
+fn cmdQuickLook(_: ?*anyopaque) void {
+    _ = quickLookPane(g_ui.browser.activePane());
+}
+
+// ---------------------------------------------------------------------------
+// Quick Look (M3): Space (browser key hook) / Cmd+Y / File menu. Local
+// selections preview in place; remote files go through the preview
+// TempCache (download once per site/path/size/mtime via the normal queue).
+// ---------------------------------------------------------------------------
+
+/// Pending remote preview download: one slot (the most recent request
+/// wins; an older in-flight download simply lands in the cache for next
+/// time). Scalars + a path copy rebuild the TempCache key at completion.
+const PreviewPending = struct {
+    item: ?bridge.ItemId = null,
+    site_id: u64 = 0,
+    size: u64 = 0,
+    mtime: i64 = 0,
+    path_buf: [1024]u8 = undefined,
+    path_len: usize = 0,
+
+    fn key(p: *const PreviewPending) temp_cache.Key {
+        return .{
+            .site_id = p.site_id,
+            .remote_path = p.path_buf[0..p.path_len],
+            .size = p.size,
+            .mtime = p.mtime,
+        };
+    }
+};
+var g_preview_pending: PreviewPending = .{};
+
+fn onPaneSpace(_: ?*anyopaque, pane: *browser_mod.BrowserPane) bool {
+    return quickLookPane(pane);
+}
+
+/// Returns true when the key/command was meaningfully consumed.
+fn quickLookPane(pane: *browser_mod.BrowserPane) bool {
+    if (quicklook.isVisible()) {
+        g_ui.preview.close();
+        return true;
+    }
+    const snap = pane.snapshot orelse return false;
+    const site_id = pane.site orelse item_mod.local_site_id;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    if (site_id == item_mod.local_site_id) {
+        var paths: std.ArrayList([]const u8) = .empty;
+        for (pane.table.selectedRows()) |row| {
+            if (row >= pane.visible.items.len) continue;
+            const slot = pane.visible.items[row];
+            if (slot == browser_mod.virtual_new_folder_row or slot >= snap.entries.len) continue;
+            const full = path_mod.join(arena, snap.path, snap.entries[slot].name) catch continue;
+            paths.append(arena, full) catch return false;
+        }
+        if (paths.items.len == 0) return false;
+        g_ui.preview.setItems(paths.items) catch return false;
+        g_ui.preview.show();
+        return true;
+    }
+
+    // Remote: preview the first selected FILE through the temp cache.
+    const cache = if (g_ui.cache) |*c| c else return false;
+    const row = pane.table.selectedRow() orelse return false;
+    if (row >= pane.visible.items.len) return false;
+    const slot = pane.visible.items[row];
+    if (slot == browser_mod.virtual_new_folder_row or slot >= snap.entries.len) return false;
+    const entry = &snap.entries[slot];
+    if (entry.kind != .file) return false;
+    const full = path_mod.join(arena, snap.path, entry.name) catch return false;
+    if (full.len > g_preview_pending.path_buf.len) return false;
+
+    const key: temp_cache.Key = .{
+        .site_id = site_id,
+        .remote_path = full,
+        .size = entry.size orelse 0,
+        .mtime = entry.mtime orelse 0,
+    };
+    if (cache.hit(key)) |local| {
+        g_ui.preview.setItems(&.{local}) catch return false;
+        g_ui.preview.show();
+        return true;
+    }
+
+    // Miss: download into the cache's staged path; the transfer_state
+    // listener commits + shows when it lands.
+    var stage_buf: [1280]u8 = undefined;
+    const stage = cache.stagePath(key, &stage_buf) catch return false;
+    const item = g_core.enqueueTransfer(.{
+        .direction = .download,
+        .src = .{ .site_id = site_id, .path = full },
+        .dst = .{ .site_id = item_mod.local_site_id, .path = stage },
+        .bytes_total = entry.size orelse 0,
+    }) catch return false;
+    g_preview_pending = .{
+        .item = item,
+        .site_id = site_id,
+        .size = entry.size orelse 0,
+        .mtime = entry.mtime orelse 0,
+        .path_len = full.len,
+    };
+    @memcpy(g_preview_pending.path_buf[0..full.len], full);
+    return true;
+}
+
+fn onPreviewTransferState(pending: *PreviewPending, e: relay.events.CoreEvent.TransferStateChange) void {
+    const item = pending.item orelse return;
+    if (e.item_id != item) return;
+    switch (e.state) {
+        .completed => {
+            pending.item = null;
+            const cache = if (g_ui.cache) |*c| c else return;
+            const local = cache.commit(pending.key()) catch return;
+            g_ui.preview.setItems(&.{local}) catch return;
+            g_ui.preview.show();
+        },
+        .failed, .canceled => pending.item = null,
+        else => {},
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M3 glue: palette integration, edit-target provider, terminal context,
+// pane context menu, palette frecency feed.
+// ---------------------------------------------------------------------------
+
+fn onPaneVisit(_: ?*anyopaque, site_id: u64, path: []const u8) void {
+    g_ui.palette.recordVisit(site_id, path);
+}
+
+fn paletteSites(_: ?*anyopaque, sink: *palette_mod.SiteSink) void {
+    var row: usize = 0;
+    while (g_ui.sites.store.persistedAt(row)) |entry| : (row += 1) {
+        sink.add(entry.site.id, sites_mod.siteLabel(entry.site));
+    }
+}
+
+fn paletteConnect(_: ?*anyopaque, site_id: u64) void {
+    g_ui.sites.connectAndList(site_id, null);
+}
+
+fn palettePaneState(_: ?*anyopaque) palette_mod.PaneState {
+    const pane = g_ui.browser.activePane();
+    const snap = pane.snapshot orelse return .{};
+    return .{
+        .site_id = pane.site orelse item_mod.local_site_id,
+        .path = snap.path,
+        .entries = snap.entries,
+    };
+}
+
+/// Palette path jump. `other` = Cmd+Return (the inactive pane). Paths on
+/// the pane's bound site navigate in place; local paths fall back to a
+/// local-role pane; remote paths on an unbound site go through the normal
+/// connect path (which may prompt — this is a user action, not a launch).
+fn paletteNavigate(_: ?*anyopaque, other: bool, site_id: u64, path: []const u8) void {
+    const target: u32 = if (other) g_ui.browser.focused ^ 1 else g_ui.browser.focused;
+    const pane = g_ui.browser.panes[target];
+    if (pane.site) |bound| {
+        if (bound == site_id) {
+            g_ui.browser.focusPane(target);
+            pane.navigateTo(path, .push);
+            return;
+        }
+    }
+    if (site_id == item_mod.local_site_id) {
+        const fallback: u32 = target ^ 1;
+        const local = if (pane.role == .local) pane else g_ui.browser.panes[fallback];
+        if (local.role != .local) return;
+        g_ui.browser.focusPane(local.index);
+        local.navigateTo(path, .push);
+        return;
+    }
+    g_ui.browser.focusPane(target);
+    g_ui.sites.connectAndList(site_id, path);
+}
+
+/// EditSessions TargetProvider: every selected FILE of the active pane
+/// when it is bound to a remote site (local files have no session — they
+/// are already on disk).
+fn collectEditTargets(
+    _: *anyopaque,
+    arena: Allocator,
+    out: *std.ArrayList(edit_mod.EditTarget),
+) error{OutOfMemory}!void {
+    const pane = g_ui.browser.activePane();
+    const site_id = pane.site orelse return;
+    if (site_id == item_mod.local_site_id) return;
+    const snap = pane.snapshot orelse return;
+    for (pane.table.selectedRows()) |row| {
+        if (row >= pane.visible.items.len) continue;
+        const slot = pane.visible.items[row];
+        if (slot == browser_mod.virtual_new_folder_row or slot >= snap.entries.len) continue;
+        const entry = &snap.entries[slot];
+        if (entry.kind != .file) continue;
+        try out.append(arena, .{
+            .site_id = site_id,
+            .dir = snap.path,
+            .name = entry.name,
+            .size = entry.size,
+            .mtime = entry.mtime,
+        });
+    }
+}
+
+/// terminal.ContextProvider: the active remote pane (or the other pane
+/// when only it is remote); fills `buf` with copies of dir/selection.
+fn terminalContext(_: ?*anyopaque, buf: []u8) ?terminal_mod.RemoteContext {
+    if (!g_ui_built) return null;
+    const pane = remoteBoundPane() orelse return null;
+    const site_id = pane.site.?;
+    const dir = pane.currentPath() orelse return null;
+
+    var fba: std.heap.FixedBufferAllocator = .init(buf);
+    const a = fba.allocator();
+    var out: terminal_mod.RemoteContext = .{
+        .site_id = site_id,
+        .dir = a.dupe(u8, dir) catch return null,
+    };
+    const snap = pane.snapshot orelse return out;
+    const row = pane.table.selectedRow() orelse return out;
+    if (row >= pane.visible.items.len) return out;
+    const slot = pane.visible.items[row];
+    if (slot == browser_mod.virtual_new_folder_row or slot >= snap.entries.len) return out;
+    const entry = &snap.entries[slot];
+    out.selected_path = path_mod.join(a, snap.path, entry.name) catch return out;
+    out.selected_is_dir = entry.kind == .dir;
+    return out;
+}
+
+fn remoteBoundPane() ?*browser_mod.BrowserPane {
+    const active = g_ui.browser.activePane();
+    if (active.site) |site| {
+        if (site != item_mod.local_site_id) return active;
+    }
+    const other = g_ui.browser.panes[active.index ^ 1];
+    if (other.site) |site| {
+        if (site != item_mod.local_site_id) return other;
+    }
+    return null;
+}
+
+/// Shared right-click menu for both pane tables (built once, lazily).
+/// Commands act on the focused pane — dsContextMenu focuses the clicked
+/// pane first.
+fn paneContextMenu(_: ?*anyopaque, pane: *browser_mod.BrowserPane, row: ?usize) ?objc.c.id {
+    _ = pane;
+    _ = row;
+    if (g_ui.pane_menu == null) {
+        const copy_as = g_ui.terminal.copyAsMenuItems();
+        const items = [_]menu_kit.Item{
+            menu_kit.Item.call("Quick Look", g_ui.commands.menuCallback(.quick_look), "", .{}),
+            menu_kit.Item.call("Edit with External Editor", g_ui.commands.menuCallback(.edit_external), "", .{}),
+            menu_kit.Item.call("Open in Terminal", g_ui.commands.menuCallback(.open_terminal), "", .{}),
+            .separator,
+            menu_kit.Item.sub("Copy as", &copy_as),
+            .separator,
+            menu_kit.Item.call("Rename", g_ui.commands.menuCallback(.rename_selection), "", .{}),
+            menu_kit.Item.call("Delete", g_ui.commands.menuCallback(.delete_selection), "", .{}),
+            .separator,
+            menu_kit.Item.call("Transfer Selection", g_ui.commands.menuCallback(.transfer_selection), "", .{}),
+        };
+        g_ui.pane_menu = menu_kit.buildContextMenu(g_ui.menu_reg, &items) catch null;
+    }
+    return if (g_ui.pane_menu) |m| m.value else null;
+}
 
 // --- toolbar ------------------------------------------------------------------
 
@@ -487,6 +1060,7 @@ const toolbar_items = [_]toolbar_mod.ItemSpec{
     .{ .identifier = "RelayBack", .label = "Back", .symbol = "chevron.left", .tooltip = "Back", .action = tbBack },
     .{ .identifier = "RelayForward", .label = "Forward", .symbol = "chevron.right", .tooltip = "Forward", .action = tbForward },
     .{ .identifier = "RelayConnect", .label = "Connect", .symbol = "bolt.horizontal.circle", .tooltip = "Connect to Server (Cmd+K)", .action = tbConnect },
+    .{ .identifier = "RelayView", .label = "View", .symbol = "slider.horizontal.3", .tooltip = "Row density", .menu_provider = tbViewMenu },
     toolbar_mod.flexibleSpace(),
     .{ .identifier = "RelayTransfers", .label = "Transfers", .symbol = "arrow.up.arrow.down.circle", .tooltip = "Toggle transfer panel (Cmd+J)", .action = tbTransfers },
     .{ .identifier = "RelayInfo", .label = "Info", .symbol = "info.circle", .tooltip = "Inspector (Cmd+I)", .action = tbInfo },
@@ -508,6 +1082,24 @@ fn tbInfo(_: *anyopaque) void {
     _ = g_ui.inner_split.toggleCollapse(1);
 }
 
+/// Toolbar 'View' popup (docs/UX.md toolbar sketch): density choices
+/// routed through the same density commands as the View menu. Built once,
+/// lazily (the toolbar delegate may materialize items before bindCommands
+/// runs — dispatch is safely a no-op until then).
+var g_view_menu: ?objc.Object = null;
+
+fn tbViewMenu(_: *anyopaque) ?objc.c.id {
+    if (g_view_menu == null) {
+        const items = [_]menu_kit.Item{
+            menu_kit.Item.call("Comfortable", g_ui.commands.menuCallback(.density_comfortable), "", .{}),
+            menu_kit.Item.call("Compact", g_ui.commands.menuCallback(.density_compact), "", .{}),
+            menu_kit.Item.call("Dense", g_ui.commands.menuCallback(.density_dense), "", .{}),
+        };
+        g_view_menu = menu_kit.buildContextMenu(g_ui.menu_reg, &items) catch null;
+    }
+    return if (g_view_menu) |menu| menu.value else null;
+}
+
 // ---------------------------------------------------------------------------
 // Smoke mode — scripted end-to-end self test on dispatch_after ticks.
 // ---------------------------------------------------------------------------
@@ -525,6 +1117,11 @@ const smoke_sftp_file = "hello.bin";
 /// Big enough that the rate-limited download spans several ~30 Hz engine
 /// progress ticks (the "panel saw progress" assertion needs >= 1 event).
 const smoke_sftp_len: usize = 4 * 1024 * 1024;
+/// Edit-session round trip (M3): a "remote" (site 0) file outside the
+/// transfer tree so the row-count assertions stay untouched.
+const smoke_edit_file = "draft.txt";
+const smoke_edit_v1 = "relay edit round trip v1\n";
+const smoke_edit_v2 = "relay edit round trip v2 — saved locally\n";
 
 fn smokeFail(step: []const u8, reason: []const u8) noreturn {
     std.debug.print("RELAY-SMOKE FAIL step={s} reason={s}\n", .{ step, reason });
@@ -554,6 +1151,13 @@ const Smoke = struct {
     expected_items: usize = smoke_local_items,
     bytes_verified: u64 = 0,
 
+    // M3 surfaces (paths gpa-owned, allocated in setup).
+    edit_dir: []u8 = &.{},
+    edit_file: []u8 = &.{},
+    edit_cache: []u8 = &.{},
+    preview_cache: []u8 = &.{},
+    edit_session: u64 = 0,
+
     // --smoke-sftp
     container_port: u16 = 0,
     container_name: [48]u8 = undefined,
@@ -569,6 +1173,11 @@ const Smoke = struct {
         settings_closed,
         sheet_open,
         sheet_close,
+        palette_check,
+        cache_check,
+        edit_start,
+        edit_watch,
+        edit_upload,
         finish,
     };
 
@@ -582,6 +1191,14 @@ const Smoke = struct {
         return if (s.mode == .smoke) s.src else s.dst;
     }
 
+    fn editCachePath(s: *const Smoke) []const u8 {
+        return s.edit_cache;
+    }
+
+    fn previewCachePath(s: *const Smoke) []const u8 {
+        return s.preview_cache;
+    }
+
     // ------------------------------------------------------------------ //
     // Pre-AppCore setup (tmp tree, config dir, container)
 
@@ -592,14 +1209,22 @@ const Smoke = struct {
         const io = s.io;
 
         const pid: u32 = @intCast(std.c.getpid());
-        s.base = try std.fmt.allocPrint(gpa, "/tmp/relay-smoke-{d}", .{pid});
+        // /private/tmp, not the /tmp symlink: the edit-session step runs a
+        // real FSEvents watcher and FSEvents wants the canonical path.
+        s.base = try std.fmt.allocPrint(gpa, "/private/tmp/relay-smoke-{d}", .{pid});
         s.src = try std.fmt.allocPrint(gpa, "{s}/src", .{s.base});
         s.dst = try std.fmt.allocPrint(gpa, "{s}/dst", .{s.base});
+        s.edit_dir = try std.fmt.allocPrint(gpa, "{s}/editsrc", .{s.base});
+        s.edit_file = try std.fmt.allocPrint(gpa, "{s}/editsrc/{s}", .{ s.base, smoke_edit_file });
+        s.edit_cache = try std.fmt.allocPrint(gpa, "{s}/editcache", .{s.base});
+        s.preview_cache = try std.fmt.allocPrint(gpa, "{s}/previewcache", .{s.base});
 
         const cwd = std.Io.Dir.cwd();
         var path_buf: [512]u8 = undefined;
         try cwd.createDirPath(io, try std.fmt.bufPrint(&path_buf, "{s}/sub", .{s.src}));
         try cwd.createDirPath(io, s.dst);
+        try cwd.createDirPath(io, s.edit_dir);
+        try cwd.writeFile(io, .{ .sub_path = s.edit_file, .data = smoke_edit_v1 });
         s.conf_dir = try cwd.createDirPathOpen(io, try std.fmt.bufPrint(&path_buf, "{s}/conf", .{s.base}), .{});
 
         s.fake_creds = .init(gpa);
@@ -694,6 +1319,9 @@ const Smoke = struct {
                     if (s.listed_rows != smoke_local_rows) smokeFail("wait_window", "local listing row count mismatch");
                     g_ui.browser.bindRemote(item_mod.local_site_id, s.dst);
                 } else {
+                    // Connects land in the ACTIVE pane: focus the right
+                    // pane first so the smoke keeps its remote-pane shape.
+                    g_ui.browser.focusPane(1);
                     g_ui.sites.connectAndList(1, "/upload");
                 }
                 s.step = .wait_dst;
@@ -779,6 +1407,102 @@ const Smoke = struct {
             },
             .sheet_close => {
                 if (g_ui.win.attachedSheet() != null) return false;
+                s.step = .palette_check;
+                return true;
+            },
+            .palette_check => {
+                // (e) command palette: open, fuzzy-query the command
+                // registry vocabulary, execute the top hit, close.
+                g_ui.palette.show(.commands);
+                if (!g_ui.palette.isVisible()) smokeFail("palette_check", "palette did not open");
+                g_ui.palette.setQuery("refresh") catch smokeFail("palette_check", "setQuery failed");
+                if (g_ui.palette.resultCount() == 0) smokeFail("palette_check", "fuzzy query returned nothing");
+                const top = g_ui.palette.resultAt(0) orelse smokeFail("palette_check", "no top result");
+                if (top.kind != .command or top.command != .refresh)
+                    smokeFail("palette_check", "top result is not the Refresh command");
+                g_ui.palette.executeResult(0, false); // dispatches .refresh, closes
+                if (g_ui.palette.executes != 1) smokeFail("palette_check", "execute did not run");
+                if (g_ui.palette.isVisible()) smokeFail("palette_check", "palette still open after execute");
+                g_ui.palette.show(.paths);
+                if (!g_ui.palette.isVisible()) smokeFail("palette_check", "paths palette did not open");
+                g_ui.palette.close();
+                if (g_ui.palette.isVisible()) smokeFail("palette_check", "palette did not close");
+                s.step = .cache_check;
+                return true;
+            },
+            .cache_check => {
+                // (f) preview TempCache put/get round trip.
+                const cache = if (g_ui.cache) |*c| c else smokeFail("cache_check", "preview cache unavailable");
+                var payload: [256]u8 = undefined;
+                for (&payload, 0..) |*b, i| b.* = smokeFileByte(9, i);
+                const key: temp_cache.Key = .{
+                    .site_id = 42,
+                    .remote_path = "/smoke/preview.bin",
+                    .size = payload.len,
+                    .mtime = 1718000000,
+                };
+                const stored = cache.put(key, &payload) catch smokeFail("cache_check", "put failed");
+                const found = cache.hit(key) orelse smokeFail("cache_check", "miss after put");
+                if (!std.mem.eql(u8, stored, found)) smokeFail("cache_check", "hit path differs from put path");
+                const got = std.Io.Dir.cwd().readFileAlloc(s.io, found, gpa, .unlimited) catch
+                    smokeFail("cache_check", "cached file unreadable");
+                defer gpa.free(got);
+                if (!std.mem.eql(u8, got, &payload)) smokeFail("cache_check", "cached bytes differ");
+                if (cache.entryCount() != 1) smokeFail("cache_check", "unexpected entry count");
+                s.step = .edit_start;
+                return true;
+            },
+            .edit_start => {
+                // (g) local edit-session round trip over the REAL pipeline:
+                // queue download → FSEvents watch → save → conflict re-stat
+                // (unchanged mtime ⇒ silent upload) → queue upload →
+                // baseline refresh. Baseline mtime in the same seconds the
+                // local VFS reports.
+                const st = std.Io.Dir.cwd().statFile(s.io, s.edit_file, .{}) catch
+                    smokeFail("edit_start", "edit source missing");
+                s.edit_session = g_ui.edit.editTarget(.{
+                    .site_id = item_mod.local_site_id,
+                    .dir = s.edit_dir,
+                    .name = smoke_edit_file,
+                    .size = st.size,
+                    .mtime = st.mtime.toSeconds(),
+                }) catch smokeFail("edit_start", "editTarget refused");
+                s.step = .edit_watch;
+                return true;
+            },
+            .edit_watch => {
+                const state = g_ui.edit.sessionState(s.edit_session) orelse
+                    smokeFail("edit_watch", "session vanished (download failed?)");
+                if (state != .watching) return false; // download in flight
+                const local = g_ui.edit.sessionLocalPath(s.edit_session) orelse
+                    smokeFail("edit_watch", "no session local path");
+                const got = std.Io.Dir.cwd().readFileAlloc(s.io, local, gpa, .unlimited) catch
+                    smokeFail("edit_watch", "temp copy unreadable");
+                defer gpa.free(got);
+                if (!std.mem.eql(u8, got, smoke_edit_v1)) smokeFail("edit_watch", "temp copy bytes differ");
+                // Save: the live FSEvents watcher must notice this write —
+                // no manual noteLocalChange nudge.
+                std.Io.Dir.cwd().writeFile(s.io, .{ .sub_path = local, .data = smoke_edit_v2 }) catch
+                    smokeFail("edit_watch", "could not modify temp copy");
+                s.step = .edit_upload;
+                return true;
+            },
+            .edit_upload => {
+                if (g_ui.edit.conflicts_seen != 0)
+                    smokeFail("edit_upload", "conflict flagged on an unchanged mtime");
+                if (g_ui.edit.uploads_enqueued == 0) return false; // watch → re-stat pending
+                const state = g_ui.edit.sessionState(s.edit_session) orelse
+                    smokeFail("edit_upload", "session vanished (upload failed?)");
+                if (state != .watching) return false; // upload/refresh in flight
+                const got = std.Io.Dir.cwd().readFileAlloc(s.io, s.edit_file, gpa, .unlimited) catch
+                    smokeFail("edit_upload", "remote file unreadable");
+                defer gpa.free(got);
+                if (!std.mem.eql(u8, got, smoke_edit_v2))
+                    smokeFail("edit_upload", "remote file does not carry the saved bytes");
+                g_ui.edit.endSession(s.edit_session);
+                if (g_ui.edit.sessionCount() != 0) smokeFail("edit_upload", "session not ended");
+                if (g_ui.edit.sessionLocalPath(s.edit_session) != null)
+                    smokeFail("edit_upload", "session table still has the entry");
                 s.step = .finish;
                 s.pass();
                 return true;
@@ -832,12 +1556,15 @@ const Smoke = struct {
         const label: []const u8 = if (s.mode == .smoke) "RELAY-SMOKE" else "RELAY-SMOKE-SFTP";
         std.debug.print(
             "{s} PASS rows={d} transfers={d} bytes={d} progress_events={d} " ++
-                "state_events={d} drains={d} events={d} cmds={d} ticks={d}\n",
+                "state_events={d} drains={d} events={d} cmds={d} " ++
+                "pal_exec={d} edit_uploads={d} ticks={d}\n",
             .{
-                label,            s.listed_rows,            s.expected_items,
-                s.bytes_verified, s.progress_events,        s.state_events,
-                g_core.drains,    g_core.events_dispatched, g_ui.commands.dispatched,
-                s.ticks,
+                label,                      s.listed_rows,
+                s.expected_items,           s.bytes_verified,
+                s.progress_events,          s.state_events,
+                g_core.drains,              g_core.events_dispatched,
+                g_ui.commands.dispatched,   g_ui.palette.executes,
+                g_ui.edit.uploads_enqueued, s.ticks,
             },
         );
         g_ui.app.terminate(); // graceful: delegate shuts the core down
@@ -1114,6 +1841,11 @@ test "density mapping covers every prefs density" {
     try testing.expectEqual(table_source.Density.comfortable, densityFromPrefs(.comfortable));
     try testing.expectEqual(table_source.Density.compact, densityFromPrefs(.compact));
     try testing.expectEqual(table_source.Density.dense, densityFromPrefs(.dense));
+}
+
+test "date-format mapping covers every prefs format" {
+    try testing.expectEqual(browser_mod.DateFormat.iso, dateFormatFromPrefs(.iso));
+    try testing.expectEqual(browser_mod.DateFormat.relative, dateFormatFromPrefs(.relative));
 }
 
 test {

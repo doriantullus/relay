@@ -20,22 +20,52 @@ Native macOS FTP/FTPS/SFTP client in Zig 0.16. Target: macOS 15+, aarch64.
 ## Layers
 
 ```
-app (exe, main thread)   main.zig window assembly · app_delegate ·
-                         bridge.zig (AppCore) · controllers/ (browser,
-                         sites, transfers+transcript, prefs+commands+menus,
-                         inspector) · factories.zig (production connect
-                         factories: known_hosts/auth/prompts) · --smoke driver
+app (exe, main thread)   main.zig window assembly + M3 integration (state
+                         restoration, Quick Look temp-cache flow, palette/
+                         edit/terminal glue) · app_delegate · bridge.zig
+                         (AppCore) · controllers/ (browser+vim, sites+
+                         importers, transfers+transcript+bandwidth,
+                         prefs+commands+menus, inspector, palette,
+                         edit_sessions, terminal) · fuzzy.zig (matcher +
+                         frecency) · temp_cache.zig (preview cache) ·
+                         factories.zig (production connect factories:
+                         known_hosts/auth/prompts/proxy) · --smoke driver
 relay_mac (module)       zig-objc AppKit wrappers: window/table/outline/
                          menu/toolbar/split_view/panels/drag · libdispatch
-                         glue · foundation+runtime kits (all selector
-                         strings live here; FSEvents/QuickLook are post-M2)
+                         glue · foundation+runtime kits · fsevents ·
+                         quicklook · notifications · app_nap (all selector
+                         strings live here)
 ── UI bridge: src/app/bridge.zig — the ONLY core↔UI crossing ──
 relay_core (module)      vfs · pool · queue · cred · settings · transcript
-                         proto/ftp (first-party) · proto/sftp (libssh2)
+                         proto/ftp (first-party) · proto/sftp (libssh2,
+                         + jump-host/ProxyCommand transports)
                          proto/ssh (pure-Zig agent/keys/known_hosts/config)
                          tls (TlsProvider → LibreSSL)
 vendored C (static)      LibreSSL 4.0 (crypto/ssl), libssh2 1.11.1
 ```
+
+## M3 integration seams (who owns what)
+
+- **CommandRegistry (prefs.zig)** is the single command vocabulary: every
+  menu leaf, key equivalent, palette row, and context-menu item dispatches
+  through it. The palette enumerates the menu tree itself, so new commands
+  surface there for free.
+- **main.zig-injected hooks on the browser**: selection (inspector feed),
+  visit (palette frecency), Space (Quick Look), context menu. Browser owns
+  pane truth; integrations read it through these seams only.
+- **Edit sessions** (controllers/edit_sessions.zig): queue download →
+  FSEvents watch (relay_mac.fsevents, main-queue callbacks; App Nap held
+  off while watching) → save → remote re-stat → conflict sheet or upload.
+  Ended (watchers stopped, temp dirs deleted) in onWillTerminate BEFORE
+  AppCore.shutdown().
+- **Session restoration**: ui.zon carries per-pane (site, path), focused
+  pane, panel collapse states, vim pref. Saved on quit; restored on launch.
+  Local pane restores silently (statted first); remote panes reconnect only
+  when provably prompt-free (SSH agent meta, or the secret already loads
+  from the Keychain). Nothing at launch may prompt.
+- **Quick Look**: local selections preview in place; remote files download
+  once into the content-addressed TempCache (site/path/size/mtime key) and
+  preview from there.
 
 ## Threading
 

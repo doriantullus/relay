@@ -5,8 +5,12 @@
 //! Responsibilities:
 //!  - applicationDidFinishLaunching: → `Hooks.on_launch` (phase 3 builds
 //!    the window + controllers there),
-//!  - applicationShouldTerminate: → graceful `AppCore.shutdown()` (cancels
-//!    all site groups + queue workers, joins, persists the queue), then
+//!  - applicationDidBecomeActive: → `Hooks.on_did_become_active` (cheap
+//!    freshness checks: the SSH-config smart group's mtime-gated re-parse),
+//!  - applicationShouldTerminate: → `Hooks.on_will_terminate` (dismisses
+//!    attached sheets — AppKit swallows terminate: while one is attached —
+//!    and saves UI state), then graceful `AppCore.shutdown()` (cancels all
+//!    site groups + queue workers, joins, persists the queue), then
 //!    replies terminate-now,
 //!  - applicationShouldHandleReopen:hasVisibleWindows: → `Hooks.on_reopen`
 //!    when the Dock icon is clicked with no visible windows,
@@ -41,6 +45,9 @@ pub const Hooks = struct {
     on_launch: ?*const fn (ctx: ?*anyopaque) void = null,
     /// Dock-icon click with no visible windows: re-show the main window.
     on_reopen: ?*const fn (ctx: ?*anyopaque) void = null,
+    /// App became active (applicationDidBecomeActive:) — cheap freshness
+    /// checks live here (SSH-config mtime re-parse).
+    on_did_become_active: ?*const fn (ctx: ?*anyopaque) void = null,
     /// Pre-shutdown notification (save UI state); runs before the core
     /// teardown on quit.
     on_will_terminate: ?*const fn (ctx: ?*anyopaque) void = null,
@@ -58,6 +65,7 @@ fn delegateClass() runtime.Error!runtime.DefinedClass {
     if (g_class) |dc| return dc;
     const dc = try runtime.defineClass("RelayAppDelegate", "NSObject", &.{}, .{
         .{ "applicationDidFinishLaunching:", impDidFinishLaunching },
+        .{ "applicationDidBecomeActive:", impDidBecomeActive },
         .{ "applicationShouldTerminate:", impShouldTerminate },
         .{ "applicationShouldHandleReopen:hasVisibleWindows:", impShouldHandleReopen },
         .{ "applicationSupportsSecureRestorableState:", impSupportsSecureRestorableState },
@@ -75,6 +83,13 @@ fn impDidFinishLaunching(target: c.id, _: c.SEL, _: c.id) callconv(.c) void {
     defer pool.deinit();
     const hooks = hooksOf(target);
     if (hooks.on_launch) |callback| callback(hooks.ctx);
+}
+
+fn impDidBecomeActive(target: c.id, _: c.SEL, _: c.id) callconv(.c) void {
+    const pool = foundation.AutoreleasePool.init();
+    defer pool.deinit();
+    const hooks = hooksOf(target);
+    if (hooks.on_did_become_active) |callback| callback(hooks.ctx);
 }
 
 fn impShouldTerminate(target: c.id, _: c.SEL, _: c.id) callconv(.c) foundation.NSUInteger {
@@ -142,6 +157,7 @@ const testing = std.testing;
 const TestFlags = struct {
     launched: usize = 0,
     reopened: usize = 0,
+    activated: usize = 0,
     will_terminate: usize = 0,
 
     fn onLaunch(ctx: ?*anyopaque) void {
@@ -151,6 +167,10 @@ const TestFlags = struct {
     fn onReopen(ctx: ?*anyopaque) void {
         const self: *TestFlags = @ptrCast(@alignCast(ctx.?));
         self.reopened += 1;
+    }
+    fn onDidBecomeActive(ctx: ?*anyopaque) void {
+        const self: *TestFlags = @ptrCast(@alignCast(ctx.?));
+        self.activated += 1;
     }
     fn onWillTerminate(ctx: ?*anyopaque) void {
         const self: *TestFlags = @ptrCast(@alignCast(ctx.?));
@@ -167,12 +187,18 @@ test "delegate class: launch + reopen + secure-state callbacks dispatch" {
         .ctx = &flags,
         .on_launch = TestFlags.onLaunch,
         .on_reopen = TestFlags.onReopen,
+        .on_did_become_active = TestFlags.onDidBecomeActive,
     };
     const delegate = try AppDelegate.init(&hooks);
     defer delegate.deinit();
 
     delegate.object.msgSend(void, "applicationDidFinishLaunching:", .{foundation.nil});
     try testing.expectEqual(@as(usize, 1), flags.launched);
+
+    // Activation hook (SSH-config freshness checks ride this).
+    delegate.object.msgSend(void, "applicationDidBecomeActive:", .{foundation.nil});
+    delegate.object.msgSend(void, "applicationDidBecomeActive:", .{foundation.nil});
+    try testing.expectEqual(@as(usize, 2), flags.activated);
 
     // No visible windows: reopen fires and the event is consumed (YES).
     const reply_hidden = delegate.object.msgSend(

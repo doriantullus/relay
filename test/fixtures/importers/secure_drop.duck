@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Protocol</key>
+	<string>ftps</string>
+	<key>Nickname</key>
+	<string>Secure Drop</string>
+	<key>UUID</key>
+	<string>7df0a7a4-3333-4d63-a2a3-1a3b8e3c0003</string>
+	<key>Hostname</key>
+	<string>secure.example.net</string>
+	<key>Port</key>
+	<string>990</string>
+	<key>Username</key>
+	<string>café-user</string>
+	<key>Path</key>
+	<string>/drop</string>
+</dict>
+</plist>

@@ -26,6 +26,10 @@ pub const ItemSpec = struct {
     symbol: ?[:0]const u8 = null,
     tooltip: ?[:0]const u8 = null,
     action: ?*const fn (ctx: *anyopaque) void = null,
+    /// Popup item: returns an NSMenu (owned by the app/menu registry; null
+    /// = plain button after all). The item materializes as an
+    /// NSMenuToolbarItem showing the menu on click; `action` is ignored.
+    menu_provider: ?*const fn (ctx: *anyopaque) ?c.id = null,
     /// Standard AppKit space items are instantiated by AppKit itself.
     standard: bool = false,
 };
@@ -216,7 +220,13 @@ fn helperItemForIdentifier(
             const spec = tb.items[i];
             // Standard space items are instantiated by AppKit itself.
             if (!spec.standard) {
-                const item = getClass("NSToolbarItem").msgSend(objc.Object, "alloc", .{})
+                // Popup specs become NSMenuToolbarItem (an NSToolbarItem
+                // subclass that shows its menu on click).
+                const item_class = if (spec.menu_provider != null)
+                    getClass("NSMenuToolbarItem")
+                else
+                    getClass("NSToolbarItem");
+                const item = item_class.msgSend(objc.Object, "alloc", .{})
                     .msgSend(objc.Object, "initWithItemIdentifier:", .{ident});
                 // Hand the alloc/init +1 to the inner pool so the dance
                 // below transfers exactly one reference to the caller.
@@ -230,8 +240,15 @@ fn helperItemForIdentifier(
                     }
                 }
                 item.msgSend(void, "setBordered:", .{true});
-                item.msgSend(void, "setTarget:", .{objc.Object.fromId(target)});
-                item.msgSend(void, "setAction:", .{objc.sel("onRelayToolbarAction:")});
+                if (spec.menu_provider) |provider| {
+                    if (provider(tb.ctx)) |menu_id| {
+                        item.msgSend(void, "setMenu:", .{objc.Object.fromId(menu_id)});
+                        item.msgSend(void, "setShowsIndicator:", .{true});
+                    }
+                } else {
+                    item.msgSend(void, "setTarget:", .{objc.Object.fromId(target)});
+                    item.msgSend(void, "setAction:", .{objc.sel("onRelayToolbarAction:")});
+                }
                 item.msgSend(void, "setAutovalidates:", .{false});
                 item.msgSend(void, "setEnabled:", .{tb.enabled[i]});
                 result = item.value;
@@ -316,4 +333,34 @@ test "toolbar init/deinit + identifier arrays through ObjC dispatch (headless)" 
 
     tb.setItemEnabled("connect", false);
     try std.testing.expect(!tb.enabled[0]);
+}
+
+test "menu_provider specs materialize as NSMenuToolbarItem carrying the menu" {
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const Hooks = struct {
+        var menu_obj: c.id = null;
+        fn provide(_: *anyopaque) ?c.id {
+            return menu_obj;
+        }
+    };
+    const menu = getClass("NSMenu").msgSend(objc.Object, "new", .{});
+    defer menu.msgSend(void, "release", .{});
+    Hooks.menu_obj = menu.value;
+
+    var ctx: u8 = 0;
+    const tb = try Toolbar.init(std.testing.allocator, "RelayMenuToolbarTest", &ctx, &.{
+        .{ .identifier = "view", .label = "View", .menu_provider = Hooks.provide },
+    });
+    defer tb.deinit();
+
+    const item = tb.helper.msgSend(
+        c.id,
+        "toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:",
+        .{ @as(c.id, null), nsStr("view").value, @as(c.BOOL, 1) },
+    );
+    try std.testing.expect(item != null);
+    const got = objc.Object.fromId(item).msgSend(c.id, "menu", .{});
+    try std.testing.expectEqual(menu.value, got);
 }

@@ -45,6 +45,7 @@ const data_conn_mod = relay.ftp.data_conn;
 const tls_provider_mod = relay.tls.provider;
 const libressl_mod = relay.tls.libressl;
 const known_hosts = relay.ssh.known_hosts;
+const ssh_config_mod = relay.ssh.ssh_config;
 
 const Allocator = std.mem.Allocator;
 const CancelToken = relay.cancel.CancelToken;
@@ -55,6 +56,8 @@ const Diagnostics = diag_mod.Diagnostics;
 pub const known_hosts_file = "known_hosts";
 
 pub const key_path_max = 1024;
+pub const proxy_jump_max = 512;
+pub const proxy_command_max = 1024;
 
 pub const AuthMethod = enum { agent, key_file, password };
 
@@ -63,6 +66,12 @@ pub const AuthMethod = enum { agent, key_file, password };
 pub const AuthChoice = struct {
     method: AuthMethod = .agent,
     key_path: []const u8 = "",
+    /// Explicit per-site ProxyJump in ssh_config syntax ("[user@]host[:port]"
+    /// hops, comma-separated; "none" disables). Empty = consult ~/.ssh/config.
+    proxy_jump: []const u8 = "",
+    /// Explicit per-site ProxyCommand (%h/%p tokens). Empty = consult
+    /// ~/.ssh/config. The explicit ProxyJump wins when both are set.
+    proxy_command: []const u8 = "",
 };
 
 /// Main-thread-only hook into the sites controller's AuthMetaStore;
@@ -184,6 +193,10 @@ const SiteState = struct {
     method: AuthMethod = .agent,
     key_path_buf: [key_path_max]u8 = undefined,
     key_path_len: usize = 0,
+    proxy_jump_buf: [proxy_jump_max]u8 = undefined,
+    proxy_jump_len: usize = 0,
+    proxy_command_buf: [proxy_command_max]u8 = undefined,
+    proxy_command_len: usize = 0,
     insecure_skip_verify: bool = false,
 
     /// Serializes the prompt+refetch path so concurrent browse/transfer
@@ -195,34 +208,49 @@ const SiteState = struct {
     tls: ?*libressl_mod.LibresslProvider = null,
 
     fn refresh(state: *SiteState, owner: *Factories, site: *const sites_mod.Site) void {
-        var method: AuthMethod = if (site.protocol == .sftp) .agent else .password;
-        var key_path: []const u8 = "";
+        var choice: AuthChoice = .{
+            .method = if (site.protocol == .sftp) .agent else .password,
+        };
         if (owner.meta_lookup.get) |get| {
-            if (get(owner.meta_lookup.ctx, site.id)) |choice| {
-                method = choice.method;
-                key_path = choice.key_path;
-            }
+            if (get(owner.meta_lookup.ctx, site.id)) |c| choice = c;
         }
         lockSpin(&state.meta_mutex);
         defer state.meta_mutex.unlock();
         state.insecure_skip_verify = site.insecure_skip_verify;
-        state.method = method;
-        const n = @min(key_path.len, state.key_path_buf.len);
-        @memcpy(state.key_path_buf[0..n], key_path[0..n]);
-        state.key_path_len = n;
+        state.method = choice.method;
+        state.key_path_len = copyClamped(&state.key_path_buf, choice.key_path);
+        state.proxy_jump_len = copyClamped(&state.proxy_jump_buf, choice.proxy_jump);
+        state.proxy_command_len = copyClamped(&state.proxy_command_buf, choice.proxy_command);
     }
 
     const AuthSnapshot = struct {
         method: AuthMethod,
         key_path: []const u8,
+        proxy_jump: []const u8,
+        proxy_command: []const u8,
     };
 
-    fn authSnapshot(state: *SiteState, buf: *[key_path_max]u8) AuthSnapshot {
+    const SnapshotBufs = struct {
+        key_path: [key_path_max]u8 = undefined,
+        proxy_jump: [proxy_jump_max]u8 = undefined,
+        proxy_command: [proxy_command_max]u8 = undefined,
+    };
+
+    fn authSnapshot(state: *SiteState, bufs: *SnapshotBufs) AuthSnapshot {
         lockSpin(&state.meta_mutex);
         defer state.meta_mutex.unlock();
-        const n = state.key_path_len;
-        @memcpy(buf[0..n], state.key_path_buf[0..n]);
-        return .{ .method = state.method, .key_path = buf[0..n] };
+        @memcpy(bufs.key_path[0..state.key_path_len], state.key_path_buf[0..state.key_path_len]);
+        @memcpy(bufs.proxy_jump[0..state.proxy_jump_len], state.proxy_jump_buf[0..state.proxy_jump_len]);
+        @memcpy(
+            bufs.proxy_command[0..state.proxy_command_len],
+            state.proxy_command_buf[0..state.proxy_command_len],
+        );
+        return .{
+            .method = state.method,
+            .key_path = bufs.key_path[0..state.key_path_len],
+            .proxy_jump = bufs.proxy_jump[0..state.proxy_jump_len],
+            .proxy_command = bufs.proxy_command[0..state.proxy_command_len],
+        };
     }
 
     fn insecureSkipVerify(state: *SiteState) bool {
@@ -373,6 +401,147 @@ fn readUserKnownHosts(gpa: Allocator, io: std.Io) ?[]u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Proxy plan (SFTP): per-site override or ~/.ssh/config ProxyJump /
+// ProxyCommand, executed via session.zig's Jump/Command transports.
+// ---------------------------------------------------------------------------
+
+/// Hard cap on chained jump hops (cycle/typo guard; OpenSSH has no fixed
+/// limit but each hop costs a session + pump thread).
+pub const max_jump_hops = 4;
+
+pub const ProxyPlan = struct {
+    arena: std.heap.ArenaAllocator,
+    /// Set = spawn this ProxyCommand; hops is empty then.
+    command: ?[]const u8,
+    /// ProxyJump chain in connection order; empty = direct.
+    hops: []const ssh_config_mod.Hop,
+
+    pub fn active(p: *const ProxyPlan) bool {
+        return p.command != null or p.hops.len > 0;
+    }
+
+    pub fn deinit(p: *ProxyPlan) void {
+        p.arena.deinit();
+        p.* = undefined;
+    }
+};
+
+/// Pure plan derivation (headless-tested): the explicit per-site fields
+/// win — ProxyJump over ProxyCommand, "none" disables everything — and
+/// only when both are unset is `config_text` (the user's ~/.ssh/config)
+/// consulted for `host`, hops first (mirroring the per-site precedence).
+pub fn buildProxyPlan(
+    gpa: Allocator,
+    explicit_jump: []const u8,
+    explicit_command: []const u8,
+    config_text: ?[]const u8,
+    host: []const u8,
+    home: []const u8,
+) error{OutOfMemory}!ProxyPlan {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    if (explicit_jump.len > 0) {
+        // Reuse ssh_config's hop grammar via a one-directive config; the
+        // synthetic directive precedes any Host block so it matches all.
+        var text_buf: [proxy_jump_max + 16]u8 = undefined;
+        const text = std.fmt.bufPrint(&text_buf, "ProxyJump {s}", .{explicit_jump}) catch
+            unreachable; // proxy_jump_max bounds the snapshot
+        const hops = try resolveHops(gpa, a, text, host, home);
+        return .{ .arena = arena, .command = null, .hops = hops };
+    }
+    if (explicit_command.len > 0) {
+        const cmd = try a.dupe(u8, explicit_command);
+        return .{ .arena = arena, .command = cmd, .hops = &.{} };
+    }
+
+    const text = config_text orelse
+        return .{ .arena = arena, .command = null, .hops = &.{} };
+    var cfg = try ssh_config_mod.parse(gpa, text, .none);
+    defer cfg.deinit();
+    var eff = try cfg.resolve(gpa, host, .{ .home = home });
+    defer eff.deinit();
+    if (eff.proxy_jump.len > 0) {
+        const hops = try dupeHops(a, eff.proxy_jump);
+        return .{ .arena = arena, .command = null, .hops = hops };
+    }
+    if (eff.proxy_command) |cmd| {
+        // Allocation must precede the literal: `.arena = arena` copies the
+        // arena state (same rule as ssh_config.resolve).
+        const cmd_copy = try a.dupe(u8, cmd);
+        return .{ .arena = arena, .command = cmd_copy, .hops = &.{} };
+    }
+    return .{ .arena = arena, .command = null, .hops = &.{} };
+}
+
+fn resolveHops(
+    gpa: Allocator,
+    a: Allocator,
+    config_text: []const u8,
+    host: []const u8,
+    home: []const u8,
+) error{OutOfMemory}![]const ssh_config_mod.Hop {
+    var cfg = try ssh_config_mod.parse(gpa, config_text, .none);
+    defer cfg.deinit();
+    var eff = try cfg.resolve(gpa, host, .{ .home = home });
+    defer eff.deinit();
+    return dupeHops(a, eff.proxy_jump);
+}
+
+fn dupeHops(a: Allocator, hops: []const ssh_config_mod.Hop) error{OutOfMemory}![]const ssh_config_mod.Hop {
+    const out = try a.alloc(ssh_config_mod.Hop, hops.len);
+    for (hops, out) |src, *dst| {
+        dst.* = .{
+            .user = if (src.user) |u| try a.dupe(u8, u) else null,
+            .host = try a.dupe(u8, src.host),
+            .port = src.port,
+        };
+    }
+    return out;
+}
+
+fn homeDir() []const u8 {
+    const home = std.c.getenv("HOME") orelse return "";
+    return std.mem.span(home);
+}
+
+fn userSshConfigText(gpa: Allocator, io: std.Io) ?[]u8 {
+    const home = homeDir();
+    if (home.len == 0) return null;
+    var path_buf: [1024]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/.ssh/config", .{home}) catch return null;
+    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch null;
+}
+
+/// Everything a proxied SFTP connection owns underneath its SshSession.
+/// Teardown (reverse of construction): jump transports target-first, then
+/// the ProxyCommand child, then the base TCP stream.
+const ProxyChainState = struct {
+    base_stream: ?std.Io.net.Stream = null,
+    command: ?*session_mod.CommandTransport = null,
+    jumps: [max_jump_hops]*session_mod.JumpTransport = undefined,
+    jump_len: usize = 0,
+
+    fn deinit(chain: *ProxyChainState, io: std.Io) void {
+        var i = chain.jump_len;
+        while (i > 0) {
+            i -= 1;
+            chain.jumps[i].deinit();
+        }
+        chain.jump_len = 0;
+        if (chain.command) |ct| {
+            ct.deinit();
+            chain.command = null;
+        }
+        if (chain.base_stream) |stream| {
+            stream.close(io);
+            chain.base_stream = null;
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
 // SFTP connect
 // ---------------------------------------------------------------------------
 
@@ -390,10 +559,108 @@ fn mapSessionError(err: session_mod.Error) vfs_mod.Error {
 
 const SftpConnState = struct {
     gpa: Allocator,
-    stream: std.Io.net.Stream,
+    chain: ProxyChainState,
     session: session_mod.SshSession,
     client: sftp_client_mod.SftpClient,
 };
+
+fn dialTcp(
+    io: std.Io,
+    diag: *Diagnostics,
+    host: []const u8,
+    port: u16,
+) vfs_mod.Error!std.Io.net.Stream {
+    const addr = std.Io.net.IpAddress.resolve(io, host, port) catch {
+        diag.set(.transient, 0, "could not resolve {s}", .{host});
+        return error.Unexpected;
+    };
+    return addr.connect(io, .{ .mode = .stream }) catch {
+        diag.set(.transient, 0, "could not connect to {s}:{d}", .{ host, port });
+        return error.ConnectionLost;
+    };
+}
+
+/// Builds the transport chain per the plan and returns the fd the target
+/// session runs over. On error every partial resource is already in
+/// `chain` for the caller's cleanup.
+fn establishProxyChain(
+    state: *SiteState,
+    io: std.Io,
+    cancel: *CancelToken,
+    diag: *Diagnostics,
+    site: *const site_pool_mod.SiteConfig,
+    plan: *const ProxyPlan,
+    login_user: []const u8,
+    chain: *ProxyChainState,
+    callbacks: session_mod.Callbacks,
+) vfs_mod.Error!std.posix.fd_t {
+    const gpa = state.owner.gpa;
+
+    if (plan.command) |cmd| {
+        const ct = session_mod.CommandTransport.spawn(gpa, io, cmd, site.host, site.port, diag) catch |err|
+            return mapSessionError(err);
+        chain.command = ct;
+        return ct.target_fd;
+    }
+    if (plan.hops.len == 0) {
+        const stream = try dialTcp(io, diag, site.host, site.port);
+        chain.base_stream = stream;
+        return stream.socket.handle;
+    }
+    if (plan.hops.len > max_jump_hops) {
+        diag.set(.permanent, 0, "ProxyJump chain too long ({d} hops; limit {d})", .{
+            plan.hops.len, max_jump_hops,
+        });
+        return error.Unexpected;
+    }
+
+    var fd: std.posix.fd_t = undefined;
+    for (plan.hops, 0..) |hop, i| {
+        const hop_port = hop.port orelse 22;
+        if (i == 0) {
+            const stream = try dialTcp(io, diag, hop.host, hop_port);
+            chain.base_stream = stream;
+            fd = stream.socket.handle;
+        }
+        // Host key verification runs per hop (the info carries the hop's
+        // host:port, so known_hosts lookups and trust prompts are per hop).
+        var hop_session = session_mod.SshSession.init(
+            gpa,
+            io,
+            fd,
+            hop.host,
+            hop_port,
+            cancel,
+            diag,
+            callbacks,
+        ) catch |err| return mapSessionError(err);
+        // Jump hosts authenticate via the non-interactive chain: agent +
+        // default ~/.ssh keys (password rescue stays target-only for now).
+        var ssh_dir_buf: [1024]u8 = undefined;
+        hop_session.authenticate(cancel, diag, .{
+            .username = hop.user orelse login_user,
+            .try_agent = true,
+            .ssh_dir = sshDir(&ssh_dir_buf),
+        }) catch |err| {
+            hop_session.deinit();
+            return mapSessionError(err);
+        };
+        const next_host = if (i + 1 < plan.hops.len) plan.hops[i + 1].host else site.host;
+        const next_port = if (i + 1 < plan.hops.len) plan.hops[i + 1].port orelse 22 else site.port;
+        const jt = session_mod.JumpTransport.open(
+            gpa,
+            hop_session,
+            next_host,
+            next_port,
+            cancel,
+            diag,
+        ) catch |err| return mapSessionError(err);
+        chain.jumps[chain.jump_len] = jt;
+        chain.jump_len += 1;
+        fd = jt.target_fd;
+    }
+    return fd;
+}
 
 fn connectSftp(
     state: *SiteState,
@@ -413,8 +680,8 @@ fn connectSftp(
         return error.Unexpected;
     };
 
-    var key_path_buf: [key_path_max]u8 = undefined;
-    const meta = state.authSnapshot(&key_path_buf);
+    var meta_bufs: SiteState.SnapshotBufs = undefined;
+    const meta = state.authSnapshot(&meta_bufs);
 
     var stored = try storedCreds(site, diag);
     if (stored == null and meta.method == .password) {
@@ -427,32 +694,54 @@ fn connectSftp(
         }
     }
 
-    const addr = std.Io.net.IpAddress.resolve(io, site.host, site.port) catch {
-        diag.set(.transient, 0, "could not resolve {s}", .{site.host});
-        return error.Unexpected;
+    var plan = blk: {
+        const config_text = userSshConfigText(gpa, io);
+        defer if (config_text) |text| gpa.free(text);
+        break :blk try buildProxyPlan(
+            gpa,
+            meta.proxy_jump,
+            meta.proxy_command,
+            config_text,
+            site.host,
+            homeDir(),
+        );
     };
-    const stream = addr.connect(io, .{ .mode = .stream }) catch {
-        diag.set(.transient, 0, "could not connect to {s}:{d}", .{ site.host, site.port });
-        return error.ConnectionLost;
-    };
-    var stream_owned = true;
-    defer if (stream_owned) stream.close(io);
+    defer plan.deinit();
 
     const conn = gpa.create(SftpConnState) catch return error.OutOfMemory;
     errdefer gpa.destroy(conn);
     conn.gpa = gpa;
-    conn.stream = stream;
+    conn.chain = .{};
+    var chain_owned = true;
+    defer if (chain_owned) conn.chain.deinit(io);
 
     var hk_ctx: HostKeyCtx = .{ .state = state, .io = io, .cancel = cancel };
+    const callbacks: session_mod.Callbacks = .{
+        .context = @ptrCast(&hk_ctx),
+        .verifyHostKey = verifyHostKeyCb,
+    };
+
+    const target_fd = try establishProxyChain(
+        state,
+        io,
+        cancel,
+        diag,
+        site,
+        &plan,
+        login.user,
+        &conn.chain,
+        callbacks,
+    );
+
     conn.session = session_mod.SshSession.init(
         gpa,
         io,
-        stream.socket.handle,
+        target_fd,
         site.host,
         site.port,
         cancel,
         diag,
-        .{ .context = @ptrCast(&hk_ctx), .verifyHostKey = verifyHostKeyCb },
+        callbacks,
     ) catch |err| return mapSessionError(err);
     errdefer conn.session.deinit();
 
@@ -498,7 +787,7 @@ fn connectSftp(
 
     conn.client = try sftp_client_mod.SftpClient.init(&conn.session, cancel, diag);
 
-    stream_owned = false; // the Conn owns everything from here
+    chain_owned = false; // the Conn owns everything from here
     return .{
         .engine = .{ .sftp = &conn.client },
         .ctx = @ptrCast(conn),
@@ -533,8 +822,10 @@ fn sftpAlive(_: *anyopaque) bool {
 fn sftpClose(ctx: *anyopaque, io: std.Io) void {
     const conn = sftpStateOf(ctx);
     conn.client.deinit();
+    // Target session first: its disconnect flows through the still-live
+    // proxy pumps; then the chain (jumps target-first, command, stream).
     conn.session.deinit();
-    conn.stream.close(io);
+    conn.chain.deinit(io);
     conn.gpa.destroy(conn);
 }
 
@@ -768,6 +1059,12 @@ fn lockSpin(m: *std.atomic.Mutex) void {
     while (!m.tryLock()) std.atomic.spinLoopHint();
 }
 
+fn copyClamped(buf: []u8, src: []const u8) usize {
+    const n = @min(src.len, buf.len);
+    @memcpy(buf[0..n], src[0..n]);
+    return n;
+}
+
 // ---------------------------------------------------------------------------
 // Tests — headless: pure policy + per-site state plumbing. The live
 // connect sequences are covered by `zig build run -- --smoke-sftp`
@@ -839,14 +1136,21 @@ test "Factories: one state per site id, refreshed auth meta via meta_lookup" {
     try testing.expectEqual(AuthMethod.agent, state.method); // sftp default
 
     // Same site id reuses the state; the meta snapshot refreshes.
-    Meta.choice = .{ .method = .key_file, .key_path = "/keys/deploy_ed25519" };
+    Meta.choice = .{
+        .method = .key_file,
+        .key_path = "/keys/deploy_ed25519",
+        .proxy_jump = "alice@bastion:2222",
+        .proxy_command = "nc %h %p",
+    };
     const f2 = factories.provider().makeFn(@ptrCast(factories), &site);
     try testing.expectEqual(f1.ctx, f2.ctx);
     try testing.expectEqual(@as(usize, 1), factories.states.items.len);
-    var key_buf: [key_path_max]u8 = undefined;
-    const snap = state.authSnapshot(&key_buf);
+    var snap_bufs: SiteState.SnapshotBufs = undefined;
+    const snap = state.authSnapshot(&snap_bufs);
     try testing.expectEqual(AuthMethod.key_file, snap.method);
     try testing.expectEqualStrings("/keys/deploy_ed25519", snap.key_path);
+    try testing.expectEqualStrings("alice@bastion:2222", snap.proxy_jump);
+    try testing.expectEqualStrings("nc %h %p", snap.proxy_command);
 
     // FTP sites default to password auth; a second id gets its own state.
     const ftp_site: sites_mod.Site = .{ .id = 8, .protocol = .ftp, .host = "f.example" };
@@ -855,6 +1159,83 @@ test "Factories: one state per site id, refreshed auth meta via meta_lookup" {
     try testing.expectEqual(@as(usize, 2), factories.states.items.len);
     const ftp_state: *SiteState = @ptrCast(@alignCast(f3.ctx));
     try testing.expectEqual(AuthMethod.password, ftp_state.method);
+}
+
+test "buildProxyPlan: explicit per-site fields win; 'none' disables" {
+    const gpa = testing.allocator;
+    const cfg = "Host *\n  ProxyJump config-bastion\n";
+
+    // Explicit multi-hop jump beats both the config and the explicit command.
+    var jump = try buildProxyPlan(gpa, "alice@b1:2222,b2", "nc %h %p", cfg, "h.example", "/h");
+    defer jump.deinit();
+    try testing.expect(jump.active());
+    try testing.expectEqual(@as(?[]const u8, null), jump.command);
+    try testing.expectEqual(@as(usize, 2), jump.hops.len);
+    try testing.expectEqualStrings("alice", jump.hops[0].user.?);
+    try testing.expectEqualStrings("b1", jump.hops[0].host);
+    try testing.expectEqual(@as(?u16, 2222), jump.hops[0].port);
+    try testing.expectEqualStrings("b2", jump.hops[1].host);
+    try testing.expectEqual(@as(?u16, null), jump.hops[1].port);
+
+    // Explicit command (no explicit jump) beats the config.
+    var cmd = try buildProxyPlan(gpa, "", "ssh -W %h:%p gw", cfg, "h.example", "/h");
+    defer cmd.deinit();
+    try testing.expect(cmd.active());
+    try testing.expectEqualStrings("ssh -W %h:%p gw", cmd.command.?);
+    try testing.expectEqual(@as(usize, 0), cmd.hops.len);
+
+    // Explicit "none" disables proxying entirely, config notwithstanding.
+    var none = try buildProxyPlan(gpa, "none", "", cfg, "h.example", "/h");
+    defer none.deinit();
+    try testing.expect(!none.active());
+}
+
+test "buildProxyPlan: ~/.ssh/config fallback, host-scoped" {
+    const gpa = testing.allocator;
+    const cfg =
+        \\Host jumped.example.com
+        \\  ProxyJump alice@bastion.example.com:2222
+        \\Host commanded.example.com
+        \\  ProxyCommand nc -x proxy:1080 %h %p
+        \\Host direct.example.com
+        \\  Port 2022
+    ;
+
+    var jump = try buildProxyPlan(gpa, "", "", cfg, "jumped.example.com", "/h");
+    defer jump.deinit();
+    try testing.expectEqual(@as(usize, 1), jump.hops.len);
+    try testing.expectEqualStrings("bastion.example.com", jump.hops[0].host);
+    try testing.expectEqual(@as(?u16, 2222), jump.hops[0].port);
+    try testing.expectEqualStrings("alice", jump.hops[0].user.?);
+
+    var cmd = try buildProxyPlan(gpa, "", "", cfg, "commanded.example.com", "/h");
+    defer cmd.deinit();
+    try testing.expectEqualStrings("nc -x proxy:1080 %h %p", cmd.command.?);
+
+    var direct = try buildProxyPlan(gpa, "", "", cfg, "direct.example.com", "/h");
+    defer direct.deinit();
+    try testing.expect(!direct.active());
+
+    var no_cfg = try buildProxyPlan(gpa, "", "", null, "jumped.example.com", "/h");
+    defer no_cfg.deinit();
+    try testing.expect(!no_cfg.active());
+}
+
+test "buildProxyPlan survives allocation failure" {
+    const Check = struct {
+        fn run(gpa: Allocator) !void {
+            var plan = try buildProxyPlan(
+                gpa,
+                "alice@b1:2222,b2",
+                "",
+                "Host *\n  ProxyJump cfg\n",
+                "h.example",
+                "/h",
+            );
+            plan.deinit();
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Check.run, .{});
 }
 
 test "appendKnownHost: accepted keys land in the app file and verify as known" {

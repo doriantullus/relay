@@ -1051,6 +1051,68 @@ pub const LibSsh2 = struct {
         return @intCast(@max(next, 0));
     }
 
+    /// Opens a direct-tcpip channel (the ProxyJump forward). null = the
+    /// server refused; read last_errno for the reason.
+    pub fn channelDirectTcpip(
+        h: Handle,
+        fd: std.posix.fd_t,
+        cancel: *CancelToken,
+        host: [:0]const u8,
+        port: u16,
+    ) poll.Error!?*c.LIBSSH2_CHANNEL {
+        const Op = struct {
+            h: Handle,
+            host: [:0]const u8,
+            port: u16,
+
+            pub fn call(op: @This()) ?*c.LIBSSH2_CHANNEL {
+                return c.libssh2_channel_direct_tcpip_ex(
+                    op.h,
+                    op.host.ptr,
+                    @intCast(op.port),
+                    "127.0.0.1",
+                    0,
+                );
+            }
+            pub fn directions(op: @This()) c_int {
+                return c.libssh2_session_block_directions(op.h);
+            }
+            pub fn lastErrno(op: @This()) c_int {
+                return c.libssh2_session_last_errno(op.h);
+            }
+        };
+        return poll.pumpHandle(fd, cancel, Op{ .h = h, .host = host, .port = port });
+    }
+
+    /// Best-effort bounded channel close + free (mirrors `disconnect`).
+    pub fn channelFree(ch: *c.LIBSSH2_CHANNEL, h: Handle, fd: std.posix.fd_t) void {
+        var token: CancelToken = .{};
+        const Close = struct {
+            ch: *c.LIBSSH2_CHANNEL,
+            h: Handle,
+
+            pub fn call(op: @This()) c_int {
+                return c.libssh2_channel_close(op.ch);
+            }
+            pub fn directions(op: @This()) c_int {
+                return c.libssh2_session_block_directions(op.h);
+            }
+        };
+        _ = poll.pumpBounded(fd, &token, Close{ .ch = ch, .h = h }, 3) catch {};
+        const Free = struct {
+            ch: *c.LIBSSH2_CHANNEL,
+            h: Handle,
+
+            pub fn call(op: @This()) c_int {
+                return c.libssh2_channel_free(op.ch);
+            }
+            pub fn directions(op: @This()) c_int {
+                return c.libssh2_session_block_directions(op.h);
+            }
+        };
+        _ = poll.pumpBounded(fd, &token, Free{ .ch = ch, .h = h }, 3) catch {};
+    }
+
     /// Best-effort teardown, bounded to ~1s total: ≤5 polls for the
     /// disconnect message, ≤5 for the session free. If libssh2 still
     /// reports EAGAIN after that we abandon the handle (leak, never hang).
@@ -1088,6 +1150,565 @@ pub const LibSsh2 = struct {
 
 /// The production session type the SFTP layer builds on.
 pub const SshSession = Engine(LibSsh2).Session;
+
+// ---------------------------------------------------------------------------
+// Proxy transports — ProxyJump / ProxyCommand
+//
+// libssh2 wants ONE socket fd per session, so anything that is not a plain
+// TCP connection (a direct-tcpip channel through a jump host, a spawned
+// ProxyCommand's stdio) is bridged to a socketpair: the target session gets
+// one end as its "socket", a pump thread shuttles bytes between the other
+// end and the real transport. The pump is poll-driven with ≤100 ms wakeups
+// so teardown (and cancellation above it) resolves promptly.
+// ---------------------------------------------------------------------------
+
+pub const pump_buf_len = 32 * 1024;
+
+/// Result of one non-blocking read/write on the channel side of a pump.
+pub const ChanResult = union(enum) {
+    bytes: usize,
+    /// Would block; progress needs the next poll wakeup.
+    again,
+    /// Orderly end of stream (reads only).
+    eof,
+    /// The transport is broken; the pump tears down.
+    fail,
+};
+
+/// One pump thread bridging `Chan` (the transport) to a socketpair end.
+/// `Chan` is duck-typed:
+///
+///   fn chanRead(ch, buf: []u8) ChanResult
+///   fn chanWrite(ch, data: []const u8) ChanResult
+///   fn chanSendEof(ch) void              — half-close toward the transport
+///   fn readFd(ch) / writeFd(ch) fd_t     — fds to poll for progress
+///   fn readPollEvents(ch) / writePollEvents(ch) i16
+///
+/// The pump owns no fds; the enclosing transport closes them after
+/// `shutdown` joins the thread. `sock` must stay open until then.
+pub fn Pump(comptime Chan: type) type {
+    return struct {
+        chan: *Chan,
+        /// Pump-side socketpair end; `start` makes it O_NONBLOCK.
+        sock: std.posix.fd_t,
+        stop_flag: std.atomic.Value(bool) = .init(false),
+        thread: ?std.Thread = null,
+
+        to_sock_buf: [pump_buf_len]u8 = undefined,
+        to_sock_start: usize = 0,
+        to_sock_len: usize = 0,
+        to_chan_buf: [pump_buf_len]u8 = undefined,
+        to_chan_start: usize = 0,
+        to_chan_len: usize = 0,
+        chan_eof: bool = false,
+        sock_eof: bool = false,
+        sock_shut: bool = false,
+        chan_eof_sent: bool = false,
+
+        const Self = @This();
+
+        /// Spawn the pump thread. The Self must not move afterwards (the
+        /// thread holds the pointer) — transports heap-allocate themselves.
+        pub fn start(self: *Self) error{Unexpected}!void {
+            try LibSsh2.setNonBlocking(self.sock);
+            self.thread = std.Thread.spawn(.{}, run, .{self}) catch return error.Unexpected;
+        }
+
+        /// Stops the loop and joins the thread (≤ ~one poll interval).
+        /// Idempotent; safe when `start` was never called.
+        pub fn shutdown(self: *Self) void {
+            self.stop_flag.store(true, .release);
+            if (self.thread) |th| th.join();
+            self.thread = null;
+        }
+
+        fn run(self: *Self) void {
+            while (self.step()) {}
+            // Unblock a session still attached to the far socketpair end:
+            // it sees EOF / write failure and classifies ConnectionLost.
+            fdShutdown(self.sock, .both);
+        }
+
+        /// One poll + transfer round; false = the pump is done. Pure
+        /// fd/Chan logic — unit-tested over socketpairs without SSH.
+        fn step(self: *Self) bool {
+            if (self.stop_flag.load(.acquire)) return false;
+            if (self.done()) return false;
+
+            var fds: [3]std.posix.pollfd = undefined;
+            var n: usize = 0;
+            {
+                var ev: i16 = 0;
+                if (self.to_chan_len == 0 and !self.sock_eof) ev |= std.posix.POLL.IN;
+                if (self.to_sock_len != 0) ev |= std.posix.POLL.OUT;
+                if (ev != 0) {
+                    fds[n] = .{ .fd = self.sock, .events = ev, .revents = 0 };
+                    n += 1;
+                }
+            }
+            if (self.to_sock_len == 0 and !self.chan_eof) {
+                fds[n] = .{
+                    .fd = self.chan.readFd(),
+                    .events = self.chan.readPollEvents(),
+                    .revents = 0,
+                };
+                n += 1;
+            }
+            if (self.to_chan_len != 0) {
+                fds[n] = .{
+                    .fd = self.chan.writeFd(),
+                    .events = self.chan.writePollEvents(),
+                    .revents = 0,
+                };
+                n += 1;
+            }
+            _ = std.posix.poll(fds[0..n], poll.poll_interval_ms) catch return false;
+            if (self.stop_flag.load(.acquire)) return false;
+
+            // chan -> sock: flush pending, then refill from the channel.
+            if (self.to_sock_len != 0) {
+                const pending = self.to_sock_buf[self.to_sock_start..][0..self.to_sock_len];
+                if (fdWrite(self.sock, pending)) |wrote| {
+                    self.to_sock_start += wrote;
+                    self.to_sock_len -= wrote;
+                } else |err| switch (err) {
+                    error.WouldBlock => {},
+                    else => return false,
+                }
+            }
+            if (self.to_sock_len == 0 and !self.chan_eof) {
+                switch (self.chan.chanRead(&self.to_sock_buf)) {
+                    .bytes => |got| {
+                        self.to_sock_start = 0;
+                        self.to_sock_len = got;
+                    },
+                    .again => {},
+                    .eof => self.chan_eof = true,
+                    .fail => return false,
+                }
+            }
+            if (self.chan_eof and self.to_sock_len == 0 and !self.sock_shut) {
+                self.sock_shut = true;
+                fdShutdown(self.sock, .send);
+            }
+
+            // sock -> chan: flush pending, then refill from the socket.
+            if (self.to_chan_len != 0) {
+                const pending = self.to_chan_buf[self.to_chan_start..][0..self.to_chan_len];
+                switch (self.chan.chanWrite(pending)) {
+                    .bytes => |wrote| {
+                        self.to_chan_start += wrote;
+                        self.to_chan_len -= wrote;
+                    },
+                    .again => {},
+                    .eof, .fail => return false,
+                }
+            }
+            if (self.to_chan_len == 0 and !self.sock_eof) {
+                if (std.posix.read(self.sock, &self.to_chan_buf)) |got| {
+                    if (got == 0) {
+                        self.sock_eof = true;
+                    } else {
+                        self.to_chan_start = 0;
+                        self.to_chan_len = got;
+                    }
+                } else |err| switch (err) {
+                    error.WouldBlock => {},
+                    else => return false,
+                }
+            }
+            if (self.sock_eof and self.to_chan_len == 0 and !self.chan_eof_sent) {
+                self.chan_eof_sent = true;
+                self.chan.chanSendEof();
+            }
+            return !self.done();
+        }
+
+        fn done(self: *const Self) bool {
+            return self.chan_eof and self.sock_eof and
+                self.to_sock_len == 0 and self.to_chan_len == 0;
+        }
+    };
+}
+
+/// Channel over a plain fd pair: a ProxyCommand child's stdout (read) and
+/// stdin (write) — also the unit-test fake (both fds = one socketpair end).
+/// Both fds must be O_NONBLOCK.
+pub const FdChan = struct {
+    read_fd: std.posix.fd_t,
+    write_fd: std.posix.fd_t,
+    eof_mode: EofMode,
+    write_closed: bool = false,
+
+    pub const EofMode = enum {
+        /// Socket: shutdown(SHUT_WR), fd stays open (tests).
+        shutdown_send,
+        /// Pipe: close the write fd (a child's stdin EOF); the owner must
+        /// then skip its own close (`write_closed`).
+        close_fd,
+    };
+
+    pub fn chanRead(ch: *FdChan, buf: []u8) ChanResult {
+        const got = std.posix.read(ch.read_fd, buf) catch |err| switch (err) {
+            error.WouldBlock => return .again,
+            else => return .fail,
+        };
+        return if (got == 0) .eof else .{ .bytes = got };
+    }
+
+    pub fn chanWrite(ch: *FdChan, data: []const u8) ChanResult {
+        if (ch.write_closed) return .fail;
+        const wrote = fdWrite(ch.write_fd, data) catch |err| switch (err) {
+            error.WouldBlock => return .again,
+            else => return .fail,
+        };
+        return .{ .bytes = wrote };
+    }
+
+    pub fn chanSendEof(ch: *FdChan) void {
+        switch (ch.eof_mode) {
+            .shutdown_send => fdShutdown(ch.write_fd, .send),
+            .close_fd => {
+                if (!ch.write_closed) fdClose(ch.write_fd);
+                ch.write_closed = true;
+            },
+        }
+    }
+
+    pub fn readFd(ch: *const FdChan) std.posix.fd_t {
+        return ch.read_fd;
+    }
+    pub fn writeFd(ch: *const FdChan) std.posix.fd_t {
+        return ch.write_fd;
+    }
+    pub fn readPollEvents(_: *const FdChan) i16 {
+        return std.posix.POLL.IN;
+    }
+    pub fn writePollEvents(_: *const FdChan) i16 {
+        return std.posix.POLL.OUT;
+    }
+};
+
+fn directionsToPollEvents(dirs: c_int) i16 {
+    var ev: i16 = 0;
+    if (dirs & poll.block_inbound != 0) ev |= std.posix.POLL.IN;
+    if (dirs & poll.block_outbound != 0) ev |= std.posix.POLL.OUT;
+    // EAGAIN with no direction (or no EAGAIN yet): wait on readability so
+    // the loop stays cool, mirroring poll.waitSocket's defensive default.
+    return if (ev == 0) std.posix.POLL.IN else ev;
+}
+
+/// Channel over a libssh2 direct-tcpip channel of an (authenticated) jump
+/// session. Only the pump thread touches the jump session after start —
+/// libssh2 sessions are not thread-safe.
+pub const ChannelChan = struct {
+    session: LibSsh2.Handle,
+    channel: *c.LIBSSH2_CHANNEL,
+    /// The jump session's socket; polled for channel progress.
+    fd: std.posix.fd_t,
+
+    pub fn chanRead(ch: *ChannelChan, buf: []u8) ChanResult {
+        const rc = c.libssh2_channel_read_ex(ch.channel, 0, buf.ptr, buf.len);
+        if (rc > 0) return .{ .bytes = @intCast(rc) };
+        if (rc == 0) return if (c.libssh2_channel_eof(ch.channel) != 0) .eof else .again;
+        if (rc == poll.eagain) return .again;
+        return .fail;
+    }
+
+    pub fn chanWrite(ch: *ChannelChan, data: []const u8) ChanResult {
+        const rc = c.libssh2_channel_write_ex(ch.channel, 0, data.ptr, data.len);
+        if (rc > 0) return .{ .bytes = @intCast(rc) };
+        if (rc == poll.eagain or rc == 0) return .again;
+        return .fail;
+    }
+
+    pub fn chanSendEof(ch: *ChannelChan) void {
+        var token: CancelToken = .{};
+        const Op = struct {
+            ch: *ChannelChan,
+
+            pub fn call(op: @This()) c_int {
+                return c.libssh2_channel_send_eof(op.ch.channel);
+            }
+            pub fn directions(op: @This()) c_int {
+                return c.libssh2_session_block_directions(op.ch.session);
+            }
+        };
+        _ = poll.pumpBounded(ch.fd, &token, Op{ .ch = ch }, 3) catch {};
+    }
+
+    pub fn readFd(ch: *const ChannelChan) std.posix.fd_t {
+        return ch.fd;
+    }
+    pub fn writeFd(ch: *const ChannelChan) std.posix.fd_t {
+        return ch.fd;
+    }
+    pub fn readPollEvents(ch: *const ChannelChan) i16 {
+        return directionsToPollEvents(c.libssh2_session_block_directions(ch.session));
+    }
+    pub fn writePollEvents(ch: *const ChannelChan) i16 {
+        return directionsToPollEvents(c.libssh2_session_block_directions(ch.session));
+    }
+};
+
+// std.posix (0.16) keeps read/poll but dropped write/close/shutdown;
+// route those through libc directly.
+fn fdClose(fd: std.posix.fd_t) void {
+    _ = std.c.close(fd);
+}
+
+const Shut = enum(c_int) {
+    send = std.c.SHUT.WR,
+    both = std.c.SHUT.RDWR,
+};
+
+fn fdShutdown(fd: std.posix.fd_t, how: Shut) void {
+    _ = std.c.shutdown(fd, @intFromEnum(how));
+}
+
+fn fdWrite(fd: std.posix.fd_t, data: []const u8) error{ WouldBlock, Unexpected }!usize {
+    while (true) {
+        const rc = std.c.write(fd, data.ptr, data.len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+/// CLOEXEC AF_UNIX stream socketpair (proxy transports spawn children; the
+/// pair must not leak into them).
+fn socketPair(diag: *Diagnostics) error{Unexpected}![2]std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) {
+        diag.set(.transient, 0, "socketpair failed for the proxy transport", .{});
+        return error.Unexpected;
+    }
+    for (fds) |fd| _ = std.c.fcntl(fd, std.posix.F.SETFD, @as(c_int, std.posix.FD_CLOEXEC));
+    return fds;
+}
+
+/// One ProxyJump hop: an authenticated SSH session to the jump host plus a
+/// direct-tcpip channel to the next hop / final target, bridged to
+/// `target_fd` for the session running over it. Multi-hop chains stack
+/// transports (each next session's "socket" is the previous `target_fd`).
+///
+/// Teardown contract: deinit the session running over `target_fd` FIRST
+/// (its disconnect flows through the still-live pump), then `deinit` here;
+/// the fd under the jump session stays owned by the caller (SshSession
+/// convention).
+pub const JumpTransport = struct {
+    gpa: Allocator,
+    session: SshSession,
+    channel: *c.LIBSSH2_CHANNEL,
+    chan: ChannelChan,
+    pump: Pump(ChannelChan),
+    /// The next session's socket; owned here, valid until deinit.
+    target_fd: std.posix.fd_t,
+    pump_fd: std.posix.fd_t,
+
+    /// Opens the direct-tcpip channel to `host:port` through `session`
+    /// (already authenticated) and starts the pump. Ownership of the
+    /// session transfers unconditionally — on error it is deinitialized
+    /// before returning.
+    pub fn open(
+        gpa: Allocator,
+        session: SshSession,
+        host: []const u8,
+        port: u16,
+        cancel: *CancelToken,
+        diag: *Diagnostics,
+    ) Error!*JumpTransport {
+        var sess = session;
+        errdefer sess.deinit();
+
+        if (host.len > max_username_len) {
+            diag.set(.permanent, 0, "jump target host name too long ({d} bytes)", .{host.len});
+            return error.Unexpected;
+        }
+        var host_z: [max_username_len:0]u8 = undefined;
+        @memcpy(host_z[0..host.len], host);
+        host_z[host.len] = 0;
+
+        const channel = (LibSsh2.channelDirectTcpip(
+            sess.handle,
+            sess.fd,
+            cancel,
+            host_z[0..host.len :0],
+            port,
+        ) catch |err| switch (err) {
+            error.Canceled => {
+                diag.set(.cancel, 0, "canceled", .{});
+                return error.Canceled;
+            },
+            error.ConnectionLost => {
+                diag.set(.transient, 0, "direct-tcpip to {s}:{d}: connection lost", .{ host, port });
+                return error.ConnectionLost;
+            },
+        }) orelse {
+            const rc = c.libssh2_session_last_errno(sess.handle);
+            var msg_buf: [256]u8 = undefined;
+            const cls = classifyLibRc(rc);
+            diag.set(cls.class, 0, "direct-tcpip to {s}:{d} via {s} failed (rc {d}): {s}", .{
+                host, port, sess.host(), rc, LibSsh2.lastErrorMessage(sess.handle, &msg_buf),
+            });
+            return cls.fatal orelse error.ConnectionLost;
+        };
+        errdefer LibSsh2.channelFree(channel, sess.handle, sess.fd);
+
+        const pair = try socketPair(diag);
+        errdefer for (pair) |fd| fdClose(fd);
+
+        const jt = gpa.create(JumpTransport) catch return error.OutOfMemory;
+        errdefer gpa.destroy(jt);
+        jt.* = .{
+            .gpa = gpa,
+            .session = sess,
+            .channel = channel,
+            .chan = .{ .session = sess.handle, .channel = channel, .fd = sess.fd },
+            .pump = .{ .chan = &jt.chan, .sock = pair[0] },
+            .target_fd = pair[1],
+            .pump_fd = pair[0],
+        };
+        jt.pump.start() catch {
+            diag.set(.transient, 0, "could not start the ProxyJump pump thread", .{});
+            return error.Unexpected;
+        };
+        return jt;
+    }
+
+    pub fn deinit(jt: *JumpTransport) void {
+        jt.pump.shutdown();
+        LibSsh2.channelFree(jt.channel, jt.session.handle, jt.session.fd);
+        jt.session.deinit();
+        fdClose(jt.pump_fd);
+        fdClose(jt.target_fd);
+        const gpa = jt.gpa;
+        jt.* = undefined;
+        gpa.destroy(jt);
+    }
+};
+
+/// ProxyCommand: a spawned `/bin/sh -c <command>` whose stdin/stdout are
+/// the SSH transport, bridged to `target_fd`. Same teardown contract as
+/// JumpTransport (target session first); deinit kills the child.
+pub const CommandTransport = struct {
+    gpa: Allocator,
+    io: std.Io,
+    child: std.process.Child,
+    chan: FdChan,
+    pump: Pump(FdChan),
+    target_fd: std.posix.fd_t,
+    pump_fd: std.posix.fd_t,
+
+    /// `command` is the verbatim ProxyCommand; %h/%p/%% are expanded here.
+    pub fn spawn(
+        gpa: Allocator,
+        io: std.Io,
+        command: []const u8,
+        host: []const u8,
+        port: u16,
+        diag: *Diagnostics,
+    ) Error!*CommandTransport {
+        const expanded = try expandProxyCommand(gpa, command, host, port);
+        defer gpa.free(expanded);
+
+        var child = std.process.spawn(io, .{
+            .argv = &.{ "/bin/sh", "-c", expanded },
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .ignore,
+        }) catch {
+            diag.set(.permanent, 0, "proxy command failed to start: {s}", .{expanded});
+            return error.Unexpected;
+        };
+        errdefer child.kill(io);
+
+        // Take the pipe fds: kill() must not double-close them.
+        const write_fd = child.stdin.?.handle;
+        const read_fd = child.stdout.?.handle;
+        child.stdin = null;
+        child.stdout = null;
+        errdefer fdClose(write_fd);
+        errdefer fdClose(read_fd);
+        LibSsh2.setNonBlocking(write_fd) catch {
+            diag.set(.permanent, 0, "could not set O_NONBLOCK on the proxy command pipes", .{});
+            return error.Unexpected;
+        };
+        LibSsh2.setNonBlocking(read_fd) catch {
+            diag.set(.permanent, 0, "could not set O_NONBLOCK on the proxy command pipes", .{});
+            return error.Unexpected;
+        };
+
+        const pair = try socketPair(diag);
+        errdefer for (pair) |fd| fdClose(fd);
+
+        const ct = gpa.create(CommandTransport) catch return error.OutOfMemory;
+        errdefer gpa.destroy(ct);
+        ct.* = .{
+            .gpa = gpa,
+            .io = io,
+            .child = child,
+            .chan = .{ .read_fd = read_fd, .write_fd = write_fd, .eof_mode = .close_fd },
+            .pump = .{ .chan = &ct.chan, .sock = pair[0] },
+            .target_fd = pair[1],
+            .pump_fd = pair[0],
+        };
+        ct.pump.start() catch {
+            diag.set(.transient, 0, "could not start the ProxyCommand pump thread", .{});
+            return error.Unexpected;
+        };
+        return ct;
+    }
+
+    pub fn deinit(ct: *CommandTransport) void {
+        ct.pump.shutdown();
+        ct.child.kill(ct.io);
+        if (!ct.chan.write_closed) fdClose(ct.chan.write_fd);
+        fdClose(ct.chan.read_fd);
+        fdClose(ct.pump_fd);
+        fdClose(ct.target_fd);
+        const gpa = ct.gpa;
+        ct.* = undefined;
+        gpa.destroy(ct);
+    }
+};
+
+/// ssh_config(5) TOKENS for ProxyCommand: %h (host), %p (port), %%.
+/// Unknown tokens stay verbatim (same lenience as ssh_config.zig).
+pub fn expandProxyCommand(
+    gpa: Allocator,
+    command: []const u8,
+    host: []const u8,
+    port: u16,
+) error{OutOfMemory}![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var i: usize = 0;
+    while (i < command.len) : (i += 1) {
+        if (command[i] != '%' or i + 1 == command.len) {
+            try out.append(gpa, command[i]);
+            continue;
+        }
+        i += 1;
+        switch (command[i]) {
+            '%' => try out.append(gpa, '%'),
+            'h' => try out.appendSlice(gpa, host),
+            'p' => {
+                var buf: [5]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "{d}", .{port}) catch unreachable;
+                try out.appendSlice(gpa, s);
+            },
+            else => {
+                try out.append(gpa, '%');
+                try out.append(gpa, command[i]);
+            },
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
 
 // ---------------------------------------------------------------------------
 // SSH wire helpers for the sign callback (pure; unit-tested + fuzzed)
@@ -1830,6 +2451,479 @@ test "authenticate survives allocation failure" {
         }
     };
     try t.checkAllAllocationFailures(t.allocator, Check.run, .{pem});
+}
+
+// ---------------------------------------------------------------------------
+// Pump / transport tests — socketpairs and a fake byte protocol; no SSH.
+// ---------------------------------------------------------------------------
+
+const TestPair = struct {
+    fds: [2]std.posix.fd_t,
+
+    fn init() !TestPair {
+        var diag: Diagnostics = .{};
+        return .{ .fds = try socketPair(&diag) };
+    }
+
+    fn deinit(p: *TestPair) void {
+        for (p.fds) |fd| fdClose(fd);
+    }
+};
+
+/// Blocking-side read with a poll deadline so a broken pump fails the test
+/// instead of hanging it.
+fn readDeadline(fd: std.posix.fd_t, buf: []u8) ![]u8 {
+    var fds = [1]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const n = std.posix.poll(&fds, 5000) catch return error.PollFailed;
+    if (n == 0) return error.DeadlineExceeded;
+    const got = try std.posix.read(fd, buf);
+    return buf[0..got];
+}
+
+fn readExactDeadline(fd: std.posix.fd_t, buf: []u8) ![]u8 {
+    var off: usize = 0;
+    while (off < buf.len) {
+        const got = try readDeadline(fd, buf[off..]);
+        if (got.len == 0) return error.UnexpectedEof;
+        off += got.len;
+    }
+    return buf;
+}
+
+test "pump bridges a fake byte protocol both ways over socketpairs" {
+    var a = try TestPair.init(); // [0] pump side, [1] "target session" side
+    defer a.deinit();
+    var b = try TestPair.init(); // [0] chan side, [1] "remote server" side
+    defer b.deinit();
+
+    try LibSsh2.setNonBlocking(b.fds[0]);
+    var chan: FdChan = .{ .read_fd = b.fds[0], .write_fd = b.fds[0], .eof_mode = .shutdown_send };
+    var pump: Pump(FdChan) = .{ .chan = &chan, .sock = a.fds[0] };
+    try pump.start();
+    defer pump.shutdown();
+
+    // Fake protocol: target sends a request, remote answers, twice.
+    var buf: [64]u8 = undefined;
+    _ = try fdWrite(a.fds[1], "PING relay");
+    try t.expectEqualStrings("PING relay", try readDeadline(b.fds[1], &buf));
+    _ = try fdWrite(b.fds[1], "PONG relay");
+    try t.expectEqualStrings("PONG relay", try readDeadline(a.fds[1], &buf));
+    _ = try fdWrite(a.fds[1], "QUIT");
+    try t.expectEqualStrings("QUIT", try readDeadline(b.fds[1], &buf));
+}
+
+test "pump moves bulk data exceeding every buffer in the path" {
+    var a = try TestPair.init();
+    defer a.deinit();
+    var b = try TestPair.init();
+    defer b.deinit();
+
+    try LibSsh2.setNonBlocking(b.fds[0]);
+    var chan: FdChan = .{ .read_fd = b.fds[0], .write_fd = b.fds[0], .eof_mode = .shutdown_send };
+    var pump: Pump(FdChan) = .{ .chan = &chan, .sock = a.fds[0] };
+    try pump.start();
+    defer pump.shutdown();
+
+    const total: usize = 8 * pump_buf_len; // 256 KiB > any single buffer
+    const Writer = struct {
+        fn run(fd: std.posix.fd_t, n: usize) void {
+            var chunk: [4096]u8 = undefined;
+            var off: usize = 0;
+            while (off < n) {
+                const len = @min(chunk.len, n - off);
+                for (chunk[0..len], 0..) |*p, i| p.* = @truncate((off + i) *% 31);
+                var done: usize = 0;
+                while (done < len) {
+                    done += fdWrite(fd, chunk[done..len]) catch return;
+                }
+                off += len;
+            }
+        }
+    };
+
+    // target -> remote
+    const th = try std.Thread.spawn(.{}, Writer.run, .{ a.fds[1], total });
+    var got: usize = 0;
+    var buf: [4096]u8 = undefined;
+    while (got < total) {
+        const chunk = try readDeadline(b.fds[1], &buf);
+        if (chunk.len == 0) break;
+        for (chunk, 0..) |byte, i| {
+            try t.expectEqual(@as(u8, @truncate((got + i) *% 31)), byte);
+        }
+        got += chunk.len;
+    }
+    th.join();
+    try t.expectEqual(total, got);
+
+    // remote -> target
+    const th2 = try std.Thread.spawn(.{}, Writer.run, .{ b.fds[1], total });
+    got = 0;
+    while (got < total) {
+        const chunk = try readDeadline(a.fds[1], &buf);
+        if (chunk.len == 0) break;
+        for (chunk, 0..) |byte, i| {
+            try t.expectEqual(@as(u8, @truncate((got + i) *% 31)), byte);
+        }
+        got += chunk.len;
+    }
+    th2.join();
+    try t.expectEqual(total, got);
+}
+
+test "pump propagates EOF both ways and finishes on its own" {
+    var a = try TestPair.init();
+    defer a.deinit();
+    var b = try TestPair.init();
+    defer b.deinit();
+
+    try LibSsh2.setNonBlocking(b.fds[0]);
+    var chan: FdChan = .{ .read_fd = b.fds[0], .write_fd = b.fds[0], .eof_mode = .shutdown_send };
+    var pump: Pump(FdChan) = .{ .chan = &chan, .sock = a.fds[0] };
+    try pump.start();
+
+    // Remote half-closes; the target side must observe EOF...
+    _ = try fdWrite(b.fds[1], "tail");
+    fdShutdown(b.fds[1], .send);
+    var buf: [16]u8 = undefined;
+    try t.expectEqualStrings("tail", try readDeadline(a.fds[1], &buf));
+    try t.expectEqual(@as(usize, 0), (try readDeadline(a.fds[1], &buf)).len);
+
+    // ...then the target closes; the pump completes without shutdown().
+    fdShutdown(a.fds[1], .send);
+    try t.expectEqual(@as(usize, 0), (try readDeadline(b.fds[1], &buf)).len);
+    pump.shutdown(); // joins a thread that already exited naturally
+    try t.expect(pump.chan_eof);
+    try t.expect(pump.sock_eof);
+}
+
+test "pump teardown under cancel: shutdown joins within the poll budget" {
+    const io = t.io;
+    var a = try TestPair.init();
+    defer a.deinit();
+    var b = try TestPair.init();
+    defer b.deinit();
+
+    try LibSsh2.setNonBlocking(b.fds[0]);
+    var chan: FdChan = .{ .read_fd = b.fds[0], .write_fd = b.fds[0], .eof_mode = .shutdown_send };
+    var pump: Pump(FdChan) = .{ .chan = &chan, .sock = a.fds[0] };
+    try pump.start();
+
+    // Mid-flight traffic, then an idle pump parked in poll().
+    _ = try fdWrite(a.fds[1], "in flight");
+    var buf: [16]u8 = undefined;
+    _ = try readDeadline(b.fds[1], &buf);
+
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    pump.shutdown();
+    const elapsed_ms = @divTrunc(
+        t0.durationTo(.now(io, .awake)).raw.nanoseconds,
+        std.time.ns_per_ms,
+    );
+    try t.expect(elapsed_ms < 500); // one ~100 ms poll wakeup + join slack
+    // After the join the far end is unblocked (shutdown .both in run()).
+    try t.expectEqual(@as(usize, 0), (try readDeadline(a.fds[1], &buf)).len);
+}
+
+test "CommandTransport: child stdio is the transport; deinit kills the child" {
+    var diag: Diagnostics = .{};
+    // `cat` echoes: bytes written to target_fd come back through the
+    // child's stdin->stdout — the full ProxyCommand data path, no SSH.
+    const ct = try CommandTransport.spawn(t.allocator, t.io, "exec cat", "h.example", 22, &diag);
+    var torn_down = false;
+    defer if (!torn_down) ct.deinit();
+
+    _ = try fdWrite(ct.target_fd, "through the proxy");
+    var buf: [32]u8 = undefined;
+    try t.expectEqualStrings(
+        "through the proxy",
+        try readExactDeadline(ct.target_fd, buf[0.."through the proxy".len]),
+    );
+
+    const pid = ct.child.id.?;
+    torn_down = true;
+    ct.deinit();
+    // deinit's kill() reaped the child: waitpid on the pid must report
+    // "no such child" rather than find a live or zombie process.
+    var status: c_int = 0;
+    const rc = std.c.waitpid(pid, &status, 0);
+    const err = std.posix.errno(rc);
+    try t.expectEqual(@as(std.c.pid_t, -1), rc);
+    try t.expectEqual(std.c.E.CHILD, err);
+}
+
+test "CommandTransport: spawn failure is classified, nothing leaks" {
+    var diag: Diagnostics = .{};
+    // /bin/sh starts fine but the command dies instantly; the transport
+    // still constructs (OpenSSH parity) and the session above would see
+    // EOF. Use a command that exits immediately to exercise child-exit.
+    const ct = try CommandTransport.spawn(t.allocator, t.io, "exec true", "h", 22, &diag);
+    defer ct.deinit();
+    var buf: [8]u8 = undefined;
+    // Child exited: target side observes EOF once the pump notices.
+    try t.expectEqual(@as(usize, 0), (try readDeadline(ct.target_fd, &buf)).len);
+}
+
+test "expandProxyCommand: %h/%p/%% tokens" {
+    const cases = [_]struct { in: []const u8, out: []const u8 }{
+        .{ .in = "ssh -W %h:%p jump", .out = "ssh -W files.example.com:2222 jump" },
+        .{ .in = "nc %h %p", .out = "nc files.example.com 2222" },
+        .{ .in = "echo 100%% %h", .out = "echo 100% files.example.com" },
+        .{ .in = "no tokens", .out = "no tokens" },
+        .{ .in = "trailing %", .out = "trailing %" },
+        .{ .in = "unknown %x stays", .out = "unknown %x stays" },
+    };
+    for (cases) |case| {
+        const out = try expandProxyCommand(t.allocator, case.in, "files.example.com", 2222);
+        defer t.allocator.free(out);
+        try t.expectEqualStrings(case.out, out);
+    }
+}
+
+test "expandProxyCommand survives allocation failure" {
+    const Check = struct {
+        fn run(gpa: Allocator) !void {
+            const out = try expandProxyCommand(gpa, "ssh -W %h:%p j %% %z", "host.example", 22);
+            gpa.free(out);
+        }
+    };
+    try t.checkAllAllocationFailures(t.allocator, Check.run, .{});
+}
+
+// ---------------------------------------------------------------------------
+// Live proxy matrix — opt-in like live_test.zig (RELAY_SFTP_LIVE=1): two
+// dockerized sshds. The jump host (linuxserver/openssh-server, password
+// auth; AllowTcpForwarding flipped on in its /config/sshd/sshd_config) and
+// an atmoz/sftp target reachable (a) through the jump via the docker
+// network's DNS name — the ProxyJump leg — and (b) on a published localhost
+// port for the ProxyCommand (`nc %h %p`) leg.
+// ---------------------------------------------------------------------------
+
+const live_jump_image = "linuxserver/openssh-server:latest";
+const live_target_image = "atmoz/sftp:alpine";
+
+fn liveDocker(gpa: Allocator, io: std.Io, argv: []const []const u8) error{ DockerFailed, OutOfMemory }![]u8 {
+    const res = std.process.run(gpa, io, .{ .argv = argv }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.DockerFailed,
+    };
+    defer gpa.free(res.stderr);
+    switch (res.term) {
+        .exited => |code| if (code == 0) return res.stdout,
+        else => {},
+    }
+    gpa.free(res.stdout);
+    return error.DockerFailed;
+}
+
+fn liveDockerOk(gpa: Allocator, io: std.Io, argv: []const []const u8) bool {
+    const out = liveDocker(gpa, io, argv) catch return false;
+    gpa.free(out);
+    return true;
+}
+
+/// Waits (≤ ~60 s; the jump image may run under emulation) for an SSH
+/// banner on the port. Docker's proxy accepts TCP before sshd listens.
+fn liveWaitBanner(io: std.Io, port: u16) bool {
+    for (0..300) |_| {
+        if (liveBannerVisible(io, port)) return true;
+        std.Io.sleep(io, .{ .nanoseconds = 200 * std.time.ns_per_ms }, .awake) catch return false;
+    }
+    return false;
+}
+
+fn liveBannerVisible(io: std.Io, port: u16) bool {
+    const addr = std.Io.net.IpAddress.resolve(io, "127.0.0.1", port) catch return false;
+    const stream = addr.connect(io, .{ .mode = .stream }) catch return false;
+    defer stream.close(io);
+    var fds = [1]std.posix.pollfd{.{
+        .fd = stream.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const n = std.posix.poll(&fds, 2000) catch return false;
+    if (n == 0) return false;
+    var buf: [8]u8 = undefined;
+    const got = std.posix.read(stream.socket.handle, &buf) catch return false;
+    return got >= 4 and std.mem.eql(u8, buf[0..4], "SSH-");
+}
+
+const AcceptAllHostKey = struct {
+    seen: usize = 0,
+
+    fn verify(ctx: *anyopaque, info: *const HostKeyInfo) HostKeyDecision {
+        const cb: *AcceptAllHostKey = @ptrCast(@alignCast(ctx));
+        cb.seen += 1;
+        _ = info;
+        return .accept;
+    }
+
+    fn callbacks(cb: *AcceptAllHostKey) Callbacks {
+        return .{ .context = cb, .verifyHostKey = verify };
+    }
+};
+
+test "live: ProxyJump + ProxyCommand transports (set RELAY_SFTP_LIVE=1 to run)" {
+    const gate = std.c.getenv("RELAY_SFTP_LIVE") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, std.mem.span(gate), "1")) return error.SkipZigTest;
+
+    const gpa = t.allocator;
+    const io = t.io;
+
+    if (!liveDockerOk(gpa, io, &.{ "docker", "version", "--format", "{{.Server.Version}}" }))
+        return error.SkipZigTest;
+    for ([_][]const u8{ live_jump_image, live_target_image }) |image| {
+        if (!liveDockerOk(gpa, io, &.{ "docker", "image", "inspect", image })) {
+            if (!liveDockerOk(gpa, io, &.{ "docker", "pull", image })) return error.SkipZigTest;
+        }
+    }
+
+    // Clock-seeded ports/names (collision avoidance, not security).
+    const now: std.Io.Clock.Timestamp = .now(io, .awake);
+    const mix = @as(u64, @truncate(@as(u96, @bitCast(now.raw.nanoseconds)))) *% 0x9e3779b97f4a7c15;
+    const jump_port: u16 = 20000 + @as(u16, @intCast((mix >> 32) % 19000));
+    const target_port: u16 = jump_port + 1;
+    var name_buf: [3][64]u8 = undefined;
+    const net = std.fmt.bufPrint(&name_buf[0], "relay-pj-net-{d}", .{jump_port}) catch unreachable;
+    const jump_name = std.fmt.bufPrint(&name_buf[1], "relay-pj-jump-{d}", .{jump_port}) catch unreachable;
+    const target_name = std.fmt.bufPrint(&name_buf[2], "relay-pj-target-{d}", .{jump_port}) catch unreachable;
+
+    if (!liveDockerOk(gpa, io, &.{ "docker", "network", "create", net })) return error.SkipZigTest;
+    defer _ = liveDockerOk(gpa, io, &.{ "docker", "network", "rm", net });
+
+    var port_buf: [2][32]u8 = undefined;
+    const target_map = std.fmt.bufPrint(&port_buf[0], "127.0.0.1:{d}:22", .{target_port}) catch unreachable;
+    const jump_map = std.fmt.bufPrint(&port_buf[1], "127.0.0.1:{d}:2222", .{jump_port}) catch unreachable;
+
+    // Target: docker-DNS reachable from the jump AND published for the
+    // ProxyCommand leg. TTL self-destruct mirrors live_test.zig.
+    if (!liveDockerOk(gpa, io, &.{
+        "docker", "run",      "-d",              "--rm",                          "--name", target_name, "--network", net,
+        "-p",     target_map, live_target_image, "relay:relaypw:1001:100:upload",
+    })) return error.SkipZigTest;
+    defer _ = liveDockerOk(gpa, io, &.{ "docker", "rm", "-f", target_name });
+    _ = liveDockerOk(gpa, io, &.{
+        "docker", "exec", "-d", target_name, "sh", "-c", "sleep 600; kill 1",
+    });
+
+    // Jump host: password auth; no --rm (docker restart below races
+    // autoremove), removed in the defer.
+    if (!liveDockerOk(gpa, io, &.{
+        "docker",               "run",           "-d", "--name",               jump_name, "--network",      net,
+        "-p",                   jump_map,        "-e", "PASSWORD_ACCESS=true", "-e",      "USER_NAME=jump", "-e",
+        "USER_PASSWORD=jumppw", live_jump_image,
+    })) return error.SkipZigTest;
+    defer _ = liveDockerOk(gpa, io, &.{ "docker", "rm", "-f", jump_name });
+
+    if (!liveWaitBanner(io, jump_port)) return error.SkipZigTest;
+    // The image ships AllowTcpForwarding no; flip it and restart sshd.
+    if (!liveDockerOk(gpa, io, &.{
+        "docker",                                           "exec",                     jump_name, "sed", "-i",
+        "s/^AllowTcpForwarding no/AllowTcpForwarding yes/", "/config/sshd/sshd_config",
+    })) return error.SkipZigTest;
+    if (!liveDockerOk(gpa, io, &.{ "docker", "restart", jump_name })) return error.SkipZigTest;
+    if (!liveWaitBanner(io, jump_port)) return error.SkipZigTest;
+    if (!liveWaitBanner(io, target_port)) return error.SkipZigTest;
+
+    // ---- ProxyJump leg: jump session -> direct-tcpip -> target session --
+    {
+        var cancel: CancelToken = .{};
+        var diag: Diagnostics = .{};
+        var hk: AcceptAllHostKey = .{};
+
+        const addr = try std.Io.net.IpAddress.resolve(io, "127.0.0.1", jump_port);
+        const stream = try addr.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+
+        var jump_session = try SshSession.init(
+            gpa,
+            io,
+            stream.socket.handle,
+            "127.0.0.1",
+            jump_port,
+            &cancel,
+            &diag,
+            hk.callbacks(),
+        );
+        var jump_owned = true;
+        defer if (jump_owned) jump_session.deinit();
+        try jump_session.authenticate(&cancel, &diag, .{
+            .username = "jump",
+            .try_agent = false,
+            .password = "jumppw",
+        });
+
+        jump_owned = false; // JumpTransport.open takes the session
+        const jt = try JumpTransport.open(gpa, jump_session, target_name, 22, &cancel, &diag);
+        var jt_owned = true;
+        defer if (jt_owned) jt.deinit();
+
+        // Full SSH handshake + host key + auth of the TARGET over the
+        // pumped channel — the transport proof. Host keys verified per
+        // hop: the callback fired once for the jump, once for the target.
+        var target_session = try SshSession.init(
+            gpa,
+            io,
+            jt.target_fd,
+            target_name,
+            22,
+            &cancel,
+            &diag,
+            hk.callbacks(),
+        );
+        var target_owned = true;
+        defer if (target_owned) target_session.deinit();
+        try target_session.authenticate(&cancel, &diag, .{
+            .username = "relay",
+            .try_agent = false,
+            .password = "relaypw",
+        });
+        try t.expectEqual(@as(usize, 2), hk.seen);
+        target_session.keepalive(5);
+        _ = try target_session.keepaliveSend(&cancel, &diag);
+
+        // Teardown contract: target session first, then the transport.
+        target_owned = false;
+        target_session.deinit();
+        jt_owned = false;
+        jt.deinit();
+        std.debug.print("RELAY-PROXY-LIVE jump leg PASS (2 host keys verified)\n", .{});
+    }
+
+    // ---- ProxyCommand leg: nc %h %p as the transport ---------------------
+    {
+        var cancel: CancelToken = .{};
+        var diag: Diagnostics = .{};
+        var hk: AcceptAllHostKey = .{};
+
+        const ct = try CommandTransport.spawn(gpa, io, "nc %h %p", "127.0.0.1", target_port, &diag);
+        var ct_owned = true;
+        defer if (ct_owned) ct.deinit();
+
+        var session = try SshSession.init(
+            gpa,
+            io,
+            ct.target_fd,
+            "127.0.0.1",
+            target_port,
+            &cancel,
+            &diag,
+            hk.callbacks(),
+        );
+        var session_owned = true;
+        defer if (session_owned) session.deinit();
+        try session.authenticate(&cancel, &diag, .{
+            .username = "relay",
+            .try_agent = false,
+            .password = "relaypw",
+        });
+
+        session_owned = false;
+        session.deinit();
+        ct_owned = false;
+        ct.deinit();
+        std.debug.print("RELAY-PROXY-LIVE command leg PASS\n", .{});
+    }
 }
 
 test {

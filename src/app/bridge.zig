@@ -170,6 +170,9 @@ pub const ListingProgress = struct {
     /// Default-sort permutation over `snapshot`, arena-owned by it.
     /// Borrowed for this dispatch; copy to keep.
     sort_index: []const u32 = &.{},
+    /// Wall time spent inside the protocol list call so far (worker-
+    /// bracketed) — the status bar's "latency honesty" (docs/UX.md).
+    elapsed_ms: u64 = 0,
 };
 
 pub const ListingDone = struct {
@@ -183,6 +186,9 @@ pub const ListingDone = struct {
     sort_index: []const u32,
     /// Message is event-arena-owned; copy to keep.
     failure: ?events_mod.Failure,
+    /// Total wall time of the protocol list call (worker-bracketed); 0 when
+    /// the call never started. Drives "· {d} ms" in remote status bars.
+    elapsed_ms: u64 = 0,
 };
 
 pub const OpKind = enum { mkdir, rename, chmod, delete };
@@ -559,11 +565,19 @@ pub const AppCore = struct {
     // ------------------------------------------------------------------ //
     // Event pump
 
-    /// Bridge-side post: honors the EventQueue scheduling contract. An OOM
-    /// drops the event (matching the engine's policy; queue state itself
-    /// stays consistent).
+    /// Bridge-side post: honors the EventQueue scheduling contract.
+    ///
+    /// OOM policy (explicit, BACKLOG hygiene): DROP the event and warn.
+    /// Events are best-effort towards the UI — the queue's own state stays
+    /// consistent and every consumer reconciles from truth (snapshots,
+    /// re-lists, engine.snapshot()), so a missed update self-heals; a
+    /// crash on the event path would not. Core producers (engine.post,
+    /// site_pool status posts) apply the same drop policy at their sites.
     fn postEvent(self: *AppCore, event: events_mod.CoreEvent) void {
-        const must_schedule = self.events_q.post(event) catch return;
+        const must_schedule = self.events_q.post(event) catch {
+            std.log.warn("bridge: event queue OOM; dropped a {s} event", .{@tagName(event)});
+            return;
+        };
         if (must_schedule) self.schedulePump();
     }
 
@@ -630,6 +644,9 @@ pub const AppCore = struct {
                     .entries_so_far = e.entry_count,
                     .snapshot = partial,
                     .sort_index = partial_sort,
+                    // Written by the worker before each batch post; the
+                    // queue handoff orders the write before this read.
+                    .elapsed_ms = job.elapsed_ms,
                 });
                 if (partial) |snap| snap.unref();
             },
@@ -643,6 +660,7 @@ pub const AppCore = struct {
                     .snapshot = job.snapshot,
                     .sort_index = job.sort_index,
                     .failure = e.failure,
+                    .elapsed_ms = job.elapsed_ms,
                 });
             },
             .transfer_progress => |e| self.emit(.transfer_progress, e),
@@ -1263,6 +1281,21 @@ const ListingJob = struct {
     // Worker-only coalescing state.
     last_partial_ns: i96 = 0,
     last_partial_count: usize = 0,
+
+    // Latency honesty: the worker brackets the protocol list call. Both
+    // fields are worker-written before an event post and main-read after
+    // the queue handoff, so no extra synchronization is needed.
+    list_started_ns: i96 = 0,
+    elapsed_ms: u64 = 0,
+
+    /// Milliseconds since the protocol call started; 0 before it did.
+    fn elapsedNow(job: *const ListingJob, io: std.Io) u64 {
+        if (job.list_started_ns == 0) return 0;
+        const now = std.Io.Clock.awake.now(io).nanoseconds;
+        const diff = now - job.list_started_ns;
+        if (diff <= 0) return 0;
+        return @intCast(@divTrunc(diff, std.time.ns_per_ms));
+    }
 };
 
 /// Streams Vfs.list batches into the snapshot Builder while posting
@@ -1282,6 +1315,7 @@ const TeeSink = struct {
             return;
         };
         publishPartial(self.job, self.builder);
+        self.job.elapsed_ms = self.job.elapsedNow(self.job.core.io);
         self.job.core.postEvent(.{ .listing_batch = .{
             .request_id = self.job.request_id,
             .entry_count = @intCast(@min(self.builder.count(), std.math.maxInt(u32))),
@@ -1362,7 +1396,12 @@ fn listWorker(job: *ListingJob) void {
     };
     var tee: TeeSink = .{ .job = job, .builder = &builder };
 
-    vfs.list(core.io, &job.token, &diag, job.path, builder.arena(), tee.sink()) catch {
+    // Latency honesty: bracket the protocol call (and only it); the final
+    // elapsed_ms rides both success and failure listing_done payloads.
+    job.list_started_ns = std.Io.Clock.awake.now(core.io).nanoseconds;
+    const list_result = vfs.list(core.io, &job.token, &diag, job.path, builder.arena(), tee.sink());
+    job.elapsed_ms = job.elapsedNow(core.io);
+    list_result catch {
         builder.abandon();
         core.postListingFailure(job.request_id, .{
             .class = diag.class,
@@ -1613,6 +1652,7 @@ const ListingRecorder = struct {
     failure_class: ?diag_mod.ErrorClass = null,
     snapshot_was_null: bool = false,
     sort_ok: bool = false,
+    elapsed_ms: u64 = std.math.maxInt(u64),
     first_sorted: [64]u8 = undefined,
     first_sorted_len: usize = 0,
     saw_name: bool = false,
@@ -1627,6 +1667,7 @@ const ListingRecorder = struct {
         self.done += 1;
         self.pane = d.pane_token;
         self.request = d.request_id;
+        self.elapsed_ms = d.elapsed_ms;
         if (d.failure) |f| {
             self.failure_class = f.class;
             self.snapshot_was_null = d.snapshot == null;
@@ -1679,6 +1720,9 @@ test "listPath round trip: local Vfs listing delivers snapshot + sort permutatio
     try testing.expect(rec.failure_class == null);
     try testing.expect(rec.progress >= 1);
     try testing.expect(rec.sort_ok);
+    // Latency honesty: the worker-bracketed elapsed time was delivered
+    // (a local listing is fast — sanity-bound it, don't race the clock).
+    try testing.expect(rec.elapsed_ms < 60_000);
     // Default sort: dirs first, then natural name order.
     try testing.expectEqualStrings("zsub", rec.first_sorted[0..rec.first_sorted_len]);
     // The pending table emptied (job + snapshot reclaimed at dispatch).

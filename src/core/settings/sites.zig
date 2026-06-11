@@ -19,6 +19,15 @@ pub fn defaultPort(protocol: Protocol) u16 {
     };
 }
 
+/// Per-site accent color (browser path-bar strip + sidebar dot). A fixed
+/// palette of names, not RGB: the UI maps each to the matching semantic
+/// NSColor (docs/UX.md: zero hard-coded colors).
+pub const Accent = enum { none, blue, purple, red, orange, yellow, green, graphite };
+
+/// Deployment tag. `prod` arms the UI's destructive-op safeguards
+/// (hold-Cmd confirm sheets, striped warning strip in the browser).
+pub const Environment = enum { none, dev, staging, prod };
+
 pub const Site = struct {
     /// Stable id; referenced by queue persistence and UI state. Assigned
     /// once at creation, never reused.
@@ -34,6 +43,10 @@ pub const Site = struct {
     initial_local_path: []const u8 = "",
     /// Per-site TLS escape hatch; the UI makes this loud.
     insecure_skip_verify: bool = false,
+    /// Visual accent (path-bar strip, sidebar dot); .none = untinted.
+    accent: Accent = .none,
+    /// Deployment tag; .prod arms destructive-op safeguards in the UI.
+    environment: Environment = .none,
 
     pub fn effectivePort(site: Site) u16 {
         return if (site.port != 0) site.port else defaultPort(site.protocol);
@@ -110,6 +123,8 @@ const test_list: SiteList = .{
             .port = 2222,
             .account = "deploy",
             .initial_remote_path = "/var/www",
+            .accent = .red,
+            .environment = .prod,
         },
         .{
             .id = 2,

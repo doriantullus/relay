@@ -16,8 +16,24 @@
 //!    success reconciles through the bridge's automatic re-list.
 //!  - Cmd+Return / drags enqueue transfers to the other pane via the bridge.
 //!
+//! Phase 2 power features (all toggles exposed as pub methods for the
+//! menu/palette owner to bind):
+//!  - Synchronized browsing (Cmd+Shift+B; command "view.syncBrowsing"):
+//!    relative path changes mirror into the other pane; a missing mirrored
+//!    dir stops the link gracefully with a status hint.
+//!  - Directory comparison (Cmd+Shift+D; command "view.comparePanes"):
+//!    rows tint by cross-pane presence/size/mtime delta (semantic colors at
+//!    low alpha), computed off-main over both snapshots.
+//!  - Per-site accent strip + prod safeguards: a 2pt strip under the remote
+//!    path bar (striped warning for environment == .prod); prod deletes
+//!    need Cmd held in the confirm sheet whose default button is Cancel.
+//!  - Vim mode (pref "ui.vimMode", off by default; setVimMode): a keymap
+//!    layer in the table keyDown hook — see vim.zig for the state machine.
+//!
 //! Threading: everything here runs on the main thread; core results arrive
-//! through AppCore's listener dispatch (run-to-completion drains).
+//! through AppCore's listener dispatch (run-to-completion drains). The one
+//! exception is the compare diff, computed on a GCD global queue over two
+//! ref'd immutable snapshots and applied back via the main queue.
 //!
 //! Lifetime: listeners cannot unregister, so a BrowserController must only
 //! be destroyed after `AppCore.shutdown()` (or never — app lifetime).
@@ -27,10 +43,15 @@ const relay = @import("relay_core");
 const mac = @import("relay_mac");
 const bridge = @import("../bridge.zig");
 
+/// The vim-mode keymap layer (pure state machine; instances live on the
+/// panes). Kept a separate file, imported ONLY from here.
+pub const vim = @import("vim.zig");
+
 const objc = mac.objc;
 const c = objc.c;
 const foundation = mac.foundation;
 const runtime = mac.runtime;
+const dispatch = mac.dispatch;
 const table_source = mac.appkit.table_source;
 const split_view = mac.appkit.split_view;
 const panels = mac.appkit.panels;
@@ -42,6 +63,7 @@ const path_mod = relay.vfs.path;
 const snapshot_mod = relay.vfs.snapshot;
 const item_mod = relay.queue.item;
 const events_mod = relay.events;
+const sites_mod = relay.sites;
 
 const DirSnapshot = snapshot_mod.DirSnapshot;
 const Allocator = std.mem.Allocator;
@@ -129,6 +151,8 @@ pub const Overlay = struct {
     renames: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
     /// entry indexes optimistically removed (delete in flight).
     hidden: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// entry index -> staged mode (chmod in flight; inspector Apply).
+    modes: std.AutoHashMapUnmanaged(u32, u16) = .empty,
     /// Optimistic mkdir row (owned name); at most one in flight per pane.
     new_folder: ?[]u8 = null,
 
@@ -136,17 +160,20 @@ pub const Overlay = struct {
         o.clear(gpa);
         o.renames.deinit(gpa);
         o.hidden.deinit(gpa);
+        o.modes.deinit(gpa);
         o.* = undefined;
     }
 
     pub fn clear(o: *Overlay, gpa: Allocator) void {
         o.clearRenames(gpa);
         o.hidden.clearRetainingCapacity();
+        o.modes.clearRetainingCapacity();
         o.clearNewFolder(gpa);
     }
 
     pub fn isEmpty(o: *const Overlay) bool {
-        return o.renames.count() == 0 and o.hidden.count() == 0 and o.new_folder == null;
+        return o.renames.count() == 0 and o.hidden.count() == 0 and
+            o.modes.count() == 0 and o.new_folder == null;
     }
 
     pub fn setRename(o: *Overlay, gpa: Allocator, entry_index: u32, new_name: []const u8) error{OutOfMemory}!void {
@@ -195,10 +222,26 @@ pub const Overlay = struct {
         return entries[entry_index].name;
     }
 
+    /// Optimistic chmod (inspector Apply): stage the new mode so the
+    /// Permissions column shows it immediately at pending alpha.
+    pub fn setMode(o: *Overlay, gpa: Allocator, entry_index: u32, mode: u16) error{OutOfMemory}!void {
+        try o.modes.put(gpa, entry_index, mode);
+    }
+
+    pub fn clearModes(o: *Overlay) void {
+        o.modes.clearRetainingCapacity();
+    }
+
+    /// Permissions column value: the staged mode, else the listing's.
+    pub fn displayMode(o: *const Overlay, entries: []const vfs_mod.Entry, entry_index: u32) ?u16 {
+        if (o.modes.get(entry_index)) |mode| return mode;
+        return entries[entry_index].mode;
+    }
+
     /// Pending treatment (60% alpha): rows with an op in flight.
     pub fn isPendingRow(o: *const Overlay, slot: u32) bool {
         if (slot == virtual_new_folder_row) return true;
-        return o.renames.contains(slot);
+        return o.renames.contains(slot) or o.modes.contains(slot);
     }
 };
 
@@ -321,6 +364,37 @@ pub fn formatMtime(buf: []u8, mtime: ?i64) []const u8 {
     }) catch buf[0..0];
 }
 
+/// Settings → "Date format" (ui.zon date_format; mapped from prefs.zig in
+/// main.zig exactly like Density).
+pub const DateFormat = enum { iso, relative };
+
+/// Relative variant of the Modified column. Anything a week old or older —
+/// and clock skew into the future — falls back to the ISO rendering.
+pub fn formatMtimeRelative(buf: []u8, mtime: ?i64, now: i64) []const u8 {
+    const t = mtime orelse return "";
+    if (t < 0) return "";
+    const diff = now - t;
+    if (diff < 0) return formatMtime(buf, mtime); // future: clock skew
+    if (diff < std.time.s_per_min) return "just now";
+    if (diff < std.time.s_per_hour)
+        return std.fmt.bufPrint(buf, "{d} min ago", .{@divTrunc(diff, std.time.s_per_min)}) catch buf[0..0];
+    if (diff < std.time.s_per_day)
+        return std.fmt.bufPrint(buf, "{d} hr ago", .{@divTrunc(diff, std.time.s_per_hour)}) catch buf[0..0];
+    if (diff < 7 * std.time.s_per_day) {
+        const days = @divTrunc(diff, std.time.s_per_day);
+        if (days == 1) return "1 day ago";
+        return std.fmt.bufPrint(buf, "{d} days ago", .{days}) catch buf[0..0];
+    }
+    return formatMtime(buf, mtime);
+}
+
+pub fn formatMtimeAs(buf: []u8, mtime: ?i64, format: DateFormat, now: i64) []const u8 {
+    return switch (format) {
+        .iso => formatMtime(buf, mtime),
+        .relative => formatMtimeRelative(buf, mtime, now),
+    };
+}
+
 /// Permissions column: octal mode ("644", "755", "1777"), blank if unknown.
 pub fn formatMode(buf: []u8, mode: ?u16) []const u8 {
     const m = mode orelse return "";
@@ -337,7 +411,14 @@ pub const StatusModel = struct {
     item_count: usize = 0,
     sel_count: usize = 0,
     sel_bytes: u64 = 0,
+    /// Last protocol round-trip (remote panes only) — "latency honesty",
+    /// docs/UX.md status sketch ("… items · 12ms").
+    latency_ms: ?u64 = null,
+    /// Compare mode active: append the tint legend.
+    compare: bool = false,
 };
+
+pub const compare_legend = "Compare: blue = only here · yellow = differs";
 
 pub fn formatStatus(buf: []u8, m: StatusModel) []const u8 {
     if (m.hint) |hint| {
@@ -357,6 +438,7 @@ pub fn formatStatus(buf: []u8, m: StatusModel) []const u8 {
                 if (m.item_count == 1) "item" else "items",
             }) catch break :out;
         }
+        if (m.latency_ms) |ms| w.print(" · {d} ms", .{ms}) catch break :out;
         if (m.sel_count > 0) {
             var hb: [32]u8 = undefined;
             w.print(" · {s} selected ({s})", .{
@@ -364,6 +446,7 @@ pub fn formatStatus(buf: []u8, m: StatusModel) []const u8 {
                 humanBytes(&hb, m.sel_bytes),
             }) catch break :out;
         }
+        if (m.compare) w.print(" · {s}", .{compare_legend}) catch break :out;
     }
     return w.buffered();
 }
@@ -401,6 +484,152 @@ pub fn findEntryByName(entries: []const vfs_mod.Entry, name: []const u8) ?u32 {
         if (std.mem.eql(u8, entry.name, name)) return @intCast(i);
     }
     return null;
+}
+
+// ---------------------------------------------------------------------------
+// Synchronized browsing (pure core): mirror a relative path change.
+// ---------------------------------------------------------------------------
+
+/// Apply the relative change `src_old` → `src_new` to `dst_base`: strip the
+/// common prefix of the source paths, walk the remaining `src_old`
+/// components UP from `dst_base`, then descend the remaining `src_new`
+/// components. Null = the change cannot be mirrored (more ups than
+/// `dst_base` has components — the panes' trees diverged above the link
+/// point). All inputs are normalized absolute paths; the gpa-owned result
+/// is normalized by construction.
+pub fn syncTarget(
+    gpa: Allocator,
+    src_old: []const u8,
+    src_new: []const u8,
+    dst_base: []const u8,
+) error{OutOfMemory}!?[]u8 {
+    var old_parts: std.ArrayList([]const u8) = .empty;
+    defer old_parts.deinit(gpa);
+    var new_parts: std.ArrayList([]const u8) = .empty;
+    defer new_parts.deinit(gpa);
+    var dst_parts: std.ArrayList([]const u8) = .empty;
+    defer dst_parts.deinit(gpa);
+
+    var old_it = path_mod.components(src_old);
+    while (old_it.next()) |p| try old_parts.append(gpa, p);
+    var new_it = path_mod.components(src_new);
+    while (new_it.next()) |p| try new_parts.append(gpa, p);
+    var dst_it = path_mod.components(dst_base);
+    while (dst_it.next()) |p| try dst_parts.append(gpa, p);
+
+    var common: usize = 0;
+    while (common < old_parts.items.len and common < new_parts.items.len and
+        std.mem.eql(u8, old_parts.items[common], new_parts.items[common]))
+        common += 1;
+
+    const ups = old_parts.items.len - common;
+    if (ups > dst_parts.items.len) return null;
+    const keep = dst_parts.items.len - ups;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (dst_parts.items[0..keep]) |p| {
+        try out.append(gpa, '/');
+        try out.appendSlice(gpa, p);
+    }
+    for (new_parts.items[common..]) |p| {
+        try out.append(gpa, '/');
+        try out.appendSlice(gpa, p);
+    }
+    if (out.items.len == 0) try out.append(gpa, '/');
+    return try out.toOwnedSlice(gpa);
+}
+
+// ---------------------------------------------------------------------------
+// Directory comparison (pure core): name-keyed cross-pane diff.
+// ---------------------------------------------------------------------------
+
+/// Compare-mode row class. Tints (semantic colors at low alpha):
+/// .missing = the name has no counterpart in the other pane (systemBlue);
+/// .differs = size or mtime delta (systemYellow); .same = untinted.
+pub const RowTint = enum(u8) { same, missing, differs };
+
+/// mtime slack: FTP listings carry minute (sometimes 2-second) resolution,
+/// so exact equality across protocols would tint everything yellow.
+pub const compare_mtime_slack_s: i64 = 2;
+
+pub const CompareTints = struct {
+    /// Tint per snapshot ENTRY index (not visible row) for each pane.
+    a: []RowTint,
+    b: []RowTint,
+
+    pub fn deinit(t: *CompareTints, gpa: Allocator) void {
+        gpa.free(t.a);
+        gpa.free(t.b);
+        t.* = undefined;
+    }
+};
+
+fn compareEntryPair(x: *const vfs_mod.Entry, y: *const vfs_mod.Entry) RowTint {
+    const x_dir = x.kind == .dir;
+    const y_dir = y.kind == .dir;
+    if (x_dir != y_dir) return .differs;
+    if (x_dir) return .same; // directories: presence only
+    if (x.size != null and y.size != null and x.size.? != y.size.?) return .differs;
+    if (x.mtime != null and y.mtime != null) {
+        const delta = x.mtime.? - y.mtime.?;
+        if (delta > compare_mtime_slack_s or delta < -compare_mtime_slack_s) return .differs;
+    }
+    return .same;
+}
+
+/// Name-keyed diff over two snapshots' entries. Pure and allocator-clean —
+/// the off-main compare job calls this, tests call it directly.
+pub fn compareSnapshots(
+    gpa: Allocator,
+    a: []const vfs_mod.Entry,
+    b: []const vfs_mod.Entry,
+) error{OutOfMemory}!CompareTints {
+    var by_name: std.StringHashMapUnmanaged(u32) = .empty;
+    defer by_name.deinit(gpa);
+    try by_name.ensureTotalCapacity(gpa, @intCast(b.len));
+    for (b, 0..) |*entry, i| by_name.putAssumeCapacity(entry.name, @intCast(i));
+
+    const a_t = try gpa.alloc(RowTint, a.len);
+    errdefer gpa.free(a_t);
+    const b_t = try gpa.alloc(RowTint, b.len);
+    @memset(b_t, .missing);
+    for (a, 0..) |*entry, i| {
+        if (by_name.get(entry.name)) |j| {
+            const class = compareEntryPair(entry, &b[j]);
+            a_t[i] = class;
+            b_t[j] = class;
+        } else {
+            a_t[i] = .missing;
+        }
+    }
+    return .{ .a = a_t, .b = b_t };
+}
+
+// ---------------------------------------------------------------------------
+// Prod safeguards + per-site accent (pure parts).
+// ---------------------------------------------------------------------------
+
+/// Production confirm-sheet decision: the destructive button counts ONLY
+/// while Cmd is held (the sheet's default button is Cancel).
+pub fn prodConfirmAllowed(confirm_clicked: bool, cmd_held: bool) bool {
+    return confirm_clicked and cmd_held;
+}
+
+/// Site accent → semantic color. This is the small pub hook sites.zig
+/// needs for the sidebar dot (and what the path-bar strip draws with);
+/// null = untinted. Semantic NSColors only, per docs/UX.md.
+pub fn accentUiColor(accent: sites_mod.Accent) ?foundation.Color {
+    return switch (accent) {
+        .none => null,
+        .blue => .system_blue,
+        .purple => .system_purple,
+        .red => .system_red,
+        .orange => .system_orange,
+        .yellow => .system_yellow,
+        .green => .system_green,
+        .graphite => .system_gray,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -512,10 +741,113 @@ const chrome = struct {
         if (row_view) |rv| objc.Object.fromId(rv).msgSend(void, "setAlphaValue:", .{alpha});
     }
 
+    /// Compare-mode treatment: a low-alpha semantic background on the
+    /// materialized row view (same on-screen-only caveat as setRowAlpha).
+    fn setRowTint(table_id: c.id, row: usize, tint: RowTint) void {
+        const row_view = objc.Object.fromId(table_id).msgSend(
+            c.id,
+            "rowViewAtRow:makeIfNecessary:",
+            .{ @as(foundation.NSInteger, @intCast(row)), false },
+        ) orelse return;
+        const color = switch (tint) {
+            .same => foundation.class("NSColor").msgSend(objc.Object, "clearColor", .{}),
+            .missing => foundation.Color.system_blue.object()
+                .msgSend(objc.Object, "colorWithAlphaComponent:", .{@as(f64, 0.15)}),
+            .differs => foundation.Color.system_yellow.object()
+                .msgSend(objc.Object, "colorWithAlphaComponent:", .{@as(f64, 0.18)}),
+        };
+        objc.Object.fromId(row_view).msgSend(void, "setBackgroundColor:", .{color});
+    }
+
+    fn setTextColor(view: objc.Object, color: objc.Object) void {
+        view.msgSend(void, "setTextColor:", .{color});
+    }
+
+    fn setToolTip(view: objc.Object, tip: []const u8) void {
+        view.msgSend(void, "setToolTip:", .{foundation.nsString(tip)});
+    }
+
+    fn setNeedsDisplay(view: objc.Object) void {
+        view.msgSend(void, "setNeedsDisplay:", .{true});
+    }
+
+    /// Height of the table's scrolled-in viewport (vim half-page motions).
+    fn visibleHeight(table_id: c.id) f64 {
+        const r = objc.Object.fromId(table_id).msgSend(foundation.NSRect, "visibleRect", .{});
+        return r.size.height;
+    }
+
+    fn boundsOf(view: objc.Object) foundation.NSRect {
+        return view.msgSend(foundation.NSRect, "bounds", .{});
+    }
+
+    fn fillRect(color: objc.Object, r: foundation.NSRect) void {
+        color.msgSend(void, "setFill", .{});
+        foundation.class("NSBezierPath")
+            .msgSend(objc.Object, "bezierPathWithRect:", .{r})
+            .msgSend(void, "fill", .{});
+    }
+
+    /// Cmd held RIGHT NOW (+[NSEvent modifierFlags]) — the prod confirm
+    /// sheet consults this when its destructive button is clicked.
+    fn commandKeyHeld() bool {
+        const flags = foundation.class("NSEvent").msgSend(NSUInteger, "modifierFlags", .{});
+        return flags & table_source.flag_command != 0;
+    }
+
+    /// vim 'y': the selection's full path onto the general pasteboard.
+    fn copyToPasteboard(text_value: []const u8) void {
+        const pb = foundation.class("NSPasteboard").msgSend(objc.Object, "generalPasteboard", .{});
+        _ = pb.msgSend(foundation.NSInteger, "clearContents", .{});
+        _ = pb.msgSend(foundation.BOOL, "setString:forType:", .{
+            foundation.nsString(text_value),
+            foundation.nsString("public.utf8-plain-text"), // NSPasteboardTypeString
+        });
+    }
+
     fn release(obj: objc.Object) void {
         obj.msgSend(void, "release", .{});
     }
 };
+
+// ---------------------------------------------------------------------------
+// Per-site accent strip (2pt under the path bar; runtime view class, state =
+// the pane): solid accent tint normally, striped warning treatment when the
+// site's environment tag is prod. Semantic colors only.
+// ---------------------------------------------------------------------------
+var g_strip_class: ?runtime.DefinedClass = null;
+
+fn stripClass() runtime.DefinedClass {
+    if (g_strip_class) |dc| return dc;
+    const dc = runtime.defineClass("RelayBrowserAccentStrip", "NSView", &.{}, .{
+        .{ "drawRect:", impStripDraw },
+    }) catch @panic("browser: failed to define RelayBrowserAccentStrip");
+    g_strip_class = dc;
+    return dc;
+}
+
+fn impStripDraw(target: c.id, _: c.SEL, _: foundation.NSRect) callconv(.c) void {
+    const pool = foundation.AutoreleasePool.init();
+    defer pool.deinit();
+    const pane = stripClass().state(BrowserPane, target);
+    const bounds = chrome.boundsOf(objc.Object.fromId(target));
+    if (pane.env_prod) {
+        // Caution-tape stripes in semantic colors: systemYellow/systemRed.
+        const seg: f64 = 8;
+        var x: f64 = 0;
+        var odd = false;
+        while (x < bounds.size.width) : (x += seg) {
+            const color: foundation.Color = if (odd) .system_red else .system_yellow;
+            chrome.fillRect(
+                color.object(),
+                foundation.rect(x, 0, @min(seg, bounds.size.width - x), bounds.size.height),
+            );
+            odd = !odd;
+        }
+        return;
+    }
+    if (accentUiColor(pane.accent)) |color| chrome.fillRect(color.object(), bounds);
+}
 
 // Virtual key codes table_source does not export.
 const key_left_arrow: u16 = 123;
@@ -532,6 +864,7 @@ fn fieldTargetClass() runtime.DefinedClass {
         .{ "relayBrowserPathSubmit:", impPathSubmit },
         .{ "relayBrowserFilterSubmit:", impFilterSubmit },
         .{ "controlTextDidChange:", impControlTextChanged },
+        .{ "control:textView:doCommandBySelector:", impControlDoCommand },
     }) catch @panic("browser: failed to define RelayBrowserFieldTarget");
     g_field_target_class = dc;
     return dc;
@@ -556,16 +889,34 @@ fn impControlTextChanged(target: c.id, _: c.SEL, note: c.id) callconv(.c) void {
     if (chrome.notificationObject(note) == pane.filter_field.value) pane.onFilterFieldChanged();
 }
 
+/// Esc WHILE TYPING in the Cmd+F filter field clears/dismisses it (the
+/// field editor routes Esc as cancelOperation: through this delegate hook;
+/// the table-focused Esc path lives in dsKeyDown). Selectors are uniqued
+/// by the runtime, so pointer comparison is exact.
+fn impControlDoCommand(target: c.id, _: c.SEL, control: c.id, _: c.id, command: c.SEL) callconv(.c) foundation.BOOL {
+    const pool = foundation.AutoreleasePool.init();
+    defer pool.deinit();
+    const pane = fieldTargetClass().state(BrowserPane, target);
+    if (control != pane.filter_field.value) return foundation.NO;
+    if (command != objc.sel("cancelOperation:").value) return foundation.NO;
+    pane.clearFilter();
+    return foundation.YES;
+}
+
 // ---------------------------------------------------------------------------
 // Columns (docs/UX.md): Name/Size/Modified, + Permissions for remote panes.
+// Both panes are built with the full set; the Permissions column is HIDDEN
+// while a pane plays the local role (either pane can host either role —
+// active-pane connects swap a local pane to remote and back).
 // ---------------------------------------------------------------------------
+const mode_column_id: [:0]const u8 = "mode";
 const local_columns = [_]table_source.ColumnSpec{
     .{ .id = "name", .title = "Name", .width = 240, .min_width = 120, .custom_draw = true, .sortable = true },
     .{ .id = "size", .title = "Size", .width = 80, .min_width = 60, .alignment = .right, .monospaced_digits = true, .sortable = true },
     .{ .id = "modified", .title = "Modified", .width = 130, .min_width = 110, .monospaced_digits = true, .sortable = true },
 };
 const remote_columns = local_columns ++ [_]table_source.ColumnSpec{
-    .{ .id = "mode", .title = "Permissions", .width = 84, .min_width = 60, .monospaced_digits = true },
+    .{ .id = mode_column_id, .title = "Permissions", .width = 84, .min_width = 60, .monospaced_digits = true },
 };
 
 // Pane chrome geometry (fixed-height bars; the table flexes).
@@ -576,6 +927,10 @@ const field_h: f64 = 21;
 const status_h: f64 = 18;
 const pad: f64 = 6;
 const filter_w: f64 = 150;
+/// Width reserved for the "⇄" sync-browsing indicator in the path bar.
+const sync_w: f64 = 22;
+/// Per-site accent strip height (under the path bar).
+const strip_h: f64 = 2;
 
 pub const PaneRole = enum { local, remote };
 
@@ -592,7 +947,11 @@ pub const NavMode = enum {
 pub const BrowserPane = struct {
     controller: *BrowserController,
     gpa: Allocator,
+    /// CURRENT role — either pane can host either role (active-pane
+    /// connects): a local pane switches to .remote when a site binds to
+    /// it and restores on disconnect. `home_role` is the constructed one.
     role: PaneRole,
+    home_role: PaneRole,
     index: u32,
     /// item_mod.local_site_id (0) for the local pane; the connected site id
     /// for a bound remote pane; null while the remote pane is unbound.
@@ -604,6 +963,11 @@ pub const BrowserPane = struct {
     filter_field: objc.Object = undefined,
     status_label: objc.Object = undefined,
     field_target: objc.Object = undefined,
+    /// "⇄" path-bar indicator, visible while synchronized browsing links
+    /// the panes.
+    sync_label: objc.Object = undefined,
+    /// 2pt per-site accent strip under the path bar (striped when prod).
+    strip_view: objc.Object = undefined,
     table: *table_source.TableView = undefined,
 
     // Listing state.
@@ -627,9 +991,34 @@ pub const BrowserPane = struct {
     sel_bytes: u64 = 0,
     /// Last site status for the bound site (the connection chip).
     chip: ?events_mod.SiteStatus = null,
+    /// Last protocol round-trip (latency honesty; rendered remote-only).
+    last_latency_ms: ?u64 = null,
+    /// Local path remembered when a local-role pane switches to remote;
+    /// the restore-on-disconnect navigates back here (owned).
+    saved_local_path: ?[]u8 = null,
 
     // Pending-alpha bookkeeping (avoid walking rows when nothing pending).
     had_pending_alpha: bool = false,
+
+    // Per-site style (applied on remote bind from the Site record).
+    accent: sites_mod.Accent = .none,
+    env_prod: bool = false,
+
+    // Compare mode: tint per snapshot ENTRY index (gpa-owned; cleared on
+    // snapshot swap, recomputed off-main), plus clear-walk bookkeeping.
+    compare_tints: []RowTint = @constCast(&[_]RowTint{}),
+    had_compare_tint: bool = false,
+
+    /// The in-flight listing was issued by synchronized browsing: a failure
+    /// stops the link gracefully (status hint, no error sheet).
+    mirror_pending: bool = false,
+
+    // Vim mode (controller.vim_mode gates feeding these).
+    vim_state: vim.Keymap = .{},
+    /// 'v' visual-range anchor (visible-row index).
+    vim_anchor: ?usize = null,
+    /// Cursor row vim motions move; falls back to the table's selection.
+    vim_cursor: ?usize = null,
 
     // Sheet scratch (one sheet at a time per window). Op targets are
     // captured by NAME (gpa-owned) plus the snapshot generation: bridge
@@ -662,7 +1051,8 @@ pub const BrowserPane = struct {
             return;
         };
         const gpa = pane.gpa;
-        const core = pane.controller.core;
+        const ctrl = pane.controller;
+        const core = ctrl.core;
         const norm = path_mod.normalize(gpa, raw) catch {
             panels.presentErrorSheet(pane.controller.win, "Invalid path", raw);
             return;
@@ -672,6 +1062,14 @@ pub const BrowserPane = struct {
         pane.loading_path = norm;
         pane.record_history = mode == .push;
         pane.listing_count = 0;
+        // Sync browsing: the path this pane is leaving, captured BEFORE the
+        // request (history updates only on completion). A fresh navigation
+        // also supersedes any mirror attribution on this pane.
+        pane.mirror_pending = false;
+        const sync_old: ?[]const u8 = if (ctrl.sync_browsing and !ctrl.mirroring)
+            pane.history.current()
+        else
+            null;
         const req = core.listPath(pane.token(), site, norm) catch |err| {
             gpa.free(norm);
             pane.loading_path = null;
@@ -683,6 +1081,7 @@ pub const BrowserPane = struct {
         pane.pending_request = req;
         pane.updatePathBar();
         pane.updateStatus();
+        if (sync_old) |old| ctrl.mirrorNavigation(pane, old, norm);
     }
 
     pub fn refresh(pane: *BrowserPane) void {
@@ -697,13 +1096,35 @@ pub const BrowserPane = struct {
     }
 
     pub fn goBack(pane: *BrowserPane) void {
+        const old = pane.dupeCurrentForMirror();
+        defer if (old) |o| pane.gpa.free(o);
         const target = pane.history.goBack(pane.gpa) orelse return;
         pane.navigateTo(target, .replace);
+        pane.mirrorHistoryNav(old);
     }
 
     pub fn goForward(pane: *BrowserPane) void {
+        const old = pane.dupeCurrentForMirror();
+        defer if (old) |o| pane.gpa.free(o);
         const target = pane.history.goForward(pane.gpa) orelse return;
         pane.navigateTo(target, .replace);
+        pane.mirrorHistoryNav(old);
+    }
+
+    /// Back/forward mutate history BEFORE navigateTo, so the in-navigate
+    /// mirror capture sees old == new and skips; these two helpers re-run
+    /// the mirror with the pre-step path.
+    fn dupeCurrentForMirror(pane: *BrowserPane) ?[]u8 {
+        const ctrl = pane.controller;
+        if (!ctrl.sync_browsing or ctrl.mirroring) return null;
+        const cur = pane.history.current() orelse return null;
+        return pane.gpa.dupe(u8, cur) catch null;
+    }
+
+    fn mirrorHistoryNav(pane: *BrowserPane, old: ?[]const u8) void {
+        const o = old orelse return;
+        const new_path = pane.loading_path orelse return; // issue failed: skip
+        pane.controller.mirrorNavigation(pane, o, new_path);
     }
 
     pub fn openSelection(pane: *BrowserPane) void {
@@ -735,6 +1156,7 @@ pub const BrowserPane = struct {
         const pending = pane.pending_request orelse return;
         if (p.request_id != pending) return;
         pane.listing_count = p.entries_so_far;
+        pane.last_latency_ms = p.elapsed_ms;
         // Streaming: adopt the coalesced partial snapshot so the first
         // rows show immediately (docs/UX.md). pending_request stays set —
         // the status bar keeps counting up until listing_done.
@@ -747,9 +1169,15 @@ pub const BrowserPane = struct {
 
     fn handleListingDone(pane: *BrowserPane, d: bridge.ListingDone) void {
         const expected = if (pane.pending_request) |req| req == d.request_id else false;
+        // Latency honesty: every completed protocol call on this pane's
+        // token (including the bridge's post-op re-lists) is a real
+        // round trip.
+        pane.last_latency_ms = d.elapsed_ms;
 
         if (d.failure) |failure| {
             if (!expected) return; // background re-list failed; stay on truth
+            const was_mirror = pane.mirror_pending;
+            pane.mirror_pending = false;
             pane.pending_request = null;
             if (pane.loading_path) |lp| {
                 pane.gpa.free(lp);
@@ -757,21 +1185,38 @@ pub const BrowserPane = struct {
             }
             pane.updatePathBar();
             pane.updateStatus();
-            if (failure.class != .cancel)
-                panels.presentErrorSheet(pane.controller.win, "Couldn't open folder", failure.message);
+            if (failure.class == .cancel) return;
+            if (was_mirror) {
+                // Sync browsing: the mirrored dir is missing here — stop
+                // the link gracefully (status hint, no error sheet).
+                pane.controller.stopSyncBrowsing("Sync stopped — folder missing in this pane");
+                return;
+            }
+            panels.presentErrorSheet(pane.controller.win, "Couldn't open folder", failure.message);
             return;
         }
 
         const snap = d.snapshot.?;
         if (expected) {
+            pane.mirror_pending = false;
             pane.pending_request = null;
             if (pane.loading_path) |lp| {
                 pane.gpa.free(lp);
                 pane.loading_path = null;
             }
             pane.adoptSnapshot(snap, d.sort_index);
-            if (pane.record_history or pane.history.cur == null)
+            if (pane.record_history or pane.history.cur == null) {
                 pane.history.visit(pane.gpa, snap.path) catch {};
+                // Palette frecency feed (M3): user navigations only — the
+                // same condition that records browser history.
+                if (pane.controller.visit_hook.notify) |notify| {
+                    notify(
+                        pane.controller.visit_hook.ctx,
+                        pane.site orelse item_mod.local_site_id,
+                        snap.path,
+                    );
+                }
+            }
             pane.updatePathBar();
             return;
         }
@@ -796,11 +1241,17 @@ pub const BrowserPane = struct {
         if (!std.meta.eql(pane.sort_opts, DirSnapshot.SortOptions{}))
             held.sortIndexInPlace(pane.sort_index, pane.sort_opts);
         pane.overlay.clear(pane.gpa);
+        pane.clearCompareTints(); // entry indexes remapped; recompute below
+        pane.vim_cursor = null;
+        pane.vim_anchor = null;
         pane.rebuildVisible();
         pane.table.reloadData();
         pane.applyPendingAlpha();
+        pane.applyCompareTints();
         pane.updateStatus();
         pane.controller.notifySelection(pane); // slots remapped under the selection
+        // Compare mode re-applies on snapshot adoption (off-main diff).
+        pane.controller.scheduleCompare();
     }
 
     fn rebuildVisible(pane: *BrowserPane) void {
@@ -815,6 +1266,7 @@ pub const BrowserPane = struct {
         pane.rebuildVisible();
         pane.table.reloadData();
         pane.applyPendingAlpha();
+        pane.applyCompareTints();
         pane.updateStatus();
     }
 
@@ -827,6 +1279,32 @@ pub const BrowserPane = struct {
             chrome.setRowAlpha(table_id, row, alpha);
         }
         pane.had_pending_alpha = has_pending;
+    }
+
+    // ------------------------------------------------------------------ //
+    // Compare mode (per-pane application; the diff lives on the controller)
+
+    fn clearCompareTints(pane: *BrowserPane) void {
+        pane.gpa.free(pane.compare_tints);
+        pane.compare_tints = @constCast(&[_]RowTint{});
+    }
+
+    /// Paint the row tints over the materialized row views (same on-screen
+    /// caveat as the pending alpha; rows scrolling in draw untinted until
+    /// the next application).
+    fn applyCompareTints(pane: *BrowserPane) void {
+        const active = pane.controller.compare_mode and pane.compare_tints.len > 0;
+        if (!active and !pane.had_compare_tint) return;
+        const table_id = pane.table.tableHandle();
+        for (pane.visible.items, 0..) |slot, row| {
+            const tint: RowTint = if (active and slot != virtual_new_folder_row and
+                slot < pane.compare_tints.len)
+                pane.compare_tints[slot]
+            else
+                .same;
+            chrome.setRowTint(table_id, row, tint);
+        }
+        pane.had_compare_tint = active;
     }
 
     // ------------------------------------------------------------------ //
@@ -911,8 +1389,25 @@ pub const BrowserPane = struct {
             model.item_count = pane.visible.items.len;
             model.sel_count = pane.sel_count;
             model.sel_bytes = pane.sel_bytes;
+            // Latency honesty: remote panes only (docs/UX.md).
+            if (pane.role == .remote) model.latency_ms = pane.last_latency_ms;
+            // Compare-mode legend rides the status bar while active.
+            model.compare = pane.controller.compare_mode;
         }
         chrome.setText(pane.status_label, formatStatus(&buf, model));
+    }
+
+    /// Sync-browsing link indicator in the path bar (both panes).
+    fn updateSyncIndicator(pane: *BrowserPane) void {
+        chrome.setHidden(pane.sync_label, !pane.controller.sync_browsing);
+    }
+
+    /// Show/hide + repaint the per-site accent strip (remote role only).
+    fn updateAccentStrip(pane: *BrowserPane) void {
+        const visible = pane.role == .remote and pane.site != null and
+            (pane.accent != .none or pane.env_prod);
+        chrome.setHidden(pane.strip_view, !visible);
+        chrome.setNeedsDisplay(pane.strip_view);
     }
 
     // ------------------------------------------------------------------ //
@@ -990,6 +1485,12 @@ pub const BrowserPane = struct {
         }
         if (pane.op_names.items.len == 0) return;
         pane.op_generation = snap.generation;
+        // Settings → "Ask before deleting" off: skip the sheet entirely —
+        // EXCEPT on prod-tagged sites, where the safeguard is not skippable.
+        if (!pane.controller.confirm_delete and !pane.env_prod) {
+            onDeleteConfirmed(pane, true);
+            return;
+        }
         var msg_buf: [160]u8 = undefined;
         const msg: []const u8 = if (pane.op_names.items.len == 1)
             std.fmt.bufPrint(&msg_buf, "Delete “{s}”?", .{
@@ -997,6 +1498,18 @@ pub const BrowserPane = struct {
             }) catch "Delete 1 item?"
         else
             std.fmt.bufPrint(&msg_buf, "Delete {d} items?", .{pane.op_names.items.len}) catch "Delete items?";
+        if (pane.env_prod) {
+            // Prod safeguard: the DEFAULT button is Cancel, and Delete only
+            // counts while Cmd is held (checked at completion).
+            panels.beginAlertSheet(pane.controller.win, .{
+                .style = .critical,
+                .message = msg,
+                .informative = "Production server — hold ⌘ and choose Delete to confirm. This cannot be undone.",
+                .buttons = &.{ "Cancel", "Delete" },
+                .destructive_button = 1,
+            }, pane, onProdDeleteSheet);
+            return;
+        }
         panels.confirmSheet(
             pane.controller.win,
             msg,
@@ -1006,6 +1519,14 @@ pub const BrowserPane = struct {
             pane,
             onDeleteConfirmed,
         );
+    }
+
+    fn onProdDeleteSheet(pane: *BrowserPane, result: panels.AlertResult) void {
+        const delete_clicked = result.button == 1;
+        const allowed = prodConfirmAllowed(delete_clicked, chrome.commandKeyHeld());
+        if (delete_clicked and !allowed)
+            chrome.setText(pane.status_label, "Hold ⌘ to confirm destructive actions on production");
+        onDeleteConfirmed(pane, allowed);
     }
 
     fn clearOpNames(pane: *BrowserPane) void {
@@ -1100,7 +1621,7 @@ pub const BrowserPane = struct {
             .rename => pane.overlay.clearRenames(gpa),
             .delete => pane.overlay.unhideAll(),
             .mkdir => pane.overlay.clearNewFolder(gpa),
-            .chmod => {},
+            .chmod => pane.overlay.clearModes(), // rollback the staged modes
         }
         pane.redraw();
         const title: []const u8 = switch (d.op) {
@@ -1111,6 +1632,19 @@ pub const BrowserPane = struct {
         };
         const detail: []const u8 = if (d.failure) |f| f.message else "";
         panels.presentErrorSheet(pane.controller.win, title, detail);
+    }
+
+    /// Optimistic chmod (inspector Apply dispatched core.chmodPath): stage
+    /// the mode override so the Permissions column shows it immediately at
+    /// pending alpha. Rolled back on op_done failure, reconciled by the
+    /// bridge's post-success re-list (adoptSnapshot clears the overlay).
+    fn stageChmodOverlay(pane: *BrowserPane, path: []const u8, mode: u16) void {
+        const snap = pane.snapshot orelse return;
+        const parent = path_mod.parent(path) orelse "/";
+        if (!std.mem.eql(u8, parent, snap.path)) return;
+        const slot = findEntryByName(snap.entries, std.fs.path.basename(path)) orelse return;
+        pane.overlay.setMode(pane.gpa, slot, mode) catch return;
+        pane.redraw();
     }
 
     // ------------------------------------------------------------------ //
@@ -1219,6 +1753,152 @@ pub const BrowserPane = struct {
     }
 
     // ------------------------------------------------------------------ //
+    // Vim mode (pref "ui.vimMode"): the keymap layer over the keyDown hook.
+    // The state machine lives in vim.zig; this is the executor.
+
+    fn vimHandle(pane: *BrowserPane, ev: table_source.KeyEvent) bool {
+        var key: vim.Key = undefined;
+        if (ev.key_code == table_source.key_escape) {
+            key = .{ .escape = true };
+        } else if (ev.key_code == table_source.key_return or
+            ev.key_code == table_source.key_keypad_enter)
+        {
+            key = .{ .enter = true };
+        } else if (ev.chars.len == 1 and ev.chars[0] >= 0x20 and ev.chars[0] != 0x7f) {
+            key = .{
+                .char = std.ascii.toLower(ev.chars[0]),
+                .shift = ev.shift or std.ascii.isUpper(ev.chars[0]),
+                .control = ev.control,
+            };
+        } else if (ev.control and ev.chars.len == 1 and ev.chars[0] >= 1 and ev.chars[0] <= 26) {
+            // Control characters (Ctrl+D arrives as 0x04) decode to letters.
+            key = .{ .char = ev.chars[0] - 1 + 'a', .control = true };
+        } else return false;
+
+        switch (pane.vim_state.feed(key)) {
+            .none => {
+                if (key.escape) {
+                    if (pane.vim_anchor != null) {
+                        pane.vim_anchor = null; // leave "visual" mode
+                        return true;
+                    }
+                    return false; // default Esc path (filter clear)
+                }
+                // Unbound printables are swallowed: type-to-select stays
+                // disabled while the layer is on. Control chords pass.
+                return key.char != 0 and !key.control;
+            },
+            .consumed => {},
+            .move_down => pane.vimMoveBy(1),
+            .move_up => pane.vimMoveBy(-1),
+            .parent => pane.goUp(),
+            .open => pane.openSelection(),
+            .top => pane.vimSelect(0),
+            .bottom => if (pane.visible.items.len > 0) pane.vimSelect(pane.visible.items.len - 1),
+            .half_page_down => pane.vimMoveBy(pane.vimHalfPage()),
+            .half_page_up => pane.vimMoveBy(-pane.vimHalfPage()),
+            .focus_filter => pane.showFilterField(),
+            .next_match => pane.vimCycleMatch(1),
+            .prev_match => pane.vimCycleMatch(-1),
+            .toggle_select => pane.vimToggleSelect(),
+            .range_anchor => pane.vim_anchor = if (pane.vim_anchor == null) pane.vimCursor() else null,
+            .delete => pane.deleteSelection(),
+            .yank => pane.vimYankPath(),
+            .rename => pane.renameSelection(),
+        }
+        return true;
+    }
+
+    /// The row vim motions move from: the tracked cursor when still valid,
+    /// else the table's own selection.
+    fn vimCursor(pane: *BrowserPane) usize {
+        if (pane.vim_cursor) |cur| {
+            if (cur < pane.visible.items.len) return cur;
+        }
+        return pane.table.selectedRow() orelse 0;
+    }
+
+    fn vimMoveBy(pane: *BrowserPane, delta: isize) void {
+        if (pane.visible.items.len == 0) return;
+        const last: isize = @intCast(pane.visible.items.len - 1);
+        const cur: isize = @intCast(pane.vimCursor());
+        pane.vimSelect(@intCast(std.math.clamp(cur + delta, 0, last)));
+    }
+
+    /// Move the cursor; with a 'v' anchor the selection extends as a range.
+    fn vimSelect(pane: *BrowserPane, row: usize) void {
+        if (row >= pane.visible.items.len) return;
+        pane.vim_cursor = row;
+        if (pane.vim_anchor) |anchor_raw| {
+            const anchor = @min(anchor_raw, pane.visible.items.len - 1);
+            const lo = @min(anchor, row);
+            const hi = @max(anchor, row);
+            if (pane.gpa.alloc(usize, hi - lo + 1)) |rows| {
+                defer pane.gpa.free(rows);
+                for (rows, 0..) |*r, i| r.* = lo + i;
+                pane.table.setSelectedRows(rows);
+            } else |_| {
+                pane.table.setSelectedRows(&.{row});
+            }
+        } else {
+            pane.table.setSelectedRows(&.{row});
+        }
+        pane.table.scrollRowToVisible(row);
+    }
+
+    /// Ctrl+d/u step: half the scrolled-in viewport, in rows.
+    fn vimHalfPage(pane: *BrowserPane) isize {
+        const h = chrome.visibleHeight(pane.table.tableHandle());
+        const rh = pane.controller.density.rowHeight();
+        if (h <= 0 or rh <= 0) return 10; // not laid out (headless): fallback
+        const rows: isize = @intFromFloat(h / rh);
+        return @max(1, @divTrunc(rows, 2));
+    }
+
+    /// n/N: cycle through the live-filter matches (the visible rows ARE
+    /// the match set) with wraparound. No filter, no cycling.
+    fn vimCycleMatch(pane: *BrowserPane, dir: isize) void {
+        if (pane.filter_buf.items.len == 0) return;
+        const n: isize = @intCast(pane.visible.items.len);
+        if (n == 0) return;
+        const cur: isize = @intCast(pane.vimCursor());
+        pane.vimSelect(@intCast(@mod(cur + dir, n)));
+    }
+
+    /// x: toggle the cursor row's membership in the selection.
+    fn vimToggleSelect(pane: *BrowserPane) void {
+        if (pane.visible.items.len == 0) return;
+        const row = pane.vimCursor();
+        var rows: std.ArrayList(usize) = .empty;
+        defer rows.deinit(pane.gpa);
+        var had = false;
+        for (pane.table.selectedRows()) |r| {
+            if (r == row) {
+                had = true;
+                continue;
+            }
+            rows.append(pane.gpa, r) catch return;
+        }
+        if (!had) rows.append(pane.gpa, row) catch return;
+        pane.table.setSelectedRows(rows.items);
+        pane.vim_cursor = row;
+    }
+
+    /// y: full path of the selected entry onto the clipboard.
+    fn vimYankPath(pane: *BrowserPane) void {
+        const snap = pane.snapshot orelse return;
+        const row = pane.table.selectedRow() orelse pane.vimCursor();
+        if (row >= pane.visible.items.len) return;
+        const slot = pane.visible.items[row];
+        if (slot == virtual_new_folder_row or slot >= snap.entries.len) return;
+        const name = pane.overlay.displayName(snap.entries, slot);
+        const full = path_mod.join(pane.gpa, snap.path, name) catch return;
+        defer pane.gpa.free(full);
+        chrome.copyToPasteboard(full);
+        chrome.setText(pane.status_label, "Path copied");
+    }
+
+    // ------------------------------------------------------------------ //
     // table_source.DataSource vtable
 
     fn dsRowCount(ctx: *anyopaque) usize {
@@ -1243,8 +1923,8 @@ pub const BrowserPane = struct {
         return switch (col) {
             0 => pane.overlay.displayName(snap.entries, slot),
             1 => formatSize(buf, entry.kind == .dir, entry.size),
-            2 => formatMtime(buf, entry.mtime),
-            3 => formatMode(buf, entry.mode),
+            2 => formatMtimeAs(buf, entry.mtime, pane.controller.date_format, nowEpochSeconds(pane.controller.core.io)),
+            3 => formatMode(buf, pane.overlay.displayMode(snap.entries, slot)),
             else => "",
         };
     }
@@ -1379,6 +2059,14 @@ pub const BrowserPane = struct {
                     pane.newFolderSheet();
                     return true;
                 },
+                'b' => if (ev.shift) {
+                    ctrl.toggleSyncBrowsing(); // "view.syncBrowsing"
+                    return true;
+                },
+                'd' => if (ev.shift) {
+                    ctrl.toggleComparePanes(); // "view.comparePanes"
+                    return true;
+                },
                 '.', '>' => {
                     if (ev.shift or ch == '>') pane.toggleHidden() else pane.cancelActiveListing();
                     return true;
@@ -1386,6 +2074,24 @@ pub const BrowserPane = struct {
                 else => {},
             }
             return false;
+        }
+
+        // Quick Look (M3): plain Space, Finder-style. Checked BEFORE the
+        // vim layer (which would swallow the printable) and before
+        // type-select. Falls through when no hook is bound.
+        if (!ev.command and !ev.control and !ev.option and
+            ev.key_code == table_source.key_space)
+        {
+            if (ctrl.space_hook.handle) |handle| {
+                if (handle(ctrl.space_hook.ctx, pane)) return true;
+            }
+        }
+
+        // Vim layer (pref "ui.vimMode"): plain keys + Ctrl chords, never
+        // Cmd/Opt. Handles Return/Esc itself; swallows printables so
+        // type-to-select stays disabled while on.
+        if (ctrl.vim_mode and !ev.command and !ev.option) {
+            if (pane.vimHandle(ev)) return true;
         }
 
         if (!ev.command and !ev.control and !ev.option) {
@@ -1407,6 +2113,17 @@ pub const BrowserPane = struct {
                 return pane.typeSelect(ev.chars);
         }
         return false;
+    }
+
+    /// Right-click menu (M3): focus follows the click (menu commands act
+    /// on the focused pane), then main.zig's hook serves the shared file
+    /// context menu.
+    fn dsContextMenu(ctx: *anyopaque, row: ?usize) ?c.id {
+        const pane: *BrowserPane = @ptrCast(@alignCast(ctx));
+        const ctrl = pane.controller;
+        ctrl.focusPane(pane.index);
+        const provide = ctrl.context_menu_hook.provide orelse return null;
+        return provide(ctrl.context_menu_hook.ctx, pane, row);
     }
 
     // ------------------------------------------------------------------ //
@@ -1460,9 +2177,39 @@ pub const BrowserController = struct {
     /// last interaction).
     focused: u32 = 0,
     density: table_source.Density = .compact,
+    /// Settings consumers (pushed from main.zig's prefs-changed listener).
+    date_format: DateFormat = .iso,
+    confirm_delete: bool = true,
+    monospace_lists: bool = false,
+    /// Vim keymap layer (pref "ui.vimMode", off by default; setVimMode).
+    vim_mode: bool = false,
+    /// Synchronized browsing (Cmd+Shift+B; command "view.syncBrowsing").
+    sync_browsing: bool = false,
+    /// Re-entrancy guard while a mirrored navigation is being issued.
+    mirroring: bool = false,
+    /// Directory comparison (Cmd+Shift+D; command "view.comparePanes").
+    compare_mode: bool = false,
+    /// Async compare-job token: stale off-main results are dropped.
+    compare_gen: u64 = 0,
+    /// Tests flip this off to run the diff inline: headless tests pump
+    /// manually (no live main queue) and use the non-thread-safe testing
+    /// allocator, so the GCD hop must not happen there.
+    compare_async: bool = true,
     /// Selection feed for the inspector (docs/UX.md): fired for the FOCUSED
     /// pane on selection changes, snapshot swaps, and pane-focus switches.
     selection_hook: SelectionHook = .{},
+    /// Successful user navigations (history-recorded listings) feed the
+    /// command palette's frecency store through this (main.zig → palette
+    /// recordVisit). M3 seam.
+    visit_hook: VisitHook = .{},
+    /// Plain Space on a pane table (no modifiers): Quick Look (M3 seam;
+    /// main.zig binds the relay_mac quicklook panel). Return true to
+    /// consume the key (it never reaches type-select then).
+    space_hook: SpaceHook = .{},
+    /// Right-click menu provider for the pane tables (M3 seam; main.zig
+    /// serves the shared file context menu: Quick Look / Edit / Copy as /
+    /// Open in Terminal). null row = click on empty area.
+    context_menu_hook: ContextMenuHook = .{},
 
     // Cached, retained SF Symbol images for the Name column.
     icon_folder: ?c.id = null,
@@ -1473,6 +2220,11 @@ pub const BrowserController = struct {
         /// Local pane start directory; null = $HOME (docs/UX.md).
         initial_local_path: ?[]const u8 = null,
         density: table_source.Density = .compact,
+        date_format: DateFormat = .iso,
+        confirm_delete: bool = true,
+        monospace_lists: bool = false,
+        /// Pref "ui.vimMode" (opt-in, off by default).
+        vim_mode: bool = false,
     };
 
     /// main.zig binds this to the inspector (it owns both controllers);
@@ -1482,8 +2234,36 @@ pub const BrowserController = struct {
         notify: ?*const fn (ctx: ?*anyopaque, pane: *BrowserPane) void = null,
     };
 
+    /// M3 seams (all main.zig-injected, all main thread).
+    pub const VisitHook = struct {
+        ctx: ?*anyopaque = null,
+        notify: ?*const fn (ctx: ?*anyopaque, site_id: u64, path: []const u8) void = null,
+    };
+
+    pub const SpaceHook = struct {
+        ctx: ?*anyopaque = null,
+        handle: ?*const fn (ctx: ?*anyopaque, pane: *BrowserPane) bool = null,
+    };
+
+    pub const ContextMenuHook = struct {
+        ctx: ?*anyopaque = null,
+        provide: ?*const fn (ctx: ?*anyopaque, pane: *BrowserPane, row: ?usize) ?c.id = null,
+    };
+
     pub fn setSelectionHook(self: *BrowserController, hook: SelectionHook) void {
         self.selection_hook = hook;
+    }
+
+    pub fn setVisitHook(self: *BrowserController, hook: VisitHook) void {
+        self.visit_hook = hook;
+    }
+
+    pub fn setSpaceHook(self: *BrowserController, hook: SpaceHook) void {
+        self.space_hook = hook;
+    }
+
+    pub fn setContextMenuHook(self: *BrowserController, hook: ContextMenuHook) void {
+        self.context_menu_hook = hook;
     }
 
     fn notifySelection(self: *BrowserController, pane: *BrowserPane) void {
@@ -1507,6 +2287,10 @@ pub const BrowserController = struct {
             .split = undefined,
             .panes = undefined,
             .density = options.density,
+            .date_format = options.date_format,
+            .confirm_delete = options.confirm_delete,
+            .monospace_lists = options.monospace_lists,
+            .vim_mode = options.vim_mode,
         };
         self.icon_folder = retainSymbol("folder");
         self.icon_file = retainSymbol("doc");
@@ -1575,25 +2359,82 @@ pub const BrowserController = struct {
     }
 
     // ------------------------------------------------------------------ //
-    // Remote-pane binding (called by the sites controller on connect)
+    // Remote-pane binding (called by the sites controller on connect).
+    // Active-pane connects (docs/UX.md): EITHER pane can host the site; a
+    // local-role pane switches to remote (Permissions column appears) and
+    // restores its local role + path on disconnect.
 
-    pub fn bindRemote(self: *BrowserController, site_id: u64, initial_path: []const u8) void {
-        const pane = self.panes[1];
+    /// Sites-controller `connecting` hook: point the pane at the site
+    /// BEFORE status events flow so the chip binds correctly.
+    pub fn prepareRemoteBind(self: *BrowserController, pane_token: bridge.PaneToken, site_id: u64) void {
+        const pane = self.paneForToken(pane_token) orelse self.panes[1];
+        self.ensureRemoteRole(pane);
         pane.site = site_id;
         pane.chip = null;
+        self.applySiteStyle(pane);
+        pane.updateStatus();
+    }
+
+    /// Sites-controller `navigate` hook: bind + list the initial directory.
+    pub fn bindRemoteToPane(self: *BrowserController, pane_token: bridge.PaneToken, site_id: u64, initial_path: []const u8) void {
+        const pane = self.paneForToken(pane_token) orelse self.panes[1];
+        self.ensureRemoteRole(pane);
+        pane.site = site_id;
+        pane.chip = null;
+        self.applySiteStyle(pane);
         self.resetPaneListing(pane);
         pane.navigateTo(if (initial_path.len > 0) initial_path else "/", .push);
+    }
+
+    /// Historical convenience: bind into the right-hand (home-remote) pane.
+    pub fn bindRemote(self: *BrowserController, site_id: u64, initial_path: []const u8) void {
+        self.bindRemoteToPane(self.panes[1].token(), site_id, initial_path);
     }
 
     pub fn unbindRemote(self: *BrowserController) void {
         const pane = self.panes[1];
         pane.site = null;
         pane.chip = null;
+        pane.last_latency_ms = null;
+        self.applySiteStyle(pane);
         self.resetPaneListing(pane);
         pane.updatePathBar();
         pane.table.reloadData();
         pane.updateStatus();
         self.notifySelection(pane);
+    }
+
+    /// Switch a local-role pane to remote: remember the local spot, show
+    /// the Permissions column. No-op for panes already remote.
+    fn ensureRemoteRole(self: *BrowserController, pane: *BrowserPane) void {
+        _ = self;
+        if (pane.role == .remote) return;
+        if (pane.saved_local_path == null) {
+            if (pane.history.current()) |cur|
+                pane.saved_local_path = pane.gpa.dupe(u8, cur) catch null;
+        }
+        pane.role = .remote;
+        pane.table.setColumnHidden(mode_column_id, false);
+        chrome.setPlaceholder(pane.path_field, "Not connected");
+    }
+
+    /// Disconnect of a role-switched pane: back to local, at the path the
+    /// pane showed before the site bound to it.
+    fn restoreLocalRole(self: *BrowserController, pane: *BrowserPane) void {
+        if (pane.role == .local or pane.home_role != .local) return;
+        pane.role = .local;
+        pane.site = item_mod.local_site_id;
+        pane.chip = null;
+        pane.last_latency_ms = null;
+        self.applySiteStyle(pane);
+        self.resetPaneListing(pane);
+        pane.table.setColumnHidden(mode_column_id, true);
+        chrome.setPlaceholder(pane.path_field, "Path");
+        pane.navigateTo(pane.saved_local_path orelse homePath(), .push);
+        if (pane.saved_local_path) |p| {
+            pane.gpa.free(p);
+            pane.saved_local_path = null;
+        }
     }
 
     fn resetPaneListing(self: *BrowserController, pane: *BrowserPane) void {
@@ -1618,6 +2459,11 @@ pub const BrowserController = struct {
         pane.sel_count = 0;
         pane.sel_bytes = 0;
         pane.listing_count = 0;
+        pane.clearCompareTints();
+        pane.mirror_pending = false;
+        pane.vim_state = .{};
+        pane.vim_anchor = null;
+        pane.vim_cursor = null;
     }
 
     // ------------------------------------------------------------------ //
@@ -1688,6 +2534,210 @@ pub const BrowserController = struct {
         for (self.panes) |pane| pane.table.setDensity(density);
     }
 
+    /// Settings → "Date format" (Modified column rendering).
+    pub fn setDateFormat(self: *BrowserController, format: DateFormat) void {
+        if (self.date_format == format) return;
+        self.date_format = format;
+        for (self.panes) |pane| pane.table.reloadData();
+    }
+
+    /// Settings → "Ask before deleting" (deleteSelection sheet skip).
+    pub fn setConfirmDelete(self: *BrowserController, confirm: bool) void {
+        self.confirm_delete = confirm;
+    }
+
+    /// Settings → "Monospaced file lists" (table_source font hook).
+    pub fn setMonospaceLists(self: *BrowserController, mono: bool) void {
+        self.monospace_lists = mono;
+        for (self.panes) |pane| pane.table.setMonospaced(mono);
+    }
+
+    /// Inspector Apply hook: stage the optimistic chmod overlay on the
+    /// pane that owns the selection (routed from main.zig).
+    pub fn stageChmod(self: *BrowserController, pane_token: bridge.PaneToken, path: []const u8, mode: u16) void {
+        const pane = self.paneForToken(pane_token) orelse return;
+        pane.stageChmodOverlay(path, mode);
+    }
+
+    /// Pref "ui.vimMode" consumer (push from the prefs-changed listener,
+    /// exactly like setMonospaceLists). Toggling resets per-pane vim state.
+    pub fn setVimMode(self: *BrowserController, enabled: bool) void {
+        if (self.vim_mode == enabled) return;
+        self.vim_mode = enabled;
+        for (self.panes) |pane| {
+            pane.vim_state = .{};
+            pane.vim_anchor = null;
+            pane.vim_cursor = null;
+        }
+    }
+
+    /// Prod-safeguard surface for sibling controllers (the transfers
+    /// panel's overwrite-confirm, the inspector's recursive chmod): true
+    /// when the pane's site carries the prod environment tag, so their
+    /// confirm sheets should demand a held Cmd exactly like delete here.
+    pub fn paneNeedsProdGuard(self: *BrowserController, pane_token: bridge.PaneToken) bool {
+        const pane = self.paneForToken(pane_token) orelse return false;
+        return pane.env_prod;
+    }
+
+    // ------------------------------------------------------------------ //
+    // Synchronized browsing ("view.syncBrowsing", Cmd+Shift+B)
+
+    /// Toggle the pane link: while on, relative path changes in one pane
+    /// mirror into the other, and "⇄" shows in both path bars.
+    pub fn toggleSyncBrowsing(self: *BrowserController) void {
+        self.sync_browsing = !self.sync_browsing;
+        for (self.panes) |pane| {
+            pane.updateSyncIndicator();
+            pane.updateStatus(); // wipe a stale stop-hint
+        }
+    }
+
+    /// Graceful stop (mirrored dir missing / trees diverged): unlink and
+    /// hint in both status bars instead of presenting an error sheet.
+    fn stopSyncBrowsing(self: *BrowserController, hint: []const u8) void {
+        if (!self.sync_browsing) return;
+        self.sync_browsing = false;
+        for (self.panes) |pane| {
+            pane.updateSyncIndicator();
+            chrome.setText(pane.status_label, hint);
+        }
+    }
+
+    /// Apply src's relative path change (src_old → src_new) to the other
+    /// pane. Issued navigations are flagged so a failure stops the link
+    /// gracefully; `mirroring` keeps the mirror from echoing back.
+    fn mirrorNavigation(
+        self: *BrowserController,
+        src: *BrowserPane,
+        src_old: []const u8,
+        src_new: []const u8,
+    ) void {
+        if (!self.sync_browsing or self.mirroring) return;
+        if (std.mem.eql(u8, src_old, src_new)) return; // refresh: in place
+        const dst = self.panes[src.index ^ 1];
+        if (dst.site == null) return;
+        const dst_base = dst.history.current() orelse return;
+        const target = (syncTarget(self.gpa, src_old, src_new, dst_base) catch return) orelse {
+            self.stopSyncBrowsing("Sync stopped — panes diverged above the link point");
+            return;
+        };
+        defer self.gpa.free(target);
+        self.mirroring = true;
+        defer self.mirroring = false;
+        dst.navigateTo(target, .push);
+        if (dst.pending_request != null) dst.mirror_pending = true;
+    }
+
+    // ------------------------------------------------------------------ //
+    // Directory comparison ("view.comparePanes", Cmd+Shift+D)
+
+    /// Toggle compare mode: rows tint by cross-pane presence/size/mtime
+    /// delta; the legend rides both status bars while active. The diff is
+    /// computed off-main and re-applied on every snapshot adoption.
+    pub fn toggleComparePanes(self: *BrowserController) void {
+        self.compare_mode = !self.compare_mode;
+        self.compare_gen +%= 1; // drop any in-flight diff either way
+        if (self.compare_mode) {
+            self.scheduleCompare();
+        } else {
+            for (self.panes) |pane| pane.clearCompareTints();
+        }
+        for (self.panes) |pane| {
+            pane.applyCompareTints();
+            pane.updateStatus();
+        }
+    }
+
+    /// Kick an off-main diff over both panes' current snapshots (refs are
+    /// taken; DirSnapshot rc is atomic and the entries are immutable).
+    fn scheduleCompare(self: *BrowserController) void {
+        if (!self.compare_mode) return;
+        self.compare_gen +%= 1;
+        const snap_a = self.panes[0].snapshot orelse return;
+        const snap_b = self.panes[1].snapshot orelse return;
+        const job = self.gpa.create(CompareJob) catch return;
+        job.* = .{
+            .ctrl = self,
+            .token = self.compare_gen,
+            .snap_a = snap_a.ref(),
+            .snap_b = snap_b.ref(),
+        };
+        if (self.compare_async) {
+            dispatch.asyncOnQueue(dispatch.globalQueue(), job, CompareJob.computeOffMain);
+        } else {
+            // Headless tests: no live main queue and a non-thread-safe gpa,
+            // so compute + adopt inline on the caller's (main) thread.
+            job.compute();
+            CompareJob.finish(job);
+        }
+    }
+
+    const CompareJob = struct {
+        ctrl: *BrowserController,
+        token: u64,
+        snap_a: *DirSnapshot,
+        snap_b: *DirSnapshot,
+        tints: ?CompareTints = null,
+
+        /// The pure diff — runs on a GCD global queue in production (the
+        /// gpa there is the thread-safe c_allocator), on the main thread
+        /// in tests.
+        fn compute(job: *CompareJob) void {
+            job.tints = compareSnapshots(job.ctrl.gpa, job.snap_a.entries, job.snap_b.entries) catch null;
+        }
+
+        fn computeOffMain(job: *CompareJob) void {
+            job.compute();
+            dispatch.mainQueueAsync(job, CompareJob.finish);
+        }
+
+        /// Main thread: adopt the result if nothing moved underneath
+        /// (mode still on, newest job, both snapshots still current).
+        fn finish(job: *CompareJob) void {
+            const ctrl = job.ctrl;
+            defer {
+                job.snap_a.unref();
+                job.snap_b.unref();
+                ctrl.gpa.destroy(job);
+            }
+            var tints = job.tints orelse return;
+            const fresh = ctrl.compare_mode and job.token == ctrl.compare_gen and
+                ctrl.panes[0].snapshot == job.snap_a and ctrl.panes[1].snapshot == job.snap_b;
+            if (!fresh) {
+                tints.deinit(ctrl.gpa);
+                return;
+            }
+            ctrl.panes[0].clearCompareTints();
+            ctrl.panes[0].compare_tints = tints.a;
+            ctrl.panes[1].clearCompareTints();
+            ctrl.panes[1].compare_tints = tints.b;
+            for (ctrl.panes) |pane| {
+                pane.applyCompareTints();
+                pane.updateStatus();
+            }
+        }
+    };
+
+    // ------------------------------------------------------------------ //
+    // Per-site accent + environment (the Site record drives the strip)
+
+    /// Pull accent + environment from the bound Site (sites.zon fields)
+    /// into the pane and refresh the path-bar strip.
+    fn applySiteStyle(self: *BrowserController, pane: *BrowserPane) void {
+        pane.accent = .none;
+        pane.env_prod = false;
+        if (pane.site) |site_id| {
+            if (site_id != item_mod.local_site_id) {
+                if (self.core.findSite(site_id)) |site| {
+                    pane.accent = site.accent;
+                    pane.env_prod = site.environment == .prod;
+                }
+            }
+        }
+        pane.updateAccentStrip();
+    }
+
     // ------------------------------------------------------------------ //
     // Bridge listeners (main thread, run-to-completion)
 
@@ -1714,11 +2764,16 @@ pub const BrowserController = struct {
     }
 
     fn onSiteStatus(self: *BrowserController, e: events_mod.CoreEvent.SiteStatusChange) void {
-        const pane = self.panes[1];
-        const site = pane.site orelse return;
-        if (site != e.site_id) return;
-        pane.chip = e.status;
-        pane.updateStatus();
+        for (self.panes) |pane| {
+            if (pane.role != .remote) continue;
+            const site = pane.site orelse continue;
+            if (site != e.site_id) continue;
+            pane.chip = e.status;
+            pane.updateStatus();
+            // Active-pane connects: a role-switched local pane returns to
+            // its local role (and path) when the site disconnects.
+            if (e.status == .offline) self.restoreLocalRole(pane);
+        }
     }
 
     // ------------------------------------------------------------------ //
@@ -1732,15 +2787,16 @@ pub const BrowserController = struct {
             .controller = self,
             .gpa = gpa,
             .role = role,
+            .home_role = role,
             .index = index,
             .site = if (role == .local) item_mod.local_site_id else null,
             .show_hidden = self.core.settings.show_hidden_files,
         };
 
-        const columns: []const table_source.ColumnSpec =
-            if (role == .remote) &remote_columns else &local_columns;
+        // Full column set for BOTH panes (role switching just toggles the
+        // Permissions column's visibility).
         pane.table = try table_source.TableView.init(gpa, .{
-            .columns = columns,
+            .columns = &remote_columns,
             .data_source = .{
                 .ctx = pane,
                 .rowCount = BrowserPane.dsRowCount,
@@ -1751,10 +2807,13 @@ pub const BrowserController = struct {
                 .doubleAction = BrowserPane.dsDoubleAction,
                 .returnAction = BrowserPane.dsReturnAction,
                 .keyDown = BrowserPane.dsKeyDown,
+                .contextMenu = BrowserPane.dsContextMenu,
             },
             .density = self.density,
             .autosave_name = if (index == 0) "RelayBrowserTableLeft" else "RelayBrowserTableRight",
         });
+        if (role == .local) pane.table.setColumnHidden(mode_column_id, true);
+        pane.table.setMonospaced(self.monospace_lists);
 
         buildChrome(pane);
 
@@ -1775,11 +2834,22 @@ pub const BrowserController = struct {
 
         const top_y = pane_h - bar_h + (bar_h - field_h) / 2;
         pane.path_field = chrome.makeTextField(
-            foundation.rect(pad, top_y, pane_w - filter_w - 3 * pad, field_h),
+            foundation.rect(pad, top_y, pane_w - filter_w - sync_w - 4 * pad, field_h),
             12,
         );
         chrome.setAutoresizing(pane.path_field, chrome.width_sizable | chrome.min_y_margin);
         chrome.setPlaceholder(pane.path_field, if (pane.role == .remote) "Not connected" else "Path");
+
+        // "⇄" between the path bar and the filter: visible while
+        // synchronized browsing links the panes.
+        pane.sync_label = chrome.makeLabel(
+            foundation.rect(pane_w - filter_w - sync_w - 2 * pad, top_y, sync_w, field_h - 2),
+        );
+        chrome.setAutoresizing(pane.sync_label, chrome.min_x_margin | chrome.min_y_margin);
+        chrome.setText(pane.sync_label, "⇄");
+        chrome.setTextColor(pane.sync_label, foundation.controlAccentColor());
+        chrome.setToolTip(pane.sync_label, "Synchronized browsing (⌘⇧B)");
+        chrome.setHidden(pane.sync_label, true);
 
         pane.filter_field = chrome.makeTextField(
             foundation.rect(pane_w - filter_w - pad, top_y, filter_w, field_h),
@@ -1788,6 +2858,15 @@ pub const BrowserController = struct {
         chrome.setAutoresizing(pane.filter_field, chrome.min_x_margin | chrome.min_y_margin);
         chrome.setPlaceholder(pane.filter_field, "Filter");
         chrome.setHidden(pane.filter_field, true);
+
+        // Per-site accent strip, 2pt under the path bar (remote role only;
+        // striped warning treatment when the site is tagged prod).
+        pane.strip_view = stripClass().newWithFrame(
+            foundation.rect(0, pane_h - bar_h - strip_h, pane_w, strip_h),
+        );
+        stripClass().attach(pane.strip_view.value, pane);
+        chrome.setAutoresizing(pane.strip_view, chrome.width_sizable | chrome.min_y_margin);
+        chrome.setHidden(pane.strip_view, true);
 
         const table_view = objc.Object.fromId(pane.table.view());
         chrome.setFrame(table_view, foundation.rect(0, status_h, pane_w, pane_h - bar_h - status_h));
@@ -1802,8 +2881,10 @@ pub const BrowserController = struct {
         chrome.setDelegate(pane.filter_field, pane.field_target);
 
         chrome.addSubview(pane.container, pane.path_field);
+        chrome.addSubview(pane.container, pane.sync_label);
         chrome.addSubview(pane.container, pane.filter_field);
         chrome.addSubview(pane.container, table_view);
+        chrome.addSubview(pane.container, pane.strip_view); // over the table edge
         chrome.addSubview(pane.container, pane.status_label);
     }
 
@@ -1814,10 +2895,13 @@ pub const BrowserController = struct {
         pane.table.deinit();
         chrome.release(pane.path_field);
         chrome.release(pane.filter_field);
+        chrome.release(pane.sync_label);
+        chrome.release(pane.strip_view);
         chrome.release(pane.status_label);
         chrome.release(pane.field_target);
         chrome.release(pane.container);
         if (pane.snapshot) |snap| snap.unref();
+        gpa.free(pane.compare_tints);
         gpa.free(pane.sort_index);
         pane.visible.deinit(gpa);
         pane.overlay.deinit(gpa);
@@ -1827,6 +2911,7 @@ pub const BrowserController = struct {
         for (pane.op_names.items) |name| gpa.free(name);
         pane.op_names.deinit(gpa);
         if (pane.loading_path) |lp| gpa.free(lp);
+        if (pane.saved_local_path) |p| gpa.free(p);
         gpa.destroy(pane);
     }
 
@@ -1849,6 +2934,12 @@ pub const BrowserController = struct {
 fn homePath() []const u8 {
     const home = std.c.getenv("HOME") orelse return "/";
     return std.mem.span(home);
+}
+
+/// Wall-clock Unix seconds (relative Modified rendering).
+fn nowEpochSeconds(io: std.Io) i64 {
+    const ns = std.Io.Clock.real.now(io).nanoseconds;
+    return @intCast(@divFloor(ns, std.time.ns_per_s));
 }
 
 // ---------------------------------------------------------------------------
@@ -1982,9 +3073,25 @@ test "pending-set semantics drive the 60%-alpha treatment" {
     overlay.clearNewFolder(gpa);
     try testing.expect(overlay.isEmpty());
 
+    // chmod staging: mode override + pending treatment + rollback.
+    const entries = [_]vfs_mod.Entry{
+        .{ .name = "a", .kind = .file, .mode = 0o644 },
+        .{ .name = "b", .kind = .file },
+    };
+    try overlay.setMode(gpa, 0, 0o600);
+    try testing.expect(overlay.isPendingRow(0));
+    try testing.expect(!overlay.isEmpty());
+    try testing.expectEqual(@as(?u16, 0o600), overlay.displayMode(&entries, 0));
+    try testing.expectEqual(@as(?u16, null), overlay.displayMode(&entries, 1)); // no override, no mode
+    overlay.clearModes();
+    try testing.expect(!overlay.isPendingRow(0));
+    try testing.expectEqual(@as(?u16, 0o644), overlay.displayMode(&entries, 0));
+    try testing.expect(overlay.isEmpty());
+
     // Snapshot swap clears everything at once.
     try overlay.setRename(gpa, 1, "x");
     try overlay.hide(gpa, 2);
+    try overlay.setMode(gpa, 3, 0o755);
     try overlay.setNewFolder(gpa, "y");
     overlay.clear(gpa);
     try testing.expect(overlay.isEmpty());
@@ -2045,6 +3152,21 @@ test "formatters: counts, sizes, mtime, mode, status line" {
     try testing.expectEqualStrings("", formatMtime(&buf, null));
     try testing.expectEqualStrings("", formatMtime(&buf, -5));
 
+    // Relative date format (Settings → Date format).
+    const now: i64 = 1_718_107_200; // 2024-06-11 12:00 UTC
+    try testing.expectEqualStrings("just now", formatMtimeRelative(&buf, now - 30, now));
+    try testing.expectEqualStrings("5 min ago", formatMtimeRelative(&buf, now - 5 * 60, now));
+    try testing.expectEqualStrings("3 hr ago", formatMtimeRelative(&buf, now - 3 * 3600, now));
+    try testing.expectEqualStrings("1 day ago", formatMtimeRelative(&buf, now - 30 * 3600, now));
+    try testing.expectEqualStrings("6 days ago", formatMtimeRelative(&buf, now - 6 * 86_400, now));
+    // A week or older — and future skew — fall back to ISO.
+    try testing.expectEqualStrings("2024-06-04 12:00", formatMtimeRelative(&buf, now - 7 * 86_400, now));
+    try testing.expectEqualStrings("2024-06-11 12:01", formatMtimeRelative(&buf, now + 60, now));
+    try testing.expectEqualStrings("", formatMtimeRelative(&buf, null, now));
+    try testing.expectEqualStrings("", formatMtimeRelative(&buf, -5, now));
+    try testing.expectEqualStrings("just now", formatMtimeAs(&buf, now - 1, .relative, now));
+    try testing.expectEqualStrings("2024-06-11 12:00", formatMtimeAs(&buf, now, .iso, now));
+
     try testing.expectEqualStrings("644", formatMode(&buf, 0o644));
     try testing.expectEqualStrings("1777", formatMode(&buf, 0o1777));
     try testing.expectEqualStrings("", formatMode(&buf, null));
@@ -2061,6 +3183,15 @@ test "formatters: counts, sizes, mtime, mode, status line" {
         formatStatus(&sbuf, .{ .chip = "Connected", .item_count = 2, .sel_count = 1, .sel_bytes = 2048 }),
     );
     try testing.expectEqualStrings("hint", formatStatus(&sbuf, .{ .hint = "hint", .item_count = 9 }));
+    // Latency honesty (docs/UX.md): remote panes append the round trip.
+    try testing.expectEqualStrings(
+        "Connected · 2 items · 12 ms",
+        formatStatus(&sbuf, .{ .chip = "Connected", .item_count = 2, .latency_ms = 12 }),
+    );
+    try testing.expectEqualStrings(
+        "1 item · 0 ms · 1 selected (1023 B)",
+        formatStatus(&sbuf, .{ .item_count = 1, .latency_ms = 0, .sel_count = 1, .sel_bytes = 1023 }),
+    );
 }
 
 test "type-select finds the next prefix match with wraparound" {
@@ -2113,6 +3244,107 @@ test "findEntryByName re-resolves sheet targets after a snapshot swap" {
     try testing.expectEqual(@as(?u32, 2), findEntryByName(newer.entries, "alpha.txt"));
     try testing.expectEqual(@as(?u32, null), findEntryByName(newer.entries, "Beta.txt"));
     try testing.expectEqual(@as(?u32, null), findEntryByName(&.{}, "alpha.txt"));
+}
+
+test "syncTarget mirrors relative path changes onto the other pane" {
+    const gpa = testing.allocator;
+
+    // Descend: /a → /a/x against /b mirrors to /b/x.
+    {
+        const t = (try syncTarget(gpa, "/a", "/a/x", "/b")).?;
+        defer gpa.free(t);
+        try testing.expectEqualStrings("/b/x", t);
+    }
+    // Up one: /a/x → /a against /b/x mirrors to /b.
+    {
+        const t = (try syncTarget(gpa, "/a/x", "/a", "/b/x")).?;
+        defer gpa.free(t);
+        try testing.expectEqualStrings("/b", t);
+    }
+    // Sibling hop (one up, one down).
+    {
+        const t = (try syncTarget(gpa, "/a/x", "/a/y", "/b/x")).?;
+        defer gpa.free(t);
+        try testing.expectEqualStrings("/b/y", t);
+    }
+    // Multi-component descent carries every new component over.
+    {
+        const t = (try syncTarget(gpa, "/srv/www", "/srv/www/site/htdocs", "/var")).?;
+        defer gpa.free(t);
+        try testing.expectEqualStrings("/var/site/htdocs", t);
+    }
+    // Walking up to the source root can land on the destination root.
+    {
+        const t = (try syncTarget(gpa, "/a", "/", "/b")).?;
+        defer gpa.free(t);
+        try testing.expectEqualStrings("/", t);
+    }
+    // More ups than the destination has components: trees diverged → null.
+    try testing.expect((try syncTarget(gpa, "/a/b", "/", "/c")) == null);
+    try testing.expect((try syncTarget(gpa, "/a/b/c", "/a", "/x")) == null);
+}
+
+test "compareSnapshots classifies presence, size, mtime, and kind deltas" {
+    const gpa = testing.allocator;
+    const a = [_]vfs_mod.Entry{
+        .{ .name = "same.txt", .kind = .file, .size = 100, .mtime = 1000 },
+        .{ .name = "size.txt", .kind = .file, .size = 100, .mtime = 1000 },
+        .{ .name = "mtime.txt", .kind = .file, .size = 100, .mtime = 1000 },
+        .{ .name = "slack.txt", .kind = .file, .size = 100, .mtime = 1000 },
+        .{ .name = "dir", .kind = .dir, .mtime = 1 },
+        .{ .name = "kind", .kind = .file, .size = 1 },
+        .{ .name = "only-a", .kind = .file, .size = 1 },
+        .{ .name = "nulls.txt", .kind = .file, .size = null, .mtime = null },
+    };
+    const b = [_]vfs_mod.Entry{
+        .{ .name = "same.txt", .kind = .file, .size = 100, .mtime = 1000 },
+        .{ .name = "size.txt", .kind = .file, .size = 200, .mtime = 1000 },
+        .{ .name = "mtime.txt", .kind = .file, .size = 100, .mtime = 5000 },
+        .{ .name = "slack.txt", .kind = .file, .size = 100, .mtime = 1000 + compare_mtime_slack_s },
+        .{ .name = "dir", .kind = .dir, .mtime = 99_999 },
+        .{ .name = "kind", .kind = .dir },
+        .{ .name = "only-b", .kind = .file, .size = 1 },
+        .{ .name = "nulls.txt", .kind = .file, .size = 100, .mtime = 7777 },
+    };
+
+    var tints = try compareSnapshots(gpa, &a, &b);
+    defer tints.deinit(gpa);
+    try testing.expectEqual(RowTint.same, tints.a[0]);
+    try testing.expectEqual(RowTint.differs, tints.a[1]); // size delta
+    try testing.expectEqual(RowTint.differs, tints.a[2]); // mtime delta
+    try testing.expectEqual(RowTint.same, tints.a[3]); // within the slack
+    try testing.expectEqual(RowTint.same, tints.a[4]); // dirs: presence only
+    try testing.expectEqual(RowTint.differs, tints.a[5]); // file vs dir
+    try testing.expectEqual(RowTint.missing, tints.a[6]); // no counterpart
+    try testing.expectEqual(RowTint.same, tints.a[7]); // null fields skip the check
+    // b mirrors the shared classes; its unmatched name is missing there.
+    try testing.expectEqual(RowTint.same, tints.b[0]);
+    try testing.expectEqual(RowTint.differs, tints.b[1]);
+    try testing.expectEqual(RowTint.missing, tints.b[6]);
+
+    // Empty other pane: everything here is missing, nothing there.
+    var lop = try compareSnapshots(gpa, &a, &.{});
+    defer lop.deinit(gpa);
+    for (lop.a) |t| try testing.expectEqual(RowTint.missing, t);
+    try testing.expectEqual(@as(usize, 0), lop.b.len);
+}
+
+test "prodConfirmAllowed: destructive click counts only while Cmd is held" {
+    try testing.expect(prodConfirmAllowed(true, true));
+    try testing.expect(!prodConfirmAllowed(true, false)); // click without Cmd
+    try testing.expect(!prodConfirmAllowed(false, true)); // Cancel with Cmd
+    try testing.expect(!prodConfirmAllowed(false, false));
+}
+
+test "accentUiColor maps site accents to semantic colors" {
+    try testing.expectEqual(@as(?foundation.Color, null), accentUiColor(.none));
+    try testing.expectEqual(@as(?foundation.Color, .system_blue), accentUiColor(.blue));
+    try testing.expectEqual(@as(?foundation.Color, .system_purple), accentUiColor(.purple));
+    try testing.expectEqual(@as(?foundation.Color, .system_red), accentUiColor(.red));
+    try testing.expectEqual(@as(?foundation.Color, .system_orange), accentUiColor(.orange));
+    try testing.expectEqual(@as(?foundation.Color, .system_yellow), accentUiColor(.yellow));
+    try testing.expectEqual(@as(?foundation.Color, .system_green), accentUiColor(.green));
+    try testing.expectEqual(@as(?foundation.Color, .system_gray), accentUiColor(.graphite));
 }
 
 // --- end-to-end (headless): real AppCore, real views, no window shown -----
@@ -2267,12 +3499,34 @@ test "dual-pane controller: local listing, navigation history, filters (headless
         local.pending_request = null;
     }
 
+    // Visit hook (M3 palette frecency feed): fires for history-recorded
+    // navigations with the pane's site id + landed path.
+    const VisitRecorder = struct {
+        calls: usize = 0,
+        last_site: u64 = 99,
+        last_path: [64]u8 = undefined,
+        last_path_len: usize = 0,
+
+        fn onVisit(ctx: ?*anyopaque, site_id: u64, path: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            self.last_site = site_id;
+            self.last_path_len = @min(path.len, self.last_path.len);
+            @memcpy(self.last_path[0..self.last_path_len], path[0..self.last_path_len]);
+        }
+    };
+    var visit_rec: VisitRecorder = .{};
+    bc.setVisitHook(.{ .ctx = &visit_rec, .notify = VisitRecorder.onVisit });
+
     // Descend + history: back returns, forward re-descends.
     local.navigateTo("/sub", .push);
     settled = .{ .pane = local, .path = "/sub" };
     try drainUntil(core, &settled, PaneSettled.ready);
     try testing.expectEqual(@as(usize, 1), local.visible.items.len);
     try testing.expect(local.history.canGoBack());
+    try testing.expectEqual(@as(usize, 1), visit_rec.calls);
+    try testing.expectEqual(item_mod.local_site_id, visit_rec.last_site);
+    try testing.expectEqualStrings("/sub", visit_rec.last_path[0..visit_rec.last_path_len]);
 
     local.goBack();
     settled = .{ .pane = local, .path = "/" };
@@ -2301,6 +3555,37 @@ test "dual-pane controller: local listing, navigation history, filters (headless
     defer gpa.free(remote_status);
     try testing.expect(std.mem.indexOf(u8, remote_status, "Not connected") != null);
 
+    // Active-pane connects: binding a site to the LOCAL pane switches its
+    // role to remote (Permissions column shows), remembers the local path,
+    // and restores both when the site goes offline.
+    {
+        try testing.expectEqual(PaneRole.local, local.role);
+        bc.prepareRemoteBind(local.token(), item_mod.local_site_id);
+        try testing.expectEqual(PaneRole.remote, local.role);
+        try testing.expectEqualStrings("/", local.saved_local_path.?);
+        bc.bindRemoteToPane(local.token(), item_mod.local_site_id, "/sub");
+        settled = .{ .pane = local, .path = "/sub" };
+        try drainUntil(core, &settled, PaneSettled.ready);
+        try testing.expectEqual(PaneRole.remote, local.role);
+        // The pane-token listing delivered a latency reading for the chip.
+        try testing.expect(local.last_latency_ms != null);
+
+        // Disconnect: the offline status restores the local role + path.
+        _ = core.events_q.post(.{ .site_status = .{
+            .site_id = item_mod.local_site_id,
+            .status = .offline,
+        } }) catch {};
+        core.drainNow();
+        try testing.expectEqual(PaneRole.local, local.role);
+        try testing.expectEqual(@as(?u64, item_mod.local_site_id), local.site);
+        try testing.expect(local.saved_local_path == null);
+        settled = .{ .pane = local, .path = "/" };
+        try drainUntil(core, &settled, PaneSettled.ready);
+        try testing.expectEqualStrings("/", local.history.current().?);
+        // The home-remote pane keeps its role across foreign disconnects.
+        try testing.expectEqual(PaneRole.remote, remote.role);
+    }
+
     // Optional visual harness: RELAY_BROWSER_HARNESS=1 shows the window
     // briefly (docs: window-dependent behavior is verified by running).
     if (std.c.getenv("RELAY_BROWSER_HARNESS") != null) {
@@ -2317,6 +3602,223 @@ test "dual-pane controller: local listing, navigation history, filters (headless
     }
 
     // Teardown order matters: stop all drains, then free the controller.
+    core.shutdown();
+    bc.destroy();
+    win.release();
+}
+
+/// Compare-tint lookup by entry name (test helper).
+fn tintOf(pane: *BrowserPane, name: []const u8) ?RowTint {
+    const snap = pane.snapshot orelse return null;
+    const idx = findEntryByName(snap.entries, name) orelse return null;
+    if (idx >= pane.compare_tints.len) return null;
+    return pane.compare_tints[idx];
+}
+
+fn kev(chars: []const u8) table_source.KeyEvent {
+    return .{ .key_code = 0, .chars = chars };
+}
+
+test "sync browsing, compare mode, vim layer (headless)" {
+    const pool = foundation.AutoreleasePool.init();
+    defer pool.deinit();
+    const gpa = testing.allocator;
+
+    var tmp_conf = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_conf.cleanup();
+    var tmp_root = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_root.cleanup();
+    var fake = FakeStore.init(gpa);
+    defer fake.deinit();
+
+    const core = try bridge.AppCore.initOptions(gpa, .{
+        .pump = .manual,
+        .config_dir = tmp_conf.dir,
+        .local_root = tmp_root.dir,
+        .cred_store = fake.credStore(),
+    });
+
+    // Pane 0 browses /a, pane 1 binds to /b (same local backend):
+    //   /a/x  /a/y  (dirs; only x exists under /b — the sync-stop trigger)
+    //   same.txt identical, diff.txt different size, only-a / only-b unique.
+    const io = core.io;
+    try tmp_root.dir.createDir(io, "a", .default_dir);
+    try tmp_root.dir.createDir(io, "a/x", .default_dir);
+    try tmp_root.dir.createDir(io, "a/y", .default_dir);
+    try tmp_root.dir.createDir(io, "b", .default_dir);
+    try tmp_root.dir.createDir(io, "b/x", .default_dir);
+    try tmp_root.dir.writeFile(io, .{ .sub_path = "a/same.txt", .data = "12345" });
+    try tmp_root.dir.writeFile(io, .{ .sub_path = "b/same.txt", .data = "12345" });
+    try tmp_root.dir.writeFile(io, .{ .sub_path = "a/diff.txt", .data = "123" });
+    try tmp_root.dir.writeFile(io, .{ .sub_path = "b/diff.txt", .data = "1234567" });
+    try tmp_root.dir.writeFile(io, .{ .sub_path = "a/only-a.txt", .data = "z" });
+    try tmp_root.dir.writeFile(io, .{ .sub_path = "b/only-b.txt", .data = "q" });
+
+    const win = window_mod.Window.create(
+        foundation.rect(0, 0, 1000, 600),
+        "relay-browser-power-test",
+        window_mod.StyleMask.standard,
+    );
+
+    const bc = try BrowserController.create(gpa, core, win, .{ .initial_local_path = "/a" });
+    win.setContentView(objc.Object.fromId(bc.view()));
+
+    const p0 = bc.localPane();
+    const p1 = bc.remotePane();
+    var settled: PaneSettled = .{ .pane = p0, .path = "/a" };
+    try drainUntil(core, &settled, PaneSettled.ready);
+    bc.bindRemoteToPane(p1.token(), item_mod.local_site_id, "/b");
+    settled = .{ .pane = p1, .path = "/b" };
+    try drainUntil(core, &settled, PaneSettled.ready);
+
+    // --- Synchronized browsing -------------------------------------------
+    try testing.expect(chrome.isHidden(p0.sync_label));
+    bc.toggleSyncBrowsing();
+    try testing.expect(bc.sync_browsing);
+    try testing.expect(!chrome.isHidden(p0.sync_label)); // "⇄" in both bars
+    try testing.expect(!chrome.isHidden(p1.sync_label));
+
+    // A navigation in pane 0 mirrors the relative change into pane 1.
+    p0.navigateTo("/a/x", .push);
+    settled = .{ .pane = p0, .path = "/a/x" };
+    try drainUntil(core, &settled, PaneSettled.ready);
+    settled = .{ .pane = p1, .path = "/b/x" };
+    try drainUntil(core, &settled, PaneSettled.ready);
+    try testing.expectEqualStrings("/b/x", p1.history.current().?);
+
+    // Mirroring into a missing dir stops the link gracefully (status hint,
+    // indicator gone, no error sheet).
+    p0.navigateTo("/a/y", .push);
+    settled = .{ .pane = p0, .path = "/a/y" };
+    try drainUntil(core, &settled, PaneSettled.ready);
+    const SyncStopped = struct {
+        bc: *BrowserController,
+        fn ready(self: *@This()) bool {
+            return !self.bc.sync_browsing;
+        }
+    };
+    var stopped: SyncStopped = .{ .bc = bc };
+    try drainUntil(core, &stopped, SyncStopped.ready);
+    try testing.expect(chrome.isHidden(p0.sync_label));
+    try testing.expect(chrome.isHidden(p1.sync_label));
+    {
+        const hint = try chrome.text(gpa, p1.status_label);
+        defer gpa.free(hint);
+        try testing.expect(std.mem.indexOf(u8, hint, "Sync stopped") != null);
+    }
+    try testing.expectEqualStrings("/b/x", p1.history.current().?); // stayed put
+
+    // --- Directory comparison --------------------------------------------
+    p0.navigateTo("/a", .push);
+    settled = .{ .pane = p0, .path = "/a" };
+    try drainUntil(core, &settled, PaneSettled.ready);
+    p1.navigateTo("/b", .push);
+    settled = .{ .pane = p1, .path = "/b" };
+    try drainUntil(core, &settled, PaneSettled.ready);
+
+    bc.compare_async = false; // run the diff inline (manual pump, testing gpa)
+    bc.toggleComparePanes();
+    try testing.expect(bc.compare_mode);
+    try testing.expectEqual(@as(?RowTint, .same), tintOf(p0, "same.txt"));
+    try testing.expectEqual(@as(?RowTint, .differs), tintOf(p0, "diff.txt"));
+    try testing.expectEqual(@as(?RowTint, .missing), tintOf(p0, "only-a.txt"));
+    try testing.expectEqual(@as(?RowTint, .same), tintOf(p0, "x")); // dir in both
+    try testing.expectEqual(@as(?RowTint, .missing), tintOf(p0, "y"));
+    try testing.expectEqual(@as(?RowTint, .missing), tintOf(p1, "only-b.txt"));
+    try testing.expectEqual(@as(?RowTint, .differs), tintOf(p1, "diff.txt"));
+    {
+        const status = try chrome.text(gpa, p0.status_label);
+        defer gpa.free(status);
+        try testing.expect(std.mem.indexOf(u8, status, "Compare:") != null); // legend
+    }
+
+    // Snapshot adoption recomputes the diff (refresh keeps the tints fresh).
+    p0.refresh();
+    settled = .{ .pane = p0, .path = "/a" };
+    try drainUntil(core, &settled, PaneSettled.ready);
+    try testing.expectEqual(@as(?RowTint, .differs), tintOf(p0, "diff.txt"));
+
+    bc.toggleComparePanes(); // off: tints drop, legend leaves the status bar
+    try testing.expect(!bc.compare_mode);
+    try testing.expectEqual(@as(usize, 0), p0.compare_tints.len);
+    try testing.expectEqual(@as(usize, 0), p1.compare_tints.len);
+    {
+        const status = try chrome.text(gpa, p0.status_label);
+        defer gpa.free(status);
+        try testing.expect(std.mem.indexOf(u8, status, "Compare:") == null);
+    }
+
+    // --- Vim layer through the real keyDown hook ---------------------------
+    // Visible order in /a: x, y, diff.txt, only-a.txt, same.txt.
+    bc.setVimMode(true);
+    const ctx0: *anyopaque = @ptrCast(p0);
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, kev("j")));
+    try testing.expectEqual(@as(?usize, 1), p0.table.selectedRow());
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, kev("k")));
+    try testing.expectEqual(@as(?usize, 0), p0.table.selectedRow());
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, .{ .key_code = 0, .chars = "G", .shift = true }));
+    try testing.expectEqual(@as(?usize, 4), p0.table.selectedRow());
+    try testing.expectEqualStrings(
+        "same.txt",
+        p0.snapshot.?.entries[p0.visible.items[4]].name,
+    );
+
+    // y: yank the full path (status confirms the copy).
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, kev("y")));
+    {
+        const status = try chrome.text(gpa, p0.status_label);
+        defer gpa.free(status);
+        try testing.expect(std.mem.indexOf(u8, status, "Path copied") != null);
+    }
+
+    // gg → top; Ctrl+d/u → clamped half pages.
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, kev("g")));
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, kev("g")));
+    try testing.expectEqual(@as(?usize, 0), p0.table.selectedRow());
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, .{ .key_code = 0, .chars = "\x04", .control = true }));
+    try testing.expectEqual(@as(?usize, 4), p0.table.selectedRow());
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, .{ .key_code = 0, .chars = "\x15", .control = true }));
+    try testing.expectEqual(@as(?usize, 0), p0.table.selectedRow());
+
+    // v anchors a range; Esc leaves visual mode; x toggles the cursor row.
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, kev("v")));
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, kev("j")));
+    try testing.expectEqual(@as(usize, 2), p0.table.selectedRows().len);
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, .{ .key_code = table_source.key_escape, .chars = "" }));
+    try testing.expect(p0.vim_anchor == null);
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, kev("x"))); // deselect row 1
+    try testing.expectEqual(@as(usize, 1), p0.table.selectedRows().len);
+    try testing.expectEqual(@as(?usize, 0), p0.table.selectedRow());
+
+    // Unbound printables are swallowed — type-to-select stays off.
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, kev("q")));
+    try testing.expectEqual(@as(usize, 0), p0.ts_len);
+
+    // l descends the selected dir; h returns to the parent.
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, kev("g")));
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, kev("g")));
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, kev("l"))); // open "x"
+    settled = .{ .pane = p0, .path = "/a/x" };
+    try drainUntil(core, &settled, PaneSettled.ready);
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, kev("h")));
+    settled = .{ .pane = p0, .path = "/a" };
+    try drainUntil(core, &settled, PaneSettled.ready);
+
+    // / focuses the filter; n cycles the match set.
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, kev("/")));
+    try testing.expect(!chrome.isHidden(p0.filter_field));
+    p0.applyFilter("same");
+    try testing.expectEqual(@as(usize, 1), p0.visible.items.len);
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, kev("n")));
+    try testing.expectEqual(@as(?usize, 0), p0.table.selectedRow());
+    p0.clearFilter();
+    try testing.expectEqual(@as(usize, 5), p0.visible.items.len);
+
+    // Vim off: the same key now feeds type-to-select again.
+    bc.setVimMode(false);
+    try testing.expect(BrowserPane.dsKeyDown(ctx0, kev("j")));
+    try testing.expectEqual(@as(usize, 1), p0.ts_len);
+
     core.shutdown();
     bc.destroy();
     win.release();

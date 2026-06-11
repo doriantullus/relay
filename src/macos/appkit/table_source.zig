@@ -310,6 +310,10 @@ pub const TableView = struct {
     table: objc.Object,
     helper: objc.Object,
     sel_buf: std.ArrayList(usize) = .empty,
+    /// Font hook: true renders EVERY cell in the monospaced system font
+    /// (Settings → "Monospaced file lists"); false keeps the per-column
+    /// system / monospaced-digit fonts.
+    monospaced: bool = false,
     /// Set by drag.attachDropHandler / drag.enableRowDragSource.
     drop: ?drag.DropHandler = null,
     drag_pane_id: ?u32 = null,
@@ -440,6 +444,20 @@ pub const TableView = struct {
         self.density = density;
         self.table.msgSend(void, "setRowHeight:", .{density.rowHeight()});
         self.reloadData();
+    }
+
+    /// Minimal font hook (Settings → "Monospaced file lists").
+    pub fn setMonospaced(self: *TableView, monospaced: bool) void {
+        if (self.monospaced == monospaced) return;
+        self.monospaced = monospaced;
+        self.reloadData();
+    }
+
+    /// Show/hide a column by identifier (pane role swaps: the Permissions
+    /// column appears only while a pane hosts a remote site).
+    pub fn setColumnHidden(self: *TableView, id: [:0]const u8, hidden: bool) void {
+        const col = self.table.msgSend(c.id, "tableColumnWithIdentifier:", .{nsStr(id.ptr)});
+        if (col) |column| objc.Object.fromId(column).msgSend(void, "setHidden:", .{hidden});
     }
 
     /// Selected row indexes, ascending. The slice is owned by the TableView
@@ -745,7 +763,11 @@ fn cellDrawRect(target: c.id, _: c.SEL, _: NSRect) callconv(.c) void {
     if (text.len == 0) return;
     const str = nsStrBytes(text);
 
-    const font = if (spec.monospaced_digits)
+    const font = if (tv.monospaced)
+        getClass("NSFont").msgSend(objc.Object, "monospacedSystemFontOfSize:weight:", .{
+            tv.density.fontSize(), @as(f64, 0.0),
+        })
+    else if (spec.monospaced_digits)
         getClass("NSFont").msgSend(objc.Object, "monospacedDigitSystemFontOfSize:weight:", .{
             tv.density.fontSize(), @as(f64, 0.0),
         })

@@ -56,6 +56,20 @@ pub const Command = enum {
     new_folder,
     rename_selection,
     delete_selection,
+    /// Edit-in-external-editor ("file.editExternal", Cmd+E); bound by
+    /// controllers/edit_sessions.zig's register().
+    edit_external,
+    /// Quick Look the selection (Cmd+Y here; plain Space rides the browser
+    /// key hook). Bound by main.zig to the relay_mac quicklook panel.
+    quick_look,
+    /// File ▸ Import — controllers/sites.zig importers (M3).
+    import_filezilla,
+    import_cyberduck,
+    // Edit ▸ Copy as — controllers/terminal.zig's register() binds these.
+    copy_as_scp,
+    copy_as_rsync,
+    copy_as_sftp,
+    copy_as_curl,
     // View
     toggle_sidebar,
     toggle_transfers,
@@ -65,16 +79,28 @@ pub const Command = enum {
     density_dense,
     toggle_hidden,
     filter,
+    /// Synchronized browsing ("view.syncBrowsing", Cmd+Shift+B).
+    toggle_sync_browsing,
+    /// Directory comparison ("view.comparePanes", Cmd+Shift+D).
+    toggle_compare,
+    /// Vim keymap layer (pref "ui.vimMode"; no key equivalent).
+    toggle_vim,
     // Go
     go_back,
     go_forward,
     go_enclosing,
     go_to_path,
     refresh,
+    /// Command palette ("palette.commands", Cmd+Shift+P) and the path jump
+    /// ("palette.paths", Cmd+P); bound by main.zig to PaletteController.
+    palette_commands,
+    palette_paths,
     // Server
     open_selection,
     transfer_selection,
     permissions,
+    /// "server.openTerminal" (Cmd+Opt+T); controllers/terminal.zig.
+    open_terminal,
     // Transfers
     pause_all_transfers,
     resume_all_transfers,
@@ -239,7 +265,14 @@ pub const file_menu: MenuDef = .{
         .separator,
         cmdLeaf("New Folder", .new_folder, "n", .{ .shift = true }),
         cmdLeaf("Rename", .rename_selection, "", .{}),
+        cmdLeaf("Edit with External Editor", .edit_external, "e", .{}),
+        cmdLeaf("Quick Look", .quick_look, "y", .{}),
         cmdLeaf("Delete", .delete_selection, K.backspace, .{}),
+        .separator,
+        .{ .submenu = .{ .title = "Import", .items = &.{
+            cmdLeaf("FileZilla Sites…", .import_filezilla, "", .{}),
+            cmdLeaf("Cyberduck Bookmarks…", .import_cyberduck, "", .{}),
+        } } },
     },
 };
 
@@ -247,6 +280,13 @@ pub const edit_menu: MenuDef = .{ .title = "Edit", .items = &.{
     selLeaf("Cut", "cut:", "x", .{}),
     selLeaf("Copy", "copy:", "c", .{}),
     selLeaf("Paste", "paste:", "v", .{}),
+    .separator,
+    .{ .submenu = .{ .title = "Copy as", .items = &.{
+        cmdLeaf("scp Command", .copy_as_scp, "", .{}),
+        cmdLeaf("rsync Command", .copy_as_rsync, "", .{}),
+        cmdLeaf("SFTP URL", .copy_as_sftp, "", .{}),
+        cmdLeaf("curl Command", .copy_as_curl, "", .{}),
+    } } },
     .separator,
     selLeaf("Select All", "selectAll:", "a", .{}),
 } };
@@ -262,6 +302,10 @@ pub const view_menu: MenuDef = .{ .title = "View", .items = &.{
         cmdLeaf("Dense", .density_dense, "", .{}),
     } } },
     .separator,
+    cmdLeaf("Synchronized Browsing", .toggle_sync_browsing, "b", .{ .shift = true }),
+    cmdLeaf("Compare Panes", .toggle_compare, "d", .{ .shift = true }),
+    cmdLeaf("Vim Key Bindings", .toggle_vim, "", .{}),
+    .separator,
     cmdLeaf("Toggle Hidden Files", .toggle_hidden, ".", .{ .shift = true }),
     cmdLeaf("Filter", .filter, "f", .{}),
 } };
@@ -273,11 +317,16 @@ pub const go_menu: MenuDef = .{ .title = "Go", .items = &.{
     .separator,
     cmdLeaf("Go to Path…", .go_to_path, "g", .{ .shift = true }),
     cmdLeaf("Refresh", .refresh, "r", .{}),
+    .separator,
+    cmdLeaf("Command Palette…", .palette_commands, "p", .{ .shift = true }),
+    cmdLeaf("Go to Anything…", .palette_paths, "p", .{}),
 } };
 
 pub const server_menu: MenuDef = .{ .title = "Server", .items = &.{
     cmdLeaf("Open Selection", .open_selection, K.down, .{}),
     cmdLeaf("Transfer Selection", .transfer_selection, K.ret, .{}),
+    .separator,
+    cmdLeaf("Open in Terminal", .open_terminal, "t", .{ .option = true }),
     .separator,
     cmdLeaf("Permissions…", .permissions, "", .{}),
 } };
@@ -629,6 +678,22 @@ pub const ui_prefs_file = "ui.zon";
 pub const Density = enum { comfortable, compact, dense };
 pub const DateFormat = enum { iso, relative };
 
+/// What main.zig saves on quit / restores on launch (M3 state restoration):
+/// per-pane (site, path) plus the panel collapse states. site_id 0 = local
+/// pane; an empty path means "nothing to restore" for that pane. Remote
+/// reconnects are gated by main.zig (agent/keychain auth only — a restore
+/// must never prompt at launch).
+pub const SessionState = struct {
+    pane0_site: u64 = 0,
+    pane0_path: []const u8 = "",
+    pane1_site: u64 = 0,
+    pane1_path: []const u8 = "",
+    focused_pane: u32 = 0,
+    sidebar_collapsed: bool = false,
+    transfers_collapsed: bool = true,
+    inspector_collapsed: bool = true,
+};
+
 pub const UiPrefs = struct {
     schema_version: u32 = 1,
     /// Default download directory; empty = ~/Downloads at use time.
@@ -637,10 +702,15 @@ pub const UiPrefs = struct {
     density: Density = .compact,
     monospace_lists: bool = false,
     date_format: DateFormat = .iso,
+    /// Pref "ui.vimMode" (View ▸ Vim Key Bindings; off by default).
+    vim_mode: bool = false,
+    /// Last session's pane/panel layout (saved on quit by main.zig).
+    session: SessionState = .{},
 };
 
-/// Loads ui.zon; `download_dir` in the result is owned by `gpa` (free with
-/// `freeUiPrefs`). Missing/corrupt files yield defaults.
+/// Loads ui.zon; `download_dir` and the session pane paths in the result
+/// are owned by `gpa` (free with `freeUiPrefs`). Missing/corrupt files
+/// yield defaults.
 pub fn loadUiPrefs(io: std.Io, dir: std.Io.Dir, gpa: Allocator) error{OutOfMemory}!UiPrefs {
     const source = settings_mod.readFileZ(io, dir, ui_prefs_file, gpa) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -654,24 +724,35 @@ pub fn loadUiPrefs(io: std.Io, dir: std.Io.Dir, gpa: Allocator) error{OutOfMemor
         error.OutOfMemory => return error.OutOfMemory,
         error.ParseZon => return defaultUiPrefs(gpa),
     };
+    defer std.zon.parse.free(gpa, parsed);
     var out = parsed;
-    out.download_dir = gpa.dupe(u8, parsed.download_dir) catch |err| {
-        std.zon.parse.free(gpa, parsed);
-        return err;
-    };
-    std.zon.parse.free(gpa, parsed);
+    out.download_dir = "";
+    out.session.pane0_path = "";
+    out.session.pane1_path = "";
+    errdefer freeUiPrefs(gpa, &out);
+    out.download_dir = try gpa.dupe(u8, parsed.download_dir);
+    out.session.pane0_path = try gpa.dupe(u8, parsed.session.pane0_path);
+    out.session.pane1_path = try gpa.dupe(u8, parsed.session.pane1_path);
     return out;
 }
 
 fn defaultUiPrefs(gpa: Allocator) error{OutOfMemory}!UiPrefs {
     var prefs: UiPrefs = .{};
     prefs.download_dir = try gpa.dupe(u8, "");
+    errdefer gpa.free(prefs.download_dir);
+    prefs.session.pane0_path = try gpa.dupe(u8, "");
+    errdefer gpa.free(prefs.session.pane0_path);
+    prefs.session.pane1_path = try gpa.dupe(u8, "");
     return prefs;
 }
 
 pub fn freeUiPrefs(gpa: Allocator, prefs: *UiPrefs) void {
     gpa.free(prefs.download_dir);
     prefs.download_dir = "";
+    gpa.free(prefs.session.pane0_path);
+    prefs.session.pane0_path = "";
+    gpa.free(prefs.session.pane1_path);
+    prefs.session.pane1_path = "";
 }
 
 /// Crash-safe persist (temp file + fsync + rename, via settings.zig).
@@ -823,6 +904,30 @@ pub const PrefsController = struct {
         self.ui.date_format = format;
         self.persistUi();
         self.changed();
+    }
+
+    /// View ▸ Vim Key Bindings (pref "ui.vimMode"); the change listener
+    /// pushes it into the browser like every other live-apply pref.
+    pub fn setVimMode(self: *PrefsController, on: bool) void {
+        if (self.ui.vim_mode == on) return;
+        self.ui.vim_mode = on;
+        self.persistUi();
+        self.changed();
+    }
+
+    /// Persist the quit-time session snapshot (M3 state restoration).
+    /// Silent: no listener notification — this runs on the terminate path
+    /// where re-rendering views is pointless. Pane paths are copied.
+    pub fn setSessionState(self: *PrefsController, session: SessionState) error{OutOfMemory}!void {
+        const p0 = try self.gpa.dupe(u8, session.pane0_path);
+        errdefer self.gpa.free(p0);
+        const p1 = try self.gpa.dupe(u8, session.pane1_path);
+        self.gpa.free(self.ui.session.pane0_path);
+        self.gpa.free(self.ui.session.pane1_path);
+        self.ui.session = session;
+        self.ui.session.pane0_path = p0;
+        self.ui.session.pane1_path = p1;
+        self.persistUi();
     }
 
     pub fn setConnectionsPerSite(self: *PrefsController, conns: u8) void {
@@ -1253,6 +1358,14 @@ test "menu tree integrity: every UX.md M2 menu shortcut appears exactly once" {
         .{ .key = "s", .mods = .{ .option = true } }, // Sidebar
         .{ .key = ",", .mods = .{} }, // Settings
         .{ .key = ".", .mods = .{} }, // Cancel
+        // M3 additions.
+        .{ .key = "e", .mods = .{} }, // Edit with External Editor
+        .{ .key = "y", .mods = .{} }, // Quick Look
+        .{ .key = "b", .mods = .{ .shift = true } }, // Synchronized Browsing
+        .{ .key = "d", .mods = .{ .shift = true } }, // Compare Panes
+        .{ .key = "p", .mods = .{ .shift = true } }, // Command Palette…
+        .{ .key = "p", .mods = .{} }, // Go to Anything…
+        .{ .key = "t", .mods = .{ .option = true } }, // Open in Terminal
     };
     for (m2_shortcuts) |shortcut| {
         try testing.expectEqual(@as(usize, 1), countShortcut(shortcut.key, shortcut.mods));
@@ -1409,6 +1522,17 @@ test "ui prefs: save/load round-trip; corrupt or missing file degrades to defaul
         .density = .dense,
         .monospace_lists = true,
         .date_format = .relative,
+        .vim_mode = true,
+        .session = .{
+            .pane0_site = 0,
+            .pane0_path = "/Users/relay/projects",
+            .pane1_site = 7,
+            .pane1_path = "/var/www",
+            .focused_pane = 1,
+            .sidebar_collapsed = true,
+            .transfers_collapsed = false,
+            .inspector_collapsed = false,
+        },
     };
     try saveUiPrefs(custom, io, tmp.dir, testing.allocator);
     var loaded = try loadUiPrefs(io, tmp.dir, testing.allocator);
@@ -1418,6 +1542,15 @@ test "ui prefs: save/load round-trip; corrupt or missing file degrades to defaul
     try testing.expectEqual(custom.density, loaded.density);
     try testing.expectEqual(custom.monospace_lists, loaded.monospace_lists);
     try testing.expectEqual(custom.date_format, loaded.date_format);
+    try testing.expectEqual(custom.vim_mode, loaded.vim_mode);
+    // M3 session restoration block round-trips, strings included.
+    try testing.expectEqualStrings(custom.session.pane0_path, loaded.session.pane0_path);
+    try testing.expectEqualStrings(custom.session.pane1_path, loaded.session.pane1_path);
+    try testing.expectEqual(custom.session.pane1_site, loaded.session.pane1_site);
+    try testing.expectEqual(custom.session.focused_pane, loaded.session.focused_pane);
+    try testing.expectEqual(custom.session.sidebar_collapsed, loaded.session.sidebar_collapsed);
+    try testing.expectEqual(custom.session.transfers_collapsed, loaded.session.transfers_collapsed);
+    try testing.expectEqual(custom.session.inspector_collapsed, loaded.session.inspector_collapsed);
 
     // Corrupt file → defaults, never a crash.
     try tmp.dir.writeFile(io, .{ .sub_path = ui_prefs_file, .data = "}{ garbage \x00" });
@@ -1462,20 +1595,37 @@ test "PrefsController: every setter persists immediately and fires listeners" {
     pc.setDateFormat(.relative);
     pc.setMonospaceLists(true);
     pc.setConfirmDelete(false);
+    pc.setVimMode(true);
     try pc.setDownloadDir("/tmp/relay-downloads");
+    // Quit-time session snapshot (M3): persists, fires NO listener.
+    try pc.setSessionState(.{
+        .pane0_path = "/srv/data",
+        .pane1_site = 3,
+        .pane1_path = "/var/www",
+        .focused_pane = 1,
+        .transfers_collapsed = false,
+    });
     var loaded = try loadUiPrefs(h.core.io, h.tmp_conf.dir, testing.allocator);
     defer freeUiPrefs(testing.allocator, &loaded);
     try testing.expectEqual(Density.dense, loaded.density);
     try testing.expectEqual(DateFormat.relative, loaded.date_format);
     try testing.expect(loaded.monospace_lists);
     try testing.expect(!loaded.confirm_delete);
+    try testing.expect(loaded.vim_mode);
     try testing.expectEqualStrings("/tmp/relay-downloads", loaded.download_dir);
+    try testing.expectEqualStrings("/srv/data", loaded.session.pane0_path);
+    try testing.expectEqual(@as(u64, 3), loaded.session.pane1_site);
+    try testing.expectEqualStrings("/var/www", loaded.session.pane1_path);
+    try testing.expectEqual(@as(u32, 1), loaded.session.focused_pane);
+    try testing.expect(!loaded.session.transfers_collapsed);
 
-    // One notification per persisted change; no-change setters are silent.
-    try testing.expectEqual(@as(u32, 9), counter.count);
+    // One notification per persisted change; no-change setters are silent
+    // (setSessionState is always silent — it runs on the terminate path).
+    try testing.expectEqual(@as(u32, 10), counter.count);
     pc.setDensity(.dense);
     pc.setConnectionsPerSite(32);
-    try testing.expectEqual(@as(u32, 9), counter.count);
+    pc.setVimMode(true);
+    try testing.expectEqual(@as(u32, 10), counter.count);
 
     // Effective download dir honors the explicit setting.
     var buf: [1024]u8 = undefined;

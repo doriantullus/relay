@@ -196,13 +196,14 @@ pub const LibresslProvider = struct {
                 return sslSetupFailure(diag, "SSL_set_session");
         }
 
+        var stall_budget: u32 = handshake_stall_budget;
         while (true) {
             c.ERR_clear_error();
             const rc = c.SSL_connect(ssl);
             if (rc == 1) break;
             switch (c.SSL_get_error(ssl, rc)) {
-                c.SSL_ERROR_WANT_READ => try waitFd(fd, .in, cancel, diag),
-                c.SSL_ERROR_WANT_WRITE => try waitFd(fd, .out, cancel, diag),
+                c.SSL_ERROR_WANT_READ => try waitFd(fd, .in, cancel, diag, &stall_budget),
+                c.SSL_ERROR_WANT_WRITE => try waitFd(fd, .out, cancel, diag, &stall_budget),
                 else => |code| return mapHandshakeFailure(ssl, code, rc, opts, &stream.verify_state, diag),
             }
         }
@@ -295,8 +296,8 @@ const SslStream = struct {
             if (rc > 0) return @intCast(rc);
             switch (c.SSL_get_error(s.ssl, rc)) {
                 c.SSL_ERROR_ZERO_RETURN => return error.EndOfStream,
-                c.SSL_ERROR_WANT_READ => waitFd(s.fd, .in, s.cancel, &s.last_error) catch return error.ReadFailed,
-                c.SSL_ERROR_WANT_WRITE => waitFd(s.fd, .out, s.cancel, &s.last_error) catch return error.ReadFailed,
+                c.SSL_ERROR_WANT_READ => waitFd(s.fd, .in, s.cancel, &s.last_error, null) catch return error.ReadFailed,
+                c.SSL_ERROR_WANT_WRITE => waitFd(s.fd, .out, s.cancel, &s.last_error, null) catch return error.ReadFailed,
                 c.SSL_ERROR_SYSCALL => {
                     // EOF without close_notify: ubiquitous on FTPS data
                     // connections; treat as end of stream, not an error.
@@ -347,8 +348,8 @@ const SslStream = struct {
                 continue;
             }
             switch (c.SSL_get_error(s.ssl, rc)) {
-                c.SSL_ERROR_WANT_READ => waitFd(s.fd, .in, s.cancel, &s.last_error) catch return error.WriteFailed,
-                c.SSL_ERROR_WANT_WRITE => waitFd(s.fd, .out, s.cancel, &s.last_error) catch return error.WriteFailed,
+                c.SSL_ERROR_WANT_READ => waitFd(s.fd, .in, s.cancel, &s.last_error, null) catch return error.WriteFailed,
+                c.SSL_ERROR_WANT_WRITE => waitFd(s.fd, .out, s.cancel, &s.last_error, null) catch return error.WriteFailed,
                 c.SSL_ERROR_SYSCALL, c.SSL_ERROR_ZERO_RETURN => {
                     s.last_error.set(.transient, 0, "TLS write failed: {t}", .{errnoNow()});
                     return error.WriteFailed;
@@ -368,7 +369,13 @@ const Want = enum { in, out };
 /// One ≤100 ms poll wakeup, checking `cancel` first — the contract that
 /// makes C-library calls cancellable. Returns when the fd is ready (or has
 /// an error condition: the next SSL_* call reports it properly).
-fn waitFd(fd: posix.fd_t, want: Want, cancel: *CancelToken, diag: *Diagnostics) Error!void {
+/// `budget`, when non-null, caps consecutive no-progress poll timeouts (each
+/// ~100 ms). A handshake that makes no forward progress for budget*100 ms
+/// fails instead of hanging forever — the bug some FTPS servers trigger on
+/// the data channel (curl times out there too). A progressing handshake
+/// resets nothing here because each readiness returns immediately; only
+/// genuine stalls burn the budget.
+fn waitFd(fd: posix.fd_t, want: Want, cancel: *CancelToken, diag: *Diagnostics, budget: ?*u32) Error!void {
     var fds = [_]posix.pollfd{.{
         .fd = fd,
         .events = switch (want) {
@@ -387,8 +394,18 @@ fn waitFd(fd: posix.fd_t, want: Want, cancel: *CancelToken, diag: *Diagnostics) 
             return error.Unexpected;
         };
         if (n != 0) return;
+        if (budget) |b| {
+            if (b.* == 0) {
+                diag.set(.transient, 0, "TLS handshake timed out (server stalled the data channel)", .{});
+                return error.HandshakeFailed;
+            }
+            b.* -= 1;
+        }
     }
 }
+
+/// ~30 s of 100 ms no-progress poll timeouts before a stalled handshake aborts.
+const handshake_stall_budget: u32 = 300;
 
 fn setNonblocking(fd: posix.fd_t, diag: *Diagnostics) Error!void {
     const rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));

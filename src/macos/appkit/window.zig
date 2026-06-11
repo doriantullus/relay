@@ -212,6 +212,13 @@ pub const Window = struct {
         self.obj.msgSend(void, "setLevel:", .{level});
     }
 
+    /// NSWindowTabbingMode: disallowed (2) kills the empty native tab bar +
+    /// the auto "Show Tab Bar" menu item that AppKit otherwise inserts. Call
+    /// once after window creation before the window is shown.
+    pub fn setTabbingMode(self: Window, mode: NSInteger) void {
+        self.obj.msgSend(void, "setTabbingMode:", .{mode});
+    }
+
     /// Frame persistence across launches (docs/UX.md: every split/window
     /// has an autosave name). Returns false if the name is already taken.
     pub fn setFrameAutosaveName(self: Window, name: []const u8) bool {

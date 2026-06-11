@@ -1084,6 +1084,16 @@ pub const BrowserPane = struct {
         return pane.history.current();
     }
 
+    /// True when this pane's containing view is currently displayed in the
+    /// window (i.e. the tab is active). Background tabs have no window —
+    /// presentErrorSheet on a detached view SIGABRTs, so all sheet calls
+    /// should guard on this.
+    pub fn isVisible(pane: *const BrowserPane) bool {
+        const container = pane.container;
+        const win_id = container.msgSend(c.id, "window", .{});
+        return win_id != null;
+    }
+
     // ------------------------------------------------------------------ //
     // Navigation
 
@@ -1238,7 +1248,11 @@ pub const BrowserPane = struct {
             // the sheet is dismissed (auto-clears on the next successful list).
             // The sheet still fires for immediate, in-context attention.
             pane.showBanner(.@"error", failure.message);
-            panels.presentErrorSheet(pane.controller.win, "Couldn't open folder", failure.message);
+            // Background-tab hygiene: the pane's container has no window when
+            // its tab is not active; presentErrorSheet on a detached view
+            // SIGABRTs (CRITICAL finding). The banner above is unconditional.
+            if (pane.isVisible())
+                panels.presentErrorSheet(pane.controller.win, "Couldn't open folder", failure.message);
             return;
         }
 
@@ -1726,7 +1740,9 @@ pub const BrowserPane = struct {
             .delete => "Delete failed",
         };
         const detail: []const u8 = if (d.failure) |f| f.message else "";
-        panels.presentErrorSheet(pane.controller.win, title, detail);
+        // Background-tab hygiene: only present a sheet when the pane is visible.
+        if (pane.isVisible())
+            panels.presentErrorSheet(pane.controller.win, title, detail);
     }
 
     /// Optimistic chmod (inspector Apply dispatched core.chmodPath): stage
@@ -2678,6 +2694,14 @@ pub const BrowserController = struct {
     pub fn paneNeedsProdGuard(self: *BrowserController, pane_token: bridge.PaneToken) bool {
         const pane = self.paneForToken(pane_token) orelse return false;
         return pane.env_prod;
+    }
+
+    /// Resolve a pane token to its BrowserPane via the process-global
+    /// registry (main thread only). Used by main.zig's PaneHost glue to route
+    /// connect callbacks to the OWNING controller when multiple tabs are open
+    /// (CRITICAL finding 1: paneForToken only checks THIS controller's panes).
+    pub fn paneByToken(token: bridge.PaneToken) ?*BrowserPane {
+        return g_pane_registry.get(token);
     }
 
     // ------------------------------------------------------------------ //

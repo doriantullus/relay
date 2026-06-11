@@ -109,6 +109,11 @@ pub const Command = enum {
     retry_failed_transfers,
     clear_completed_transfers,
     cancel_active,
+    // Tabs (Phase B)
+    new_tab,
+    close_tab,
+    next_tab,
+    prev_tab,
 };
 
 /// Command → callback registry with a validation hook. Heap-pinned
@@ -258,9 +263,11 @@ pub const settings_leaf: MenuLeaf = .{
 pub const file_menu: MenuDef = .{
     .title = "File",
     .items = &.{
-        // M2 ships a single window; Cmd+N re-fronts it (tabs land later).
+        // M2 ships a single window; Cmd+N re-fronts it.
         cmdLeaf("Show Main Window", .new_window, "n", .{}),
-        selLeaf("Close", "performClose:", "w", .{}),
+        cmdLeaf("New Tab", .new_tab, "t", .{}),
+        // Close: Cmd+W closes the active tab when >1 tab open, else performClose: the window.
+        cmdLeaf("Close", .close_tab, "w", .{}),
         .separator,
         cmdLeaf("Connect to Server…", .connect_server, "k", .{}),
         cmdLeaf("Disconnect", .disconnect, "k", .{ .shift = true }),
@@ -311,6 +318,9 @@ pub const view_menu: MenuDef = .{ .title = "View", .items = &.{
     .separator,
     cmdLeaf("Toggle Hidden Files", .toggle_hidden, ".", .{ .shift = true }),
     cmdLeaf("Filter", .filter, "f", .{}),
+    .separator,
+    cmdLeaf("Next Tab", .next_tab, "]", .{ .shift = true }),
+    cmdLeaf("Previous Tab", .prev_tab, "[", .{ .shift = true }),
 } };
 
 pub const go_menu: MenuDef = .{ .title = "Go", .items = &.{
@@ -682,11 +692,22 @@ pub const Density = enum { comfortable, compact, dense };
 pub const DateFormat = enum { iso, relative };
 
 /// What main.zig saves on quit / restores on launch (M3 state restoration):
+/// Per-tab session state. Fields mirror the legacy pane0/pane1 fields for
+/// the active tab; the tabs array carries all tabs (Phase B).
+pub const TabState = struct {
+    pane0_site: u64 = 0,
+    pane0_path: []const u8 = "",
+    pane1_site: u64 = 0,
+    pane1_path: []const u8 = "",
+};
+
 /// per-pane (site, path) plus the panel collapse states. site_id 0 = local
 /// pane; an empty path means "nothing to restore" for that pane. Remote
 /// reconnects are gated by main.zig (agent/keychain auth only — a restore
 /// must never prompt at launch).
 pub const SessionState = struct {
+    /// Legacy fields — still written from the ACTIVE tab for back-compat
+    /// with older ui.zon readers. New code reads from `tabs`.
     pane0_site: u64 = 0,
     pane0_path: []const u8 = "",
     pane1_site: u64 = 0,
@@ -695,6 +716,10 @@ pub const SessionState = struct {
     sidebar_collapsed: bool = false,
     transfers_collapsed: bool = true,
     inspector_collapsed: bool = true,
+    /// Phase B: all tabs. Slice owned by UiPrefs (dup'd in loadUiPrefs,
+    /// freed in freeUiPrefs). Empty = fall back to legacy pane0/pane1 fields.
+    tabs: []TabState = &.{},
+    active_tab: u32 = 0,
 };
 
 pub const UiPrefs = struct {
@@ -736,10 +761,31 @@ pub fn loadUiPrefs(io: std.Io, dir: std.Io.Dir, gpa: Allocator) error{OutOfMemor
     out.download_dir = "";
     out.session.pane0_path = "";
     out.session.pane1_path = "";
+    out.session.tabs = &.{};
     errdefer freeUiPrefs(gpa, &out);
     out.download_dir = try gpa.dupe(u8, parsed.download_dir);
     out.session.pane0_path = try gpa.dupe(u8, parsed.session.pane0_path);
     out.session.pane1_path = try gpa.dupe(u8, parsed.session.pane1_path);
+    // Dup the tabs array + each tab's path strings.
+    if (parsed.session.tabs.len > 0) {
+        const tabs = try gpa.alloc(TabState, parsed.session.tabs.len);
+        errdefer gpa.free(tabs);
+        var done: usize = 0;
+        errdefer for (tabs[0..done]) |*t| {
+            gpa.free(t.pane0_path);
+            gpa.free(t.pane1_path);
+        };
+        for (parsed.session.tabs, 0..) |src, i| {
+            tabs[i] = src;
+            tabs[i].pane0_path = "";
+            tabs[i].pane1_path = "";
+            tabs[i].pane0_path = try gpa.dupe(u8, src.pane0_path);
+            errdefer gpa.free(tabs[i].pane0_path);
+            tabs[i].pane1_path = try gpa.dupe(u8, src.pane1_path);
+            done = i + 1;
+        }
+        out.session.tabs = tabs;
+    }
     return out;
 }
 
@@ -750,6 +796,7 @@ fn defaultUiPrefs(gpa: Allocator) error{OutOfMemory}!UiPrefs {
     prefs.session.pane0_path = try gpa.dupe(u8, "");
     errdefer gpa.free(prefs.session.pane0_path);
     prefs.session.pane1_path = try gpa.dupe(u8, "");
+    // tabs = &.{} is the zero value; no allocation needed.
     return prefs;
 }
 
@@ -760,6 +807,17 @@ pub fn freeUiPrefs(gpa: Allocator, prefs: *UiPrefs) void {
     prefs.session.pane0_path = "";
     gpa.free(prefs.session.pane1_path);
     prefs.session.pane1_path = "";
+    freeTabStates(gpa, prefs.session.tabs);
+    prefs.session.tabs = &.{};
+}
+
+/// Free a heap-allocated TabState slice and all path strings within it.
+pub fn freeTabStates(gpa: Allocator, tabs: []TabState) void {
+    for (tabs) |*t| {
+        gpa.free(t.pane0_path);
+        gpa.free(t.pane1_path);
+    }
+    if (tabs.len > 0) gpa.free(tabs);
 }
 
 /// Crash-safe persist (temp file + fsync + rename, via settings.zig).
@@ -932,16 +990,40 @@ pub const PrefsController = struct {
 
     /// Persist the quit-time session snapshot (M3 state restoration).
     /// Silent: no listener notification — this runs on the terminate path
-    /// where re-rendering views is pointless. Pane paths are copied.
+    /// where re-rendering views is pointless. Pane paths and tabs are copied.
     pub fn setSessionState(self: *PrefsController, session: SessionState) error{OutOfMemory}!void {
         const p0 = try self.gpa.dupe(u8, session.pane0_path);
         errdefer self.gpa.free(p0);
         const p1 = try self.gpa.dupe(u8, session.pane1_path);
+        errdefer self.gpa.free(p1);
+        // Dup the tabs array.
+        var new_tabs: []TabState = &.{};
+        if (session.tabs.len > 0) {
+            new_tabs = try self.gpa.alloc(TabState, session.tabs.len);
+            errdefer self.gpa.free(new_tabs);
+            var done: usize = 0;
+            errdefer for (new_tabs[0..done]) |*t| {
+                self.gpa.free(t.pane0_path);
+                self.gpa.free(t.pane1_path);
+            };
+            for (session.tabs, 0..) |src, i| {
+                new_tabs[i] = src;
+                new_tabs[i].pane0_path = "";
+                new_tabs[i].pane1_path = "";
+                new_tabs[i].pane0_path = try self.gpa.dupe(u8, src.pane0_path);
+                errdefer self.gpa.free(new_tabs[i].pane0_path);
+                new_tabs[i].pane1_path = try self.gpa.dupe(u8, src.pane1_path);
+                done = i + 1;
+            }
+        }
+        // Free old state AFTER all allocations succeed.
         self.gpa.free(self.ui.session.pane0_path);
         self.gpa.free(self.ui.session.pane1_path);
+        freeTabStates(self.gpa, self.ui.session.tabs);
         self.ui.session = session;
         self.ui.session.pane0_path = p0;
         self.ui.session.pane1_path = p1;
+        self.ui.session.tabs = new_tabs;
         self.persistUi();
     }
 
@@ -1394,6 +1476,10 @@ test "menu tree integrity: every UX.md M2 menu shortcut appears exactly once" {
         .{ .key = "p", .mods = .{ .shift = true } }, // Command Palette…
         .{ .key = "p", .mods = .{} }, // Go to Anything…
         .{ .key = "t", .mods = .{ .option = true } }, // Open in Terminal
+        // Tab additions (Phase B).
+        .{ .key = "t", .mods = .{} }, // New Tab
+        .{ .key = "]", .mods = .{ .shift = true } }, // Next Tab
+        .{ .key = "[", .mods = .{ .shift = true } }, // Previous Tab
     };
     for (m2_shortcuts) |shortcut| {
         try testing.expectEqual(@as(usize, 1), countShortcut(shortcut.key, shortcut.mods));
@@ -1513,12 +1599,17 @@ test "buildItems lowers the tree: separators, selectors, commands, submenus" {
     cb.f(cb.ctx);
     try testing.expectEqual(@as(u32, 1), rec.hits);
 
-    // Responder-chain leaf keeps its selector.
-    try testing.expect(items[1].leaf.action == .sel);
-    try testing.expectEqualStrings("performClose:", items[1].leaf.action.sel);
-    try testing.expectEqualStrings("w", items[1].leaf.key);
+    // New Tab (Phase B): items[1] is a command leaf (not a selector).
+    try testing.expect(items[1] == .leaf);
+    try testing.expect(items[1].leaf.action == .call);
+    try testing.expectEqualStrings("t", items[1].leaf.key);
 
-    try testing.expect(items[2] == .separator);
+    // Close tab: items[2] is a command leaf.
+    try testing.expect(items[2] == .leaf);
+    try testing.expect(items[2].leaf.action == .call);
+    try testing.expectEqualStrings("w", items[2].leaf.key);
+
+    try testing.expect(items[3] == .separator);
 
     // Submenu lowering (View ▸ Density).
     const view_items = try buildItems(arena_state.allocator(), reg, view_menu.items);

@@ -49,6 +49,7 @@ pub const controllers = struct {
     pub const edit_sessions = @import("controllers/edit_sessions.zig");
     pub const palette = @import("controllers/palette.zig");
     pub const terminal = @import("controllers/terminal.zig");
+    pub const tabs = @import("controllers/tabs.zig");
 };
 
 const objc = mac.objc;
@@ -59,6 +60,7 @@ const split_view = mac.appkit.split_view;
 const toolbar_mod = mac.appkit.toolbar;
 const menu_kit = mac.appkit.menu;
 const table_source = mac.appkit.table_source;
+const tab_bar_mod = mac.appkit.tab_bar;
 
 const browser_mod = controllers.browser;
 const sites_mod = controllers.sites;
@@ -68,6 +70,7 @@ const inspector_mod = controllers.inspector;
 const edit_mod = controllers.edit_sessions;
 const palette_mod = controllers.palette;
 const terminal_mod = controllers.terminal;
+const tabs_mod = controllers.tabs;
 const quicklook = mac.quicklook;
 const notifications = mac.notifications;
 
@@ -181,7 +184,11 @@ fn onWillTerminate(_: ?*anyopaque) void {
         // Session restoration: persist per-pane (site, path) + panel
         // states into ui.zon while the views are still alive.
         if (g_mode == .normal) {
-            g_ui.prefs.setSessionState(captureSessionState()) catch {};
+            const session = captureSessionState();
+            g_ui.prefs.setSessionState(session) catch {};
+            // Free the temporary tabs slice we allocated in captureSessionState
+            // (setSessionState duped it into prefs storage).
+            if (session.tabs.len > 0) gpa.free(session.tabs);
         }
         // End every edit session BEFORE AppCore.shutdown(): stops the
         // FSEvents watchers, cancels in-flight items through the live
@@ -196,19 +203,31 @@ fn onWillTerminate(_: ?*anyopaque) void {
 /// recorded only when they are persisted (saved sites) — ephemeral
 /// quick-connect ids are meaningless across runs.
 fn captureSessionState() prefs_mod.SessionState {
+    const active_browser = activeBrowser();
     var session: prefs_mod.SessionState = .{
-        .focused_pane = g_ui.browser.focused,
+        .focused_pane = active_browser.focused,
         .sidebar_collapsed = g_ui.root_split.isCollapsed(0),
         .transfers_collapsed = g_ui.content_split.isCollapsed(1),
         .inspector_collapsed = g_ui.inner_split.isCollapsed(1),
+        .active_tab = @intCast(g_ui.tabs.active),
     };
-    capturePane(0, &session.pane0_site, &session.pane0_path);
-    capturePane(1, &session.pane1_site, &session.pane1_path);
+    // Legacy fields from the active tab (back-compat with single-tab ui.zon).
+    capturePaneFromBrowser(active_browser, 0, &session.pane0_site, &session.pane0_path);
+    capturePaneFromBrowser(active_browser, 1, &session.pane1_site, &session.pane1_path);
+    // Phase B: capture every tab.
+    const tab_count = g_ui.tabs.tabs.items.len;
+    const tabs_out = gpa.alloc(prefs_mod.TabState, tab_count) catch return session;
+    for (g_ui.tabs.tabs.items, 0..) |tab, i| {
+        tabs_out[i] = .{};
+        capturePaneFromBrowser(tab.browser, 0, &tabs_out[i].pane0_site, &tabs_out[i].pane0_path);
+        capturePaneFromBrowser(tab.browser, 1, &tabs_out[i].pane1_site, &tabs_out[i].pane1_path);
+    }
+    session.tabs = tabs_out;
     return session;
 }
 
-fn capturePane(index: u32, site_out: *u64, path_out: *[]const u8) void {
-    const pane = g_ui.browser.panes[index];
+fn capturePaneFromBrowser(browser: *browser_mod.BrowserController, index: u32, site_out: *u64, path_out: *[]const u8) void {
+    const pane = browser.panes[index];
     const site_id = pane.site orelse return;
     const path = pane.currentPath() orelse return;
     if (site_id != item_mod.local_site_id and !sitePersisted(site_id)) return;
@@ -250,7 +269,7 @@ const Ui = struct {
     commands: *prefs_mod.CommandRegistry,
     tb: *toolbar_mod.Toolbar,
     prefs: *prefs_mod.PrefsController,
-    browser: *browser_mod.BrowserController,
+    tabs: *tabs_mod.TabsController,
     transfers: *transfers_mod.TransfersController,
     inspector: *inspector_mod.InspectorController,
     sites: *sites_mod.SitesController,
@@ -273,6 +292,11 @@ const Ui = struct {
     /// browser panes | inspector.
     inner_split: *split_view.SplitView,
 };
+
+/// Convenience: the BrowserController for the currently active tab.
+fn activeBrowser() *browser_mod.BrowserController {
+    return g_ui.tabs.activeBrowser();
+}
 
 fn densityFromPrefs(d: prefs_mod.Density) table_source.Density {
     return switch (d) {
@@ -306,22 +330,34 @@ fn buildUi() !void {
     const ui_prefs = g_ui.prefs.uiPrefs();
     // Local-pane restore is silent: the saved path is statted first so a
     // vanished directory degrades to $HOME instead of a launch error sheet.
-    const restored_local: ?[]const u8 = blk: {
+    const first_tab_local: ?[]const u8 = blk: {
         if (g_mode != .normal) break :blk g_smoke.localStartPath();
         const session = ui_prefs.session;
-        if (session.pane0_site == item_mod.local_site_id and
-            session.pane0_path.len > 0 and localDirExists(session.pane0_path))
-            break :blk session.pane0_path;
+        // Legacy pane0 OR first tab in the tabs array.
+        const tab0_pane0_site = if (session.tabs.len > 0)
+            session.tabs[0].pane0_site
+        else
+            session.pane0_site;
+        const tab0_pane0_path = if (session.tabs.len > 0)
+            session.tabs[0].pane0_path
+        else
+            session.pane0_path;
+        if (tab0_pane0_site == item_mod.local_site_id and
+            tab0_pane0_path.len > 0 and localDirExists(tab0_pane0_path))
+            break :blk tab0_pane0_path;
         break :blk null;
     };
-    g_ui.browser = try browser_mod.BrowserController.create(gpa, core, g_ui.win, .{
-        .initial_local_path = restored_local,
+    const browser_options: browser_mod.BrowserController.Options = .{
+        .initial_local_path = first_tab_local,
         .density = densityFromPrefs(ui_prefs.density),
         .date_format = dateFormatFromPrefs(ui_prefs.date_format),
         .confirm_delete = ui_prefs.confirm_delete,
         .monospace_lists = ui_prefs.monospace_lists,
         .vim_mode = ui_prefs.vim_mode,
-    });
+    };
+    const first_browser = try browser_mod.BrowserController.create(gpa, core, g_ui.win, browser_options);
+    // TabsController adopts first_browser; don't destroy it separately.
+    g_ui.tabs = try tabs_mod.TabsController.create(gpa, core, g_ui.win, first_browser);
 
     g_ui.transfers = try transfers_mod.TransfersController.create(gpa, core);
 
@@ -337,6 +373,8 @@ fn buildUi() !void {
             .navigate = paneHostNavigate,
         },
     });
+    // Wire the sites store into the tabs controller now that sites is live.
+    g_ui.tabs.sites_store = &g_ui.sites.store;
 
     // --- M3 controllers -------------------------------------------------
 
@@ -357,7 +395,8 @@ fn buildUi() !void {
         .open_in_editor = g_mode == .normal,
         .win = g_ui.win,
     });
-    g_ui.edit.setTargetProvider(.{ .ctx = g_ui.browser, .collectFn = collectEditTargets });
+    // collectEditTargets uses activeBrowser() — pass a stable pointer as ctx.
+    g_ui.edit.setTargetProvider(.{ .ctx = &g_ui, .collectFn = collectEditTargets });
 
     g_ui.terminal = try terminal_mod.TerminalController.create(gpa, core, .{
         .window = g_ui.win,
@@ -415,22 +454,18 @@ fn buildUi() !void {
 
     // Inspector feed: focused-pane selection changes, snapshot swaps and
     // focus switches land in the Get Info panel (docs/UX.md).
-    g_ui.browser.setSelectionHook(.{ .ctx = null, .notify = onPaneSelection });
+    // We wire the hook on the first tab's browser; new tabs get it wired in
+    // newTab (via setBrowserHooks).
+    setBrowserHooks(first_browser);
 
     // Inspector Apply → optimistic chmod overlay on the owning pane
     // (pending-alpha Permissions cell until op_done/re-list reconciles).
     g_ui.inspector.setChmodStageHook(.{ .ctx = null, .stage = onChmodStaged });
 
-    // M3 browser seams: successful navigations feed the palette frecency
-    // store; plain Space Quick Looks the selection; right-click serves the
-    // shared file context menu.
-    g_ui.browser.setVisitHook(.{ .ctx = null, .notify = onPaneVisit });
-    g_ui.browser.setSpaceHook(.{ .ctx = null, .handle = onPaneSpace });
-    g_ui.browser.setContextMenuHook(.{ .ctx = null, .provide = paneContextMenu });
-
     // Splits per docs/UX.md, every one with an autosave name.
+    // inner_split child 0 is now the tabs container view (swaps browser views).
     g_ui.inner_split = try split_view.hSplit(gpa, &.{
-        .{ .view = g_ui.browser.view(), .min_size = 520 },
+        .{ .view = g_ui.tabs.containerView(), .min_size = 520 },
         .{ .view = g_ui.inspector.view(), .min_size = inspector_mod.panel_width, .collapsible = true },
     }, .{ .autosave_name = "RelayContentInspector" });
     g_ui.inner_split.collapse(1); // inspector closed until Cmd+I
@@ -456,11 +491,21 @@ fn buildUi() !void {
 
     g_ui.transfers.setRevealHandler(null, revealInPane);
 
-    g_ui.win.setContentView(objc.Object.fromId(g_ui.root_split.view()));
+    // Build the window content: TabBar strip (top) + root_split (below).
+    // The bar starts hidden (single tab); it reveals itself automatically
+    // when a second tab is opened (TabsController.newTab).
+    const content_container = buildTabWindowContent(
+        g_ui.tabs.bar.view(),
+        objc.Object.fromId(g_ui.root_split.view()),
+    );
+    g_ui.win.setContentView(content_container);
+    // Disable AppKit's native tab bar (would show an empty strip).
+    // 2 = NSWindowTabbingModeDisallowed.
+    g_ui.win.setTabbingMode(2);
     g_ui.win.center();
     g_ui.win.makeKeyAndOrderFront();
     g_ui.app.activate();
-    g_ui.browser.focusPane(0);
+    activeBrowser().focusPane(0);
 
     // Restore the persisted queue (items come back paused; resume is a
     // user action, never forced) and reflect it in the panel.
@@ -479,28 +524,100 @@ fn buildUi() !void {
 /// Remote reconnects run only when the "Reconnect to servers at launch"
 /// pref is on, and even then never prompt: a site is restored only when
 /// its auth is provably silent (SSH agent, or a secret already in the
-/// keychain).
+/// keychain). Tab structure + local paths restore unconditionally.
 fn restoreSession(session: prefs_mod.SessionState) void {
     if (session.sidebar_collapsed) g_ui.root_split.collapse(0);
     if (!session.transfers_collapsed) g_ui.content_split.uncollapse(1);
     if (!session.inspector_collapsed) g_ui.inner_split.uncollapse(1);
 
-    if (g_ui.prefs.uiPrefs().reconnect_on_launch) {
-        restorePaneSite(0, session.pane0_site, session.pane0_path);
-        restorePaneSite(1, session.pane1_site, session.pane1_path);
+    const reconnect = g_ui.prefs.uiPrefs().reconnect_on_launch;
+
+    if (session.tabs.len > 0) {
+        // Phase B: restore all tabs. Tab 0 was already created at buildUi
+        // time (with its local path). Additional tabs get created here.
+        for (session.tabs[1..]) |tab_state| {
+            const local: ?[]const u8 = if (tab_state.pane0_site == item_mod.local_site_id and
+                tab_state.pane0_path.len > 0 and localDirExists(tab_state.pane0_path))
+                tab_state.pane0_path
+            else
+                null;
+            g_ui.tabs.newTab(.{ .initial_local_path = local }) catch continue;
+            setBrowserHooks(activeBrowser());
+        }
+        // Select the saved active tab.
+        const active = if (session.active_tab < g_ui.tabs.tabs.items.len)
+            session.active_tab
+        else
+            0;
+        g_ui.tabs.selectTab(active);
+        // Reconnect remote panes (gated on the pref).
+        if (reconnect) {
+            for (session.tabs, 0..) |tab_state, i| {
+                const browser = g_ui.tabs.tabs.items[i].browser;
+                restorePaneSiteOnBrowser(browser, 0, tab_state.pane0_site, tab_state.pane0_path);
+                restorePaneSiteOnBrowser(browser, 1, tab_state.pane1_site, tab_state.pane1_path);
+            }
+        }
+    } else {
+        // Legacy: single-tab session from before Phase B.
+        if (reconnect) {
+            restorePaneSiteOnBrowser(activeBrowser(), 0, session.pane0_site, session.pane0_path);
+            restorePaneSiteOnBrowser(activeBrowser(), 1, session.pane1_site, session.pane1_path);
+        }
     }
 
-    g_ui.browser.focusPane(if (session.focused_pane < 2) session.focused_pane else 0);
+    activeBrowser().focusPane(if (session.focused_pane < 2) session.focused_pane else 0);
 }
 
-fn restorePaneSite(index: u32, site_id: u64, path: []const u8) void {
+fn restorePaneSiteOnBrowser(browser: *browser_mod.BrowserController, index: u32, site_id: u64, path: []const u8) void {
     if (site_id == item_mod.local_site_id) return; // local: handled at create
     const site = g_ui.sites.store.get(site_id) orelse return;
     if (!sitePersisted(site_id)) return;
     if (!reconnectIsPromptFree(site)) return;
     // Connects land in the active pane (docs/UX.md): focus the saved one.
-    g_ui.browser.focusPane(index);
+    browser.focusPane(index);
     g_ui.sites.connectAndList(site_id, if (path.len > 0) path else null);
+}
+
+/// Wire the M3 browser seam hooks (selection, visit, space, context menu)
+/// onto a browser controller. Called for the first tab at buildUi and for
+/// each new tab created by newTab/restoreSession.
+fn setBrowserHooks(browser: *browser_mod.BrowserController) void {
+    browser.setSelectionHook(.{ .ctx = null, .notify = onPaneSelection });
+    browser.setVisitHook(.{ .ctx = null, .notify = onPaneVisit });
+    browser.setSpaceHook(.{ .ctx = null, .handle = onPaneSpace });
+    browser.setContextMenuHook(.{ .ctx = null, .provide = paneContextMenu });
+}
+
+/// Build the window content view: a plain NSView with the TabBar strip
+/// pinned to the top (fixed height = bar_height) and `content` below it
+/// filling the rest. Both have autoresizing so AppKit maintains the layout
+/// on window resize.
+///
+/// NSView uses non-flipped (y-up) coordinates: origin is bottom-left.
+/// Bar lives at y = total_h - bar_height (top); content fills [0, total_h - bar_height).
+fn buildTabWindowContent(bar_view: objc.c.id, content: objc.Object) objc.Object {
+    const total_w: f64 = 1240;
+    const total_h: f64 = 780;
+    const bar_h: f64 = tab_bar_mod.bar_height;
+
+    const outer = foundation.class("NSView").msgSend(objc.Object, "alloc", .{})
+        .msgSend(objc.Object, "initWithFrame:", .{foundation.rect(0, 0, total_w, total_h)});
+    // Width + height sizable so AppKit stretches it with the window.
+    outer.msgSend(void, "setAutoresizingMask:", .{@as(foundation.NSUInteger, (1 << 1) | (1 << 4))});
+
+    // Bar: top edge, width-sizable, minY-margin (stays at top as height grows).
+    const bar = objc.Object.fromId(bar_view);
+    bar.msgSend(void, "setFrame:", .{foundation.rect(0, total_h - bar_h, total_w, bar_h)});
+    bar.msgSend(void, "setAutoresizingMask:", .{@as(foundation.NSUInteger, (1 << 1) | (1 << 3))});
+    outer.msgSend(void, "addSubview:", .{bar});
+
+    // Content: fills everything below the bar; height + width sizable.
+    content.msgSend(void, "setFrame:", .{foundation.rect(0, 0, total_w, total_h - bar_h)});
+    content.msgSend(void, "setAutoresizingMask:", .{@as(foundation.NSUInteger, (1 << 1) | (1 << 4))});
+    outer.msgSend(void, "addSubview:", .{content});
+
+    return outer;
 }
 
 /// True when reconnecting `site` cannot pose a credential prompt: SFTP
@@ -542,22 +659,30 @@ fn localDirExists(path: []const u8) bool {
 
 /// PrefsController change listener: re-read the prefs and push everything
 /// with a live-apply hook into the open views (density, date format,
-/// confirm-delete, monospaced lists).
+/// confirm-delete, monospaced lists). Must iterate ALL tabs.
 fn onPrefsChanged(_: ?*anyopaque) void {
     const ui_prefs = g_ui.prefs.uiPrefs();
-    g_ui.browser.setDensity(densityFromPrefs(ui_prefs.density));
-    g_ui.browser.setDateFormat(dateFormatFromPrefs(ui_prefs.date_format));
-    g_ui.browser.setConfirmDelete(ui_prefs.confirm_delete);
-    g_ui.browser.setMonospaceLists(ui_prefs.monospace_lists);
-    g_ui.browser.setVimMode(ui_prefs.vim_mode);
+    for (g_ui.tabs.tabs.items) |tab| {
+        tab.browser.setDensity(densityFromPrefs(ui_prefs.density));
+        tab.browser.setDateFormat(dateFormatFromPrefs(ui_prefs.date_format));
+        tab.browser.setConfirmDelete(ui_prefs.confirm_delete);
+        tab.browser.setMonospaceLists(ui_prefs.monospace_lists);
+        tab.browser.setVimMode(ui_prefs.vim_mode);
+    }
 }
 
 /// InspectorController.ChmodStageHook → browser optimistic overlay.
+/// Route via the pane registry to find the owning controller (CRITICAL
+/// finding 1: with multiple tabs a foreign token must not go to the wrong
+/// browser).
 fn onChmodStaged(_: ?*anyopaque, pane_token: bridge.PaneToken, path: []const u8, mode: u16) void {
-    g_ui.browser.stageChmod(pane_token, path, mode);
+    const pane = browser_mod.BrowserController.paneByToken(pane_token) orelse return;
+    pane.controller.stageChmod(pane_token, path, mode);
 }
 
 // --- PaneHost: connects land in the ACTIVE pane (docs/UX.md) ----------------
+// CRITICAL finding 1: resolve the owning controller via the pane registry
+// so a foreign tab's token routes to the correct BrowserController.
 
 fn paneHostActiveToken(_: ?*anyopaque) bridge.PaneToken {
     // Connects land in the right-hand remote pane by default (the
@@ -568,19 +693,30 @@ fn paneHostActiveToken(_: ?*anyopaque) bridge.PaneToken {
     // Pane tokens are allocated per pane (no fixed values); before the UI
     // exists there is no pane, so the standalone fallback routes nowhere.
     if (!g_ui_built) return sites_mod.default_pane_token;
-    const active = g_ui.browser.activePane();
+    const browser = activeBrowser();
+    const active = browser.activePane();
     if (active.isRemote()) return active.token();
-    return g_ui.browser.remotePane().token();
+    return browser.remotePane().token();
 }
 
 fn paneHostConnecting(_: ?*anyopaque, pane_token: bridge.PaneToken, site_id: u64) void {
-    // Bind the chip target (and swap a local pane to the remote role)
-    // before status events start flowing.
-    g_ui.browser.prepareRemoteBind(pane_token, site_id);
+    // Route to the owning controller via the registry (CRITICAL finding 1).
+    const pane = browser_mod.BrowserController.paneByToken(pane_token) orelse {
+        // Fallback: active tab's remote pane.
+        activeBrowser().prepareRemoteBind(pane_token, site_id);
+        return;
+    };
+    pane.controller.prepareRemoteBind(pane_token, site_id);
 }
 
 fn paneHostNavigate(_: ?*anyopaque, pane_token: bridge.PaneToken, site_id: u64, path: []const u8) void {
-    g_ui.browser.bindRemoteToPane(pane_token, site_id, path);
+    // Route to the owning controller via the registry (CRITICAL finding 1).
+    const pane = browser_mod.BrowserController.paneByToken(pane_token) orelse {
+        activeBrowser().bindRemoteToPane(pane_token, site_id, path);
+        return;
+    };
+    pane.controller.bindRemoteToPane(pane_token, site_id, path);
+    g_ui.tabs.refreshTitles() catch {};
 }
 
 /// factories.MetaLookup → the sites controller's AuthMetaStore (main
@@ -602,7 +738,10 @@ fn sitesAuthLookup(ctx: ?*anyopaque, site_id: u64) ?factories.AuthChoice {
 /// BrowserController.SelectionHook → InspectorController.setSelection.
 /// Names/paths are borrowed for the call (the inspector copies into its
 /// own arena), so one short-lived arena covers the whole conversion.
+/// Only fire for the active tab's browser to avoid stale inspector state.
 fn onPaneSelection(_: ?*anyopaque, pane: *browser_mod.BrowserPane) void {
+    // Background tab selection changes don't update the inspector.
+    if (pane.controller != activeBrowser()) return;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const selection = paneSelection(arena.allocator(), pane) catch return;
@@ -648,13 +787,15 @@ fn paneSelection(
 
 fn revealInPane(_: ?*anyopaque, site_id: u64, dir: []const u8) void {
     // Either pane can host either role (active-pane connects): reveal in
-    // whichever pane currently shows the item's site.
-    for (g_ui.browser.panes, 0..) |pane, i| {
+    // whichever pane currently shows the item's site. Check the active tab
+    // first, then other tabs.
+    const browser = activeBrowser();
+    for (browser.panes, 0..) |pane, i| {
         const pane_site = pane.site orelse continue;
         if (pane_site != site_id) continue;
         if (site_id == item_mod.local_site_id and pane.role != .local) continue;
         pane.navigateTo(dir, .push);
-        g_ui.browser.focusPane(@intCast(i));
+        browser.focusPane(@intCast(i));
         return;
     }
 }
@@ -706,11 +847,39 @@ fn bindCommands() void {
     // files go through the download/watch/upload session.
     cmds.bind(.edit_external, null, cmdEditExternal);
     g_ui.terminal.register(cmds); // .open_terminal + the four .copy_as_*
+    // Phase B: tabs.
+    cmds.bind(.new_tab, null, cmdNewTab);
+    cmds.bind(.close_tab, null, cmdCloseTab);
+    cmds.bind(.next_tab, null, cmdNextTab);
+    cmds.bind(.prev_tab, null, cmdPrevTab);
 }
 
 fn cmdNewWindow(_: ?*anyopaque) void {
-    // M2 ships a single window; Cmd+N re-fronts it (tabs land later).
+    // M2 ships a single window; Cmd+N re-fronts it.
     g_ui.win.makeKeyAndOrderFront();
+}
+fn cmdNewTab(_: ?*anyopaque) void {
+    const ui_prefs = g_ui.prefs.uiPrefs();
+    g_ui.tabs.newTab(.{
+        .density = densityFromPrefs(ui_prefs.density),
+        .date_format = dateFormatFromPrefs(ui_prefs.date_format),
+        .confirm_delete = ui_prefs.confirm_delete,
+        .monospace_lists = ui_prefs.monospace_lists,
+        .vim_mode = ui_prefs.vim_mode,
+    }) catch {};
+    setBrowserHooks(activeBrowser());
+}
+fn cmdCloseTab(_: ?*anyopaque) void {
+    if (!g_ui.tabs.closeActiveTab()) {
+        // Last tab: close the window.
+        g_ui.win.performClose();
+    }
+}
+fn cmdNextTab(_: ?*anyopaque) void {
+    g_ui.tabs.nextTab();
+}
+fn cmdPrevTab(_: ?*anyopaque) void {
+    g_ui.tabs.prevTab();
 }
 fn cmdConnectServer(_: ?*anyopaque) void {
     g_ui.sites.quickConnect();
@@ -722,13 +891,13 @@ fn cmdDisconnectAll(_: ?*anyopaque) void {
     g_ui.sites.disconnectAll();
 }
 fn cmdNewFolder(_: ?*anyopaque) void {
-    g_ui.browser.newFolderSheet();
+    activeBrowser().newFolderSheet();
 }
 fn cmdRename(_: ?*anyopaque) void {
-    g_ui.browser.renameSelection();
+    activeBrowser().renameSelection();
 }
 fn cmdDelete(_: ?*anyopaque) void {
-    g_ui.browser.deleteSelection();
+    activeBrowser().deleteSelection();
 }
 fn cmdToggleSidebar(_: ?*anyopaque) void {
     _ = g_ui.root_split.toggleCollapse(0);
@@ -752,31 +921,31 @@ fn cmdDensityDense(_: ?*anyopaque) void {
     setDensity(.dense);
 }
 fn cmdToggleHidden(_: ?*anyopaque) void {
-    g_ui.browser.toggleHiddenFiles();
+    activeBrowser().toggleHiddenFiles();
 }
 fn cmdFilter(_: ?*anyopaque) void {
-    g_ui.browser.showFilter();
+    activeBrowser().showFilter();
 }
 fn cmdGoBack(_: ?*anyopaque) void {
-    g_ui.browser.goBack();
+    activeBrowser().goBack();
 }
 fn cmdGoForward(_: ?*anyopaque) void {
-    g_ui.browser.goForward();
+    activeBrowser().goForward();
 }
 fn cmdGoUp(_: ?*anyopaque) void {
-    g_ui.browser.goUp();
+    activeBrowser().goUp();
 }
 fn cmdGoToPath(_: ?*anyopaque) void {
-    g_ui.browser.goToPathSheet();
+    activeBrowser().goToPathSheet();
 }
 fn cmdRefresh(_: ?*anyopaque) void {
-    g_ui.browser.refresh();
+    activeBrowser().refresh();
 }
 fn cmdOpenSelection(_: ?*anyopaque) void {
-    g_ui.browser.openSelection();
+    activeBrowser().openSelection();
 }
 fn cmdTransferSelection(_: ?*anyopaque) void {
-    g_ui.browser.transferSelection();
+    activeBrowser().transferSelection();
 }
 fn cmdPermissions(_: ?*anyopaque) void {
     g_ui.inner_split.uncollapse(1);
@@ -794,7 +963,7 @@ fn cmdClearCompleted(_: ?*anyopaque) void {
     g_ui.transfers.clearCompleted();
 }
 fn cmdCancelActive(_: ?*anyopaque) void {
-    g_ui.browser.cancelActiveListing();
+    activeBrowser().cancelActiveListing();
     g_ui.transfers.cancelSelected();
 }
 fn cmdImportFileZilla(_: ?*anyopaque) void {
@@ -804,10 +973,10 @@ fn cmdImportCyberduck(_: ?*anyopaque) void {
     g_ui.sites.importCyberduck();
 }
 fn cmdToggleSyncBrowsing(_: ?*anyopaque) void {
-    g_ui.browser.toggleSyncBrowsing();
+    activeBrowser().toggleSyncBrowsing();
 }
 fn cmdToggleCompare(_: ?*anyopaque) void {
-    g_ui.browser.toggleComparePanes();
+    activeBrowser().toggleComparePanes();
 }
 fn cmdToggleVim(_: ?*anyopaque) void {
     // Persisted pref ("ui.vimMode"); the change listener pushes it into
@@ -815,7 +984,7 @@ fn cmdToggleVim(_: ?*anyopaque) void {
     g_ui.prefs.setVimMode(!g_ui.prefs.uiPrefs().vim_mode);
 }
 fn cmdQuickLook(_: ?*anyopaque) void {
-    _ = quickLookPane(g_ui.browser.activePane());
+    _ = quickLookPane(activeBrowser().activePane());
 }
 
 // ---------------------------------------------------------------------------
@@ -959,7 +1128,7 @@ fn paletteConnect(_: ?*anyopaque, site_id: u64) void {
 }
 
 fn palettePaneState(_: ?*anyopaque) palette_mod.PaneState {
-    const pane = g_ui.browser.activePane();
+    const pane = activeBrowser().activePane();
     const snap = pane.snapshot orelse return .{};
     return .{
         .site_id = pane.site orelse item_mod.local_site_id,
@@ -973,24 +1142,24 @@ fn palettePaneState(_: ?*anyopaque) palette_mod.PaneState {
 /// local-role pane; remote paths on an unbound site go through the normal
 /// connect path (which may prompt — this is a user action, not a launch).
 fn paletteNavigate(_: ?*anyopaque, other: bool, site_id: u64, path: []const u8) void {
-    const target: u32 = if (other) g_ui.browser.focused ^ 1 else g_ui.browser.focused;
-    const pane = g_ui.browser.panes[target];
+    const target: u32 = if (other) activeBrowser().focused ^ 1 else activeBrowser().focused;
+    const pane = activeBrowser().panes[target];
     if (pane.site) |bound| {
         if (bound == site_id) {
-            g_ui.browser.focusPane(target);
+            activeBrowser().focusPane(target);
             pane.navigateTo(path, .push);
             return;
         }
     }
     if (site_id == item_mod.local_site_id) {
         const fallback: u32 = target ^ 1;
-        const local = if (pane.role == .local) pane else g_ui.browser.panes[fallback];
+        const local = if (pane.role == .local) pane else activeBrowser().panes[fallback];
         if (local.role != .local) return;
-        g_ui.browser.focusPane(local.index);
+        activeBrowser().focusPane(local.index);
         local.navigateTo(path, .push);
         return;
     }
-    g_ui.browser.focusPane(target);
+    activeBrowser().focusPane(target);
     g_ui.sites.connectAndList(site_id, path);
 }
 
@@ -999,7 +1168,7 @@ fn paletteNavigate(_: ?*anyopaque, other: bool, site_id: u64, path: []const u8) 
 /// they open in the editor directly (the session machinery would otherwise
 /// silently no-op on them — the reported bug).
 fn cmdEditExternal(_: ?*anyopaque) void {
-    const pane = g_ui.browser.activePane();
+    const pane = activeBrowser().activePane();
     const site_id = pane.site orelse return;
     if (site_id != item_mod.local_site_id) {
         g_ui.edit.editSelection();
@@ -1026,7 +1195,7 @@ fn collectEditTargets(
     arena: Allocator,
     out: *std.ArrayList(edit_mod.EditTarget),
 ) error{OutOfMemory}!void {
-    const pane = g_ui.browser.activePane();
+    const pane = activeBrowser().activePane();
     const site_id = pane.site orelse return;
     if (site_id == item_mod.local_site_id) return;
     const snap = pane.snapshot orelse return;
@@ -1072,11 +1241,11 @@ fn terminalContext(_: ?*anyopaque, buf: []u8) ?terminal_mod.RemoteContext {
 }
 
 fn remoteBoundPane() ?*browser_mod.BrowserPane {
-    const active = g_ui.browser.activePane();
+    const active = activeBrowser().activePane();
     if (active.site) |site| {
         if (site != item_mod.local_site_id) return active;
     }
-    const other = g_ui.browser.panes[active.index ^ 1];
+    const other = activeBrowser().panes[active.index ^ 1];
     if (other.site) |site| {
         if (site != item_mod.local_site_id) return other;
     }
@@ -1121,10 +1290,10 @@ const toolbar_items = [_]toolbar_mod.ItemSpec{
 };
 
 fn tbBack(_: *anyopaque) void {
-    g_ui.browser.goBack();
+    activeBrowser().goBack();
 }
 fn tbForward(_: *anyopaque) void {
-    g_ui.browser.goForward();
+    activeBrowser().goForward();
 }
 fn tbConnect(_: *anyopaque) void {
     g_ui.sites.quickConnect();
@@ -1362,43 +1531,43 @@ const Smoke = struct {
                 // (a) window + all panes exist.
                 if (!g_ui_built or !g_ui.win.isVisible()) return false;
                 if (g_ui.sites.sidebarView() == null) smokeFail("wait_window", "no sidebar");
-                if (g_ui.browser.view() == null) smokeFail("wait_window", "no browser split");
+                if (activeBrowser().view() == null) smokeFail("wait_window", "no browser split");
                 if (g_ui.transfers.view() == null) smokeFail("wait_window", "no transfer panel");
                 if (g_ui.inspector.view() == null) smokeFail("wait_window", "no inspector");
                 // (b) local pane listed its start directory.
-                const local = g_ui.browser.localPane();
+                const local = activeBrowser().localPane();
                 if (local.snapshot == null) return false;
                 s.listed_rows = local.visible.items.len;
                 if (s.mode == .smoke) {
                     if (s.listed_rows != smoke_local_rows) smokeFail("wait_window", "local listing row count mismatch");
-                    g_ui.browser.bindRemote(item_mod.local_site_id, s.dst);
+                    activeBrowser().bindRemote(item_mod.local_site_id, s.dst);
                 } else {
                     // Connects land in the ACTIVE pane: focus the right
                     // pane first so the smoke keeps its remote-pane shape.
-                    g_ui.browser.focusPane(1);
+                    activeBrowser().focusPane(1);
                     g_ui.sites.connectAndList(1, "/upload");
                 }
                 s.step = .wait_dst;
                 return true;
             },
             .wait_dst => {
-                const remote = g_ui.browser.remotePane();
+                const remote = activeBrowser().remotePane();
                 const snap = remote.snapshot orelse return false;
                 if (s.mode == .smoke) {
                     if (!std.mem.eql(u8, snap.path, s.dst)) return false;
                     // (c) select everything in the local pane, transfer it.
-                    const local = g_ui.browser.localPane();
+                    const local = activeBrowser().localPane();
                     const n = local.visible.items.len;
                     if (n > smoke_local_rows) smokeFail("wait_dst", "more rows than expected");
                     var rows_buf: [smoke_local_rows]usize = undefined;
                     for (0..n) |i| rows_buf[i] = i;
                     local.table.setSelectedRows(rows_buf[0..n]);
-                    g_ui.browser.focusPane(0);
+                    activeBrowser().focusPane(0);
                 } else {
                     if (!std.mem.eql(u8, snap.path, "/upload")) return false;
                     const row = s.findRemoteRow(smoke_sftp_file) orelse return false;
                     remote.table.setSelectedRows(&.{row});
-                    g_ui.browser.focusPane(1);
+                    activeBrowser().focusPane(1);
                 }
                 if (!g_ui.commands.dispatch(.transfer_selection))
                     smokeFail("wait_dst", "transfer_selection command refused");
@@ -1567,7 +1736,7 @@ const Smoke = struct {
 
     fn findRemoteRow(s: *Smoke, name: []const u8) ?usize {
         _ = s;
-        const pane = g_ui.browser.remotePane();
+        const pane = activeBrowser().remotePane();
         const snap = pane.snapshot orelse return null;
         for (pane.visible.items, 0..) |slot, row| {
             if (slot < snap.entries.len and std.mem.eql(u8, snap.entries[slot].name, name))

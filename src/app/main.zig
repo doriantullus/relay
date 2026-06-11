@@ -678,6 +678,9 @@ fn bindCommands() void {
     cmds.bind(.toggle_compare, null, cmdToggleCompare);
     cmds.bind(.toggle_vim, null, cmdToggleVim);
     g_ui.edit.register(cmds); // .edit_external (Cmd+E)
+    // Override with the local-aware wrapper: local files open directly, remote
+    // files go through the download/watch/upload session.
+    cmds.bind(.edit_external, null, cmdEditExternal);
     g_ui.terminal.register(cmds); // .open_terminal + the four .copy_as_*
 }
 
@@ -962,6 +965,30 @@ fn paletteNavigate(_: ?*anyopaque, other: bool, site_id: u64, path: []const u8) 
     }
     g_ui.browser.focusPane(target);
     g_ui.sites.connectAndList(site_id, path);
+}
+
+/// Cmd+E / "Edit with External Editor". Remote files go through the
+/// download→watch→upload edit session; LOCAL files are already on disk, so
+/// they open in the editor directly (the session machinery would otherwise
+/// silently no-op on them — the reported bug).
+fn cmdEditExternal(_: ?*anyopaque) void {
+    const pane = g_ui.browser.activePane();
+    const site_id = pane.site orelse return;
+    if (site_id != item_mod.local_site_id) {
+        g_ui.edit.editSelection();
+        return;
+    }
+    const snap = pane.snapshot orelse return;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    for (pane.table.selectedRows()) |row| {
+        if (row >= pane.visible.items.len) continue;
+        const slot = pane.visible.items[row];
+        if (slot == browser_mod.virtual_new_folder_row or slot >= snap.entries.len) continue;
+        const entry = &snap.entries[slot];
+        if (entry.kind != .file) continue;
+        const abs = std.fmt.bufPrint(&buf, "{s}/{s}", .{ snap.path, entry.name }) catch continue;
+        _ = g_ui.edit.openLocalFile(abs);
+    }
 }
 
 /// EditSessions TargetProvider: every selected FILE of the active pane

@@ -110,6 +110,9 @@ pub const SplitView = struct {
     helper: objc.Object,
     /// true → children side by side (NSSplitView isVertical YES).
     horizontal: bool,
+    /// Per-child remembered extent along the split axis, so uncollapse
+    /// restores the size the user (or layout) last had it at.
+    saved_extent: []f64,
 
     fn init(
         alloc: std.mem.Allocator,
@@ -123,6 +126,9 @@ pub const SplitView = struct {
         errdefer alloc.destroy(self);
         const owned = try alloc.dupe(ChildSpec, children);
         errdefer alloc.free(owned);
+        const saved = try alloc.alloc(f64, children.len);
+        errdefer alloc.free(saved);
+        @memset(saved, 0);
 
         const split = getClass("NSSplitView").msgSend(objc.Object, "alloc", .{})
             .msgSend(objc.Object, "initWithFrame:", .{rect(0, 0, 900, 600)});
@@ -139,6 +145,7 @@ pub const SplitView = struct {
             .split = split,
             .helper = helper,
             .horizontal = horizontal,
+            .saved_extent = saved,
         };
         c.object_setIvar(helper.value, g_helper_state_ivar, @ptrCast(self));
 
@@ -167,6 +174,7 @@ pub const SplitView = struct {
         self.split.msgSend(void, "release", .{});
         self.helper.msgSend(void, "release", .{});
         self.alloc.free(self.children);
+        self.alloc.free(self.saved_extent);
         self.alloc.destroy(self);
     }
 
@@ -175,23 +183,54 @@ pub const SplitView = struct {
         return self.split.value;
     }
 
+    /// Subview extent along the split axis (width for side-by-side, height
+    /// for stacked). This is ground truth — `isSubviewCollapsed:`/`isHidden`
+    /// track flags that NSSplitView does NOT honor under `adjustSubviews`,
+    /// so collapse must move the divider and read the resulting frame back.
+    fn axisExtent(self: *SplitView, index: usize) f64 {
+        const f = self.subviewFrame(index);
+        return if (self.horizontal) f.size.width else f.size.height;
+    }
+
+    fn splitAxisExtent(self: *SplitView) f64 {
+        const f = self.split.msgSend(NSRect, "frame", .{});
+        return if (self.horizontal) f.size.width else f.size.height;
+    }
+
+    fn dividerThickness(self: *SplitView) f64 {
+        return self.split.msgSend(f64, "dividerThickness", .{});
+    }
+
     pub fn isCollapsed(self: *SplitView, index: usize) bool {
         if (index >= self.children.len) return false;
-        const child = objc.Object.fromId(self.children[index].view);
-        return self.split.msgSend(c.BOOL, "isSubviewCollapsed:", .{child}) != 0 or
-            child.msgSend(c.BOOL, "isHidden", .{}) != 0;
+        return self.axisExtent(index) < 1.0;
     }
 
     pub fn collapse(self: *SplitView, index: usize) void {
         if (index >= self.children.len) return;
-        objc.Object.fromId(self.children[index].view).msgSend(void, "setHidden:", .{true});
-        self.split.msgSend(void, "adjustSubviews", .{});
+        const cur = self.axisExtent(index);
+        if (cur > 1.0) self.saved_extent[index] = cur; // remember for restore
+        // Drive the bordering divider to the edge so the subview gets 0.
+        // index 0 → divider 0 to the near edge; otherwise → divider before
+        // it to the far edge (clamped by NSSplitView to the other minimums).
+        if (index == 0) {
+            self.setPosition(0, 0);
+        } else {
+            self.setPosition(index - 1, self.splitAxisExtent());
+        }
     }
 
     pub fn uncollapse(self: *SplitView, index: usize) void {
         if (index >= self.children.len) return;
-        objc.Object.fromId(self.children[index].view).msgSend(void, "setHidden:", .{false});
-        self.split.msgSend(void, "adjustSubviews", .{});
+        var ext = self.saved_extent[index];
+        const min = self.children[index].min_size;
+        if (ext < min) ext = if (min > 1.0) min else 180;
+        if (index == 0) {
+            self.setPosition(0, ext);
+        } else {
+            const full = self.splitAxisExtent();
+            self.setPosition(index - 1, full - ext - self.dividerThickness());
+        }
     }
 
     /// Returns the new collapsed state.
@@ -244,6 +283,9 @@ fn helperConstrainMin(
     const sv = stateFromIvar(target);
     const i: usize = @intCast(divider_index);
     if (i >= sv.children.len) return proposed;
+    // A collapsible subview may shrink all the way to 0 (that IS its
+    // collapse); only non-collapsible children enforce a hard minimum.
+    if (sv.children[i].collapsible) return proposed;
     const frame = sv.subviewFrame(i);
     return minCoordinateForDivider(proposed, sv.origin(frame), sv.children[i].min_size);
 }
@@ -258,16 +300,19 @@ fn helperConstrainMax(
     const sv = stateFromIvar(target);
     const next: usize = @intCast(divider_index + 1);
     if (next >= sv.children.len) return proposed;
+    if (sv.children[next].collapsible) return proposed; // may collapse to 0
     const frame = sv.subviewFrame(next);
     const end = sv.origin(frame) + sv.extent(frame);
     const thickness = sv.split.msgSend(f64, "dividerThickness", .{});
     return maxCoordinateForDivider(proposed, end, sv.children[next].min_size, thickness);
 }
 
-fn helperCanCollapse(target: c.id, _: c.SEL, _: c.id, subview: c.id) callconv(.c) c.BOOL {
-    const sv = stateFromIvar(target);
-    const i = sv.indexOfSubview(subview) orelse return 0;
-    return if (sv.children[i].collapsible) 1 else 0;
+fn helperCanCollapse(_: c.id, _: c.SEL, _: c.id, _: c.id) callconv(.c) c.BOOL {
+    // Always NO: we collapse/uncollapse by driving the divider position
+    // (relaxed constraints let collapsible children reach 0). If NSSplitView
+    // owned the collapsed *flag*, it would refuse to restore size on
+    // setPosition — leaving the panel stuck collapsed (the Cmd+J bug).
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -299,10 +344,11 @@ test "delegate class registers and recovers state (headless)" {
     defer helper.msgSend(void, "release", .{});
     c.object_setIvar(helper.value, g_helper_state_ivar, @ptrCast(&sv));
 
-    // canCollapse honors the per-child flag (both views are null here, and
-    // index lookup matches child 0 first).
+    // NSSplitView's own collapse is always disabled: we drive collapse by
+    // divider position so setPosition can restore the size (NSSplitView
+    // would otherwise latch the collapsed flag and refuse to expand).
     const can = helper.msgSend(c.BOOL, "splitView:canCollapseSubview:", .{
         @as(c.id, null), @as(c.id, null),
     });
-    try std.testing.expectEqual(@as(c.BOOL, 1), can);
+    try std.testing.expectEqual(@as(c.BOOL, 0), can);
 }

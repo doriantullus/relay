@@ -339,6 +339,13 @@ pub const EditSessionsController = struct {
         self.target_provider = provider;
     }
 
+    /// Open an already-local file directly in the editor — no download/watch/
+    /// upload session (local files edit in place). Returns whether it opened.
+    pub fn openLocalFile(self: *EditSessionsController, abs_path: []const u8) bool {
+        if (!self.open_in_editor) return true; // headless test mode
+        return workspaceOpen(abs_path);
+    }
+
     pub fn setConflictHook(self: *EditSessionsController, hook: ?ConflictHook) void {
         self.conflict_hook = hook;
     }

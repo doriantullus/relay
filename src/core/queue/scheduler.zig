@@ -654,6 +654,7 @@ const HostileListVfs = struct {
 
     const vtable: vfs_mod.VTable = .{
         .caps = capsFn,
+        .defaultPath = defaultPathFn,
         .stat = statFn,
         .list = listFn,
         .openRead = openReadFn,
@@ -666,6 +667,10 @@ const HostileListVfs = struct {
 
     fn fromCtx(ctx: *anyopaque) *HostileListVfs {
         return @ptrCast(@alignCast(ctx));
+    }
+
+    fn defaultPathFn(ctx: *anyopaque, io: std.Io, cancel: *cancel_mod.CancelToken, diag: *diag_mod.Diagnostics, buf: []u8) vfs_mod.Error![]const u8 {
+        return fromCtx(ctx).inner.defaultPath(io, cancel, diag, buf);
     }
 
     fn listFn(ctx: *anyopaque, io: std.Io, cancel: *cancel_mod.CancelToken, diag: *diag_mod.Diagnostics, path: []const u8, arena: std.mem.Allocator, sink: vfs_mod.ListingSink) vfs_mod.Error!void {

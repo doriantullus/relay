@@ -1136,6 +1136,34 @@ pub const BrowserPane = struct {
         if (sync_old) |old| ctrl.mirrorNavigation(pane, old, norm);
     }
 
+    /// Navigate to the bound site's default directory (FTP login dir,
+    /// SFTP home) — the first listing of a site with no configured remote
+    /// path. The worker resolves the real path; until the snapshot lands
+    /// there is no loading_path, so the path bar keeps its placeholder.
+    pub fn navigateToDefault(pane: *BrowserPane) void {
+        const site = pane.site orelse {
+            pane.updateStatus();
+            return;
+        };
+        const gpa = pane.gpa;
+        const core = pane.controller.core;
+        if (pane.pending_request) |req| _ = core.cancelListing(req);
+        if (pane.loading_path) |lp| gpa.free(lp);
+        pane.loading_path = null;
+        pane.record_history = true;
+        pane.listing_count = 0;
+        pane.mirror_pending = false;
+        const req = core.listDefaultPath(pane.token(), site) catch |err| {
+            pane.pending_request = null;
+            pane.updatePathBar();
+            panels.presentErrorSheet(pane.controller.win, "Couldn't open folder", @errorName(err));
+            return;
+        };
+        pane.pending_request = req;
+        pane.updatePathBar();
+        pane.updateStatus();
+    }
+
     pub fn refresh(pane: *BrowserPane) void {
         const cur = pane.history.current() orelse return;
         pane.navigateTo(cur, .replace);
@@ -2497,7 +2525,12 @@ pub const BrowserController = struct {
         pane.chip = null;
         self.applySiteStyle(pane);
         self.resetPaneListing(pane);
-        pane.navigateTo(if (initial_path.len > 0) initial_path else "/", .push);
+        // No configured path: list the server's default directory (its
+        // home), not "/".
+        if (initial_path.len > 0)
+            pane.navigateTo(initial_path, .push)
+        else
+            pane.navigateToDefault();
     }
 
     /// Historical convenience: bind into the right-hand (home-remote) pane.

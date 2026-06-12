@@ -37,6 +37,7 @@ pub const SftpVfs = struct {
 
     const vtable: vfs.VTable = .{
         .caps = vtCaps,
+        .defaultPath = vtDefaultPath,
         .stat = vtStat,
         .list = vtList,
         .openRead = vtOpenRead,
@@ -78,6 +79,19 @@ pub const SftpVfs = struct {
 
     // ------------------------------------------------------------------ //
     // Browse operations
+
+    /// realpath(".") — the SFTP server resolves it to the user's home
+    /// (SFTP has no CWD; "." is stable for the session's lifetime).
+    fn vtDefaultPath(ctx: *anyopaque, io: std.Io, cancel: *CancelToken, diag: *Diagnostics, buf: []u8) vfs.Error![]const u8 {
+        const self = fromCtx(ctx);
+        var lease = try self.pool.checkout(io, cancel, diag, .browse);
+        defer lease.release(io);
+        const client = try engineOf(&lease, diag);
+        return client.realpath(cancel, diag, ".", buf) catch |err| {
+            if (isFatal(err)) lease.markBroken();
+            return err;
+        };
+    }
 
     fn vtStat(ctx: *anyopaque, io: std.Io, cancel: *CancelToken, diag: *Diagnostics, p: []const u8) vfs.Error!vfs.Entry {
         const self = fromCtx(ctx);

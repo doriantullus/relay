@@ -22,7 +22,7 @@ fn lockSpin(m: *std.atomic.Mutex) void {
     while (!m.tryLock()) std.atomic.spinLoopHint();
 }
 
-pub const Op = enum { stat, list, open_read, open_write, read, write, mkdir, remove, rename, chmod };
+pub const Op = enum { default_path, stat, list, open_read, open_write, read, write, mkdir, remove, rename, chmod };
 
 pub const FaultSpec = struct {
     /// Exact path, or "*" to match any path.
@@ -71,6 +71,8 @@ pub const MockVfs = struct {
         .atomic_rename = true,
         .case_sensitive = true,
     },
+    /// What defaultPath reports (a site's "home"); borrowed, set by tests.
+    default_path_value: []const u8 = "/",
 
     // Shaping knobs (set before transfers start).
     /// Max bytes served per stream read call.
@@ -297,6 +299,7 @@ pub const MockVfs = struct {
 
     const vtable: vfs_mod.VTable = .{
         .caps = capsFn,
+        .defaultPath = defaultPathFn,
         .stat = statFn,
         .list = listFn,
         .openRead = openReadFn,
@@ -313,6 +316,22 @@ pub const MockVfs = struct {
 
     fn capsFn(ctx: *anyopaque) vfs_mod.Caps {
         return fromCtx(ctx).caps_value;
+    }
+
+    fn defaultPathFn(ctx: *anyopaque, io: std.Io, cancel: *cancel_mod.CancelToken, diag: *diag_mod.Diagnostics, buf: []u8) vfs_mod.Error![]const u8 {
+        _ = io;
+        const self = fromCtx(ctx);
+        try cancel.check();
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.logLocked("default_path", .{});
+        try self.checkFaultLocked(.default_path, "*", diag);
+        if (self.default_path_value.len > buf.len) {
+            diag.set(.permanent, 0, "mock: default path exceeds buffer", .{});
+            return error.Unexpected;
+        }
+        @memcpy(buf[0..self.default_path_value.len], self.default_path_value);
+        return buf[0..self.default_path_value.len];
     }
 
     fn statFn(ctx: *anyopaque, io: std.Io, cancel: *cancel_mod.CancelToken, diag: *diag_mod.Diagnostics, path: []const u8) vfs_mod.Error!vfs_mod.Entry {

@@ -36,6 +36,7 @@ pub const LocalVfs = struct {
 
     const vtable: vfs.VTable = .{
         .caps = vtCaps,
+        .defaultPath = vtDefaultPath,
         .stat = vtStat,
         .list = vtList,
         .openRead = vtOpenRead,
@@ -70,6 +71,27 @@ pub const LocalVfs = struct {
             // backend cannot know per-volume without statfs.
             .case_sensitive = null,
         };
+    }
+
+    /// $HOME when set and absolute, else "/". The caller normalizes (HOME
+    /// may carry a trailing slash); a bogus HOME surfaces as the listing's
+    /// own not-found error rather than being second-guessed here.
+    fn vtDefaultPath(ctx: *anyopaque, io: std.Io, cancel: *CancelToken, diag: *Diagnostics, buf: []u8) vfs.Error![]const u8 {
+        _ = ctx;
+        _ = io;
+        try checkCancel(cancel, diag);
+        const home: []const u8 = blk: {
+            const env = std.c.getenv("HOME") orelse break :blk "/";
+            const span = std.mem.span(env);
+            if (span.len == 0 or span[0] != '/') break :blk "/";
+            break :blk span;
+        };
+        if (home.len > buf.len) {
+            diag.set(.permanent, 0, "HOME is longer than the path buffer", .{});
+            return error.Unexpected;
+        }
+        @memcpy(buf[0..home.len], home);
+        return buf[0..home.len];
     }
 
     fn vtStat(ctx: *anyopaque, io: std.Io, cancel: *CancelToken, diag: *Diagnostics, p: []const u8) vfs.Error!vfs.Entry {

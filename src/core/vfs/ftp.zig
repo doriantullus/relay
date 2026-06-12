@@ -40,6 +40,7 @@ pub const FtpVfs = struct {
 
     const vtable: vfs.VTable = .{
         .caps = vtCaps,
+        .defaultPath = vtDefaultPath,
         .stat = vtStat,
         .list = vtList,
         .openRead = vtOpenRead,
@@ -108,6 +109,21 @@ pub const FtpVfs = struct {
 
     // ------------------------------------------------------------------ //
     // Browse operations
+
+    /// PWD on the browse connection. Right after connect (the only caller
+    /// today: a first listing with no configured remote path) this is the
+    /// server's login directory; on a long-lived conn it reflects the last
+    /// CWD probe — still a valid directory, just not necessarily home.
+    fn vtDefaultPath(ctx: *anyopaque, io: std.Io, cancel: *CancelToken, diag: *Diagnostics, buf: []u8) vfs.Error![]const u8 {
+        const self = fromCtx(ctx);
+        var lease = try self.checkoutBrowse(io, cancel, diag);
+        defer lease.release(io);
+        const client = try engineOf(&lease, diag);
+        return client.pwd(io, cancel, diag, buf) catch |err| {
+            if (isFatal(err)) lease.markBroken();
+            return err;
+        };
+    }
 
     fn vtStat(ctx: *anyopaque, io: std.Io, cancel: *CancelToken, diag: *Diagnostics, p: []const u8) vfs.Error!vfs.Entry {
         const self = fromCtx(ctx);
@@ -591,6 +607,8 @@ test "ftp backend end-to-end: list streams into a DirSnapshot, stat, read stream
         .{ .reply = "213 12" },
         .{ .expect = "MDTM /pub/hello.txt" },
         .{ .reply = "213 20240910084528" },
+        .{ .expect = "PWD" },
+        .{ .reply = "257 \"/home/demo\" is the current directory" },
     };
     // Script 1: the transfer connection (login + RETR).
     const transfer_script = login_steps ++ [_]Step{
@@ -657,6 +675,11 @@ test "ftp backend end-to-end: list streams into a DirSnapshot, stat, read stream
     try testing.expectEqual(vfs.EntryKind.file, entry.kind);
     try testing.expectEqual(@as(?u64, 12), entry.size);
     try testing.expectEqual(@as(?i64, 1725957928), entry.mtime);
+
+    // defaultPath = PWD (the login directory) on the browse connection.
+    var home_buf: [256]u8 = undefined;
+    const home = try v.defaultPath(io, &cancel, &diag, &home_buf);
+    try testing.expectEqualStrings("/home/demo", home);
 
     // Download through a transfer lease held for the stream's lifetime.
     var read_diag: Diagnostics = .{};

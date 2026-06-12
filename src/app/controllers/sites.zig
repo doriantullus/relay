@@ -1381,9 +1381,14 @@ pub const SitesController = struct {
             section_history => {
                 if (row >= self.history.entries.items.len) return .{ .title = "" };
                 const entry = self.history.entries.items[row];
-                const title = std.fmt.bufPrint(buf, "{s} · {s}", .{
-                    entry.label, entry.path,
-                }) catch entry.label;
+                // Empty path = "the server's default directory" (no
+                // configured remote path): show just the site label.
+                const title = if (entry.path.len == 0)
+                    entry.label
+                else
+                    std.fmt.bufPrint(buf, "{s} · {s}", .{
+                        entry.label, entry.path,
+                    }) catch entry.label;
                 return .{
                     .title = title,
                     .symbol = "clock",
@@ -1622,17 +1627,22 @@ pub const SitesController = struct {
         // attempt that never produced a terminal status. OOM = no sheet, the
         // inline banner/chip still surface the reason.
         self.pending_connects.put(self.gpa, site_id, {}) catch {};
+        // Empty = no configured path: the listing resolves the server's
+        // default directory (FTP login dir, SFTP home) instead of "/".
         const initial: []const u8 = blk: {
             if (path_override) |p| {
                 if (p.len > 0) break :blk p;
             }
-            if (site.initial_remote_path.len > 0) break :blk site.initial_remote_path;
-            break :blk "/";
+            break :blk site.initial_remote_path;
         };
         if (self.pane_host.navigate) |nav| {
             nav(self.pane_host.ctx, pane, site_id, initial);
-        } else {
+        } else if (initial.len > 0) {
             _ = self.core.listPath(pane, site_id, initial) catch |err| {
+                self.showError("Could not list the initial directory", @errorName(err));
+            };
+        } else {
+            _ = self.core.listDefaultPath(pane, site_id) catch |err| {
                 self.showError("Could not list the initial directory", @errorName(err));
             };
         }
@@ -2088,7 +2098,7 @@ pub const SitesController = struct {
             .{ .label = "Auth", .kind = .popup, .options = &auth_titles, .initial = auth },
             .{ .label = "Key File", .initial = key_path, .placeholder = "empty = choose via panel" },
             .{ .label = "Password", .kind = .secure, .initial = password, .placeholder = "saved to Keychain only" },
-            .{ .label = "Remote Path", .initial = remote, .placeholder = "/" },
+            .{ .label = "Remote Path", .initial = remote, .placeholder = "Server default" },
             .{ .label = "Local Path", .initial = local },
         };
         const session = self.gpa.create(EditorSession) catch {

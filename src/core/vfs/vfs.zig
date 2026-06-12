@@ -105,6 +105,10 @@ pub const WriteStream = struct {
 
 pub const VTable = struct {
     caps: *const fn (ctx: *anyopaque) Caps,
+    /// The backend's default directory, copied into `buf`: the user's home
+    /// (local, SFTP realpath ".") or the post-login working directory
+    /// (FTP PWD). Used for sites with no configured remote path.
+    defaultPath: *const fn (ctx: *anyopaque, io: std.Io, cancel: *CancelToken, diag: *diag_mod.Diagnostics, buf: []u8) Error![]const u8,
     stat: *const fn (ctx: *anyopaque, io: std.Io, cancel: *CancelToken, diag: *diag_mod.Diagnostics, path: []const u8) Error!Entry,
     list: *const fn (ctx: *anyopaque, io: std.Io, cancel: *CancelToken, diag: *diag_mod.Diagnostics, path: []const u8, arena: std.mem.Allocator, sink: ListingSink) Error!void,
     openRead: *const fn (ctx: *anyopaque, io: std.Io, cancel: *CancelToken, diag: *diag_mod.Diagnostics, path: []const u8, offset: u64) Error!ReadStream,
@@ -121,6 +125,9 @@ pub const Vfs = struct {
 
     pub fn caps(self: Vfs) Caps {
         return self.vtable.caps(self.ctx);
+    }
+    pub fn defaultPath(self: Vfs, io: std.Io, cancel: *CancelToken, diag: *diag_mod.Diagnostics, buf: []u8) Error![]const u8 {
+        return self.vtable.defaultPath(self.ctx, io, cancel, diag, buf);
     }
     pub fn stat(self: Vfs, io: std.Io, cancel: *CancelToken, diag: *diag_mod.Diagnostics, path: []const u8) Error!Entry {
         return self.vtable.stat(self.ctx, io, cancel, diag, path);

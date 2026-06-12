@@ -851,6 +851,32 @@ pub const AppCore = struct {
     ) error{ InvalidPath, OutOfMemory, ConcurrencyUnavailable }!RequestId {
         const norm = try path_mod.normalize(self.gpa, raw_path);
         errdefer self.gpa.free(norm);
+        return self.startListing(pane_token, site_id, norm);
+    }
+
+    /// Like listPath, but lists the site's default directory (FTP login
+    /// dir, SFTP home) — for sites with no configured remote path. The
+    /// worker resolves the real path via Vfs.defaultPath before listing,
+    /// so the resulting snapshot carries the resolved absolute path.
+    pub fn listDefaultPath(
+        self: *AppCore,
+        pane_token: PaneToken,
+        site_id: u64,
+    ) error{ OutOfMemory, ConcurrencyUnavailable }!RequestId {
+        // Empty path = the worker-resolved sentinel (normalize never
+        // produces "": it maps "" to "/").
+        const sentinel = try self.gpa.alloc(u8, 0);
+        errdefer self.gpa.free(sentinel);
+        return self.startListing(pane_token, site_id, sentinel);
+    }
+
+    /// `owned_path` is gpa-owned and adopted by the job (freed with it).
+    fn startListing(
+        self: *AppCore,
+        pane_token: PaneToken,
+        site_id: u64,
+        owned_path: []u8,
+    ) error{ OutOfMemory, ConcurrencyUnavailable }!RequestId {
         const job = try self.gpa.create(ListingJob);
         errdefer self.gpa.destroy(job);
         const request_id = self.next_request_id;
@@ -859,7 +885,7 @@ pub const AppCore = struct {
             .request_id = request_id,
             .pane_token = pane_token,
             .site_id = site_id,
-            .path = norm,
+            .path = owned_path,
         };
         try self.pending_listings.put(self.gpa, request_id, job);
         errdefer _ = self.pending_listings.remove(request_id);
@@ -1428,6 +1454,30 @@ fn listWorker(job: *ListingJob) void {
         return;
     };
 
+    // Empty path = "the site's default directory" (listDefaultPath):
+    // resolve it on the backend before the listing proper so the snapshot
+    // (and through it the path bar and history) carries the real path.
+    if (job.path.len == 0) {
+        var def_buf: [4096]u8 = undefined;
+        const def = vfs.defaultPath(core.io, &job.token, &diag, &def_buf) catch {
+            core.postListingFailure(job.request_id, .{
+                .class = diag.class,
+                .protocol_code = diag.protocol_code,
+                .message = diag.message,
+            });
+            return;
+        };
+        const norm = path_mod.normalize(core.gpa, def) catch {
+            core.postListingFailure(job.request_id, .{
+                .class = .permanent,
+                .message = "server reported an unusable default directory",
+            });
+            return;
+        };
+        core.gpa.free(job.path);
+        job.path = norm;
+    }
+
     var builder = snapshot_mod.Builder.init(core.gpa, job.path, job.request_id) catch {
         core.postListingFailure(job.request_id, .{ .class = .transient, .message = "out of memory" });
         return;
@@ -1744,6 +1794,8 @@ const ListingRecorder = struct {
     first_sorted_len: usize = 0,
     saw_name: bool = false,
     needle: []const u8 = "",
+    path_buf: [256]u8 = undefined,
+    path_len: usize = 0,
 
     fn onProgress(self: *@This(), p: ListingProgress) void {
         self.progress += 1;
@@ -1764,6 +1816,8 @@ const ListingRecorder = struct {
         self.entries = snap.entries.len;
         self.generation = snap.generation;
         self.sort_ok = d.sort_index.len == snap.entries.len;
+        self.path_len = @min(snap.path.len, self.path_buf.len);
+        @memcpy(self.path_buf[0..self.path_len], snap.path[0..self.path_len]);
         if (d.sort_index.len > 0) {
             const name = snap.entries[d.sort_index[0]].name;
             const n = @min(name.len, self.first_sorted.len);
@@ -1814,6 +1868,38 @@ test "listPath round trip: local Vfs listing delivers snapshot + sort permutatio
     try testing.expectEqualStrings("zsub", rec.first_sorted[0..rec.first_sorted_len]);
     // The pending table emptied (job + snapshot reclaimed at dispatch).
     try testing.expectEqual(@as(usize, 0), h.core.pending_listings.count());
+}
+
+test "listDefaultPath resolves the backend's default dir; snapshot carries the real path" {
+    var h: TestHarness = undefined;
+    try h.start(null);
+    defer h.stop();
+    const io = h.core.io;
+
+    // The local backend's default is $HOME. The harness's local root is a
+    // tmp dir, so mirror HOME under it (HOME is absolute → root-relative
+    // by stripping the leading '/') and drop a marker entry inside.
+    const home_env = std.c.getenv("HOME") orelse return; // env-less runner: skip
+    const home = std.mem.span(home_env);
+    if (home.len < 2 or home[0] != '/') return;
+    const norm = try path_mod.normalize(testing.allocator, home);
+    defer testing.allocator.free(norm);
+    try h.tmp_root.dir.createDirPath(io, norm[1..]);
+    const marker = try std.fmt.allocPrint(testing.allocator, "{s}/marker.txt", .{norm[1..]});
+    defer testing.allocator.free(marker);
+    try h.tmp_root.dir.writeFile(io, .{ .sub_path = marker, .data = "m" });
+
+    var rec: ListingRecorder = .{ .needle = "marker.txt" };
+    try h.core.registerListener(.listing_done, &rec, ListingRecorder.onDone);
+
+    const request_id = try h.core.listDefaultPath(7, item_mod.local_site_id);
+    try h.waitUntil(&rec, ListingRecorder.gotDone);
+
+    try testing.expectEqual(request_id, rec.request);
+    try testing.expect(rec.failure_class == null);
+    // The snapshot's path is the RESOLVED default, not the "" sentinel.
+    try testing.expectEqualStrings(norm, rec.path_buf[0..rec.path_len]);
+    try testing.expect(rec.saw_name);
 }
 
 test "listPath failure carries classified diagnostics, null snapshot" {

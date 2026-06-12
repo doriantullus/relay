@@ -1303,6 +1303,8 @@ fn paneContextMenu(_: ?*anyopaque, pane: *browser_mod.BrowserPane, row: ?usize) 
             menu_kit.Item.call("Delete", g_ui.commands.menuCallback(.delete_selection), "", .{}),
             .separator,
             menu_kit.Item.call("Transfer Selection", g_ui.commands.menuCallback(.transfer_selection), "", .{}),
+            .separator,
+            menu_kit.Item.call("Refresh", g_ui.commands.menuCallback(.refresh), "", .{}),
         };
         g_ui.pane_menu = menu_kit.buildContextMenu(g_ui.menu_reg, &items) catch null;
     }
@@ -1314,6 +1316,7 @@ fn paneContextMenu(_: ?*anyopaque, pane: *browser_mod.BrowserPane, row: ?usize) 
 const toolbar_items = [_]toolbar_mod.ItemSpec{
     .{ .identifier = "RelayBack", .label = "Back", .symbol = "chevron.left", .tooltip = "Back", .action = tbBack },
     .{ .identifier = "RelayForward", .label = "Forward", .symbol = "chevron.right", .tooltip = "Forward", .action = tbForward },
+    .{ .identifier = "RelayRefresh", .label = "Refresh", .symbol = "arrow.clockwise", .tooltip = "Refresh the focused pane (Cmd+R)", .action = tbRefresh },
     .{ .identifier = "RelayConnect", .label = "Connect", .symbol = "bolt.horizontal.circle", .tooltip = "Connect to Server (Cmd+K)", .action = tbConnect },
     .{ .identifier = "RelayView", .label = "View", .symbol = "slider.horizontal.3", .tooltip = "Row density", .menu_provider = tbViewMenu },
     toolbar_mod.flexibleSpace(),
@@ -1326,6 +1329,9 @@ fn tbBack(_: *anyopaque) void {
 }
 fn tbForward(_: *anyopaque) void {
     activeBrowser().goForward();
+}
+fn tbRefresh(_: *anyopaque) void {
+    activeBrowser().refresh();
 }
 fn tbConnect(_: *anyopaque) void {
     g_ui.sites.quickConnect();

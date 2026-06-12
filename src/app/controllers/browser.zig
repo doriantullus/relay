@@ -1217,10 +1217,20 @@ pub const BrowserPane = struct {
         if (slot == virtual_new_folder_row) return;
         const snap = pane.snapshot orelse return;
         if (slot >= snap.entries.len) return;
-        if (snap.entries[slot].kind != .dir) return; // M2: descend dirs only
+        const kind = snap.entries[slot].kind;
+        if (kind != .dir and kind != .symlink) return; // M2: descend, don't open files
         const name = pane.overlay.displayName(snap.entries, slot);
         const target = path_mod.join(pane.gpa, snap.path, name) catch return;
         defer pane.gpa.free(target);
+        if (kind == .symlink and !pane.isRemote()) {
+            // Local: one follow-stat picks dir-links to descend and keeps
+            // file-link behavior identical to plain files (no-op). Remote
+            // links descend optimistically instead — the server resolves
+            // them, and a file target surfaces the server's verbatim
+            // refusal in the pane banner.
+            const core = pane.controller.core;
+            if (!localPathIsDir(core.io, core.local_root, target)) return;
+        }
         pane.navigateTo(target, .push);
     }
 
@@ -2303,6 +2313,16 @@ pub const BrowserPane = struct {
         return any;
     }
 };
+
+/// Follow-stat through the core's local root: true when `abs` (a
+/// pane-coordinate absolute path) resolves to a directory, symlinks
+/// followed. Main-thread sync stat — local only, never a remote VFS.
+fn localPathIsDir(io: std.Io, root: std.Io.Dir, abs: []const u8) bool {
+    if (abs.len == 0 or abs[0] != '/') return false;
+    const sub: []const u8 = if (abs.len == 1) "." else abs[1..];
+    const st = root.statFile(io, sub, .{}) catch return false;
+    return st.kind == .directory;
+}
 
 // ---------------------------------------------------------------------------
 // BrowserController
@@ -3537,6 +3557,31 @@ test "prodConfirmAllowed: destructive click counts only while Cmd is held" {
     try testing.expect(!prodConfirmAllowed(true, false)); // click without Cmd
     try testing.expect(!prodConfirmAllowed(false, true)); // Cancel with Cmd
     try testing.expect(!prodConfirmAllowed(false, false));
+}
+
+test "localPathIsDir follows symlinks: dir-links descend, file-links don't" {
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(io, "d", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "x" });
+    tmp.dir.symLink(io, "d", "dlink", .{}) catch |err| switch (err) {
+        // Filesystems without symlink support skip the test body.
+        error.AccessDenied => return,
+        else => return err,
+    };
+    try tmp.dir.symLink(io, "f.txt", "flink", .{});
+    try tmp.dir.symLink(io, "gone", "dangling", .{});
+
+    try testing.expect(localPathIsDir(io, tmp.dir, "/d"));
+    try testing.expect(localPathIsDir(io, tmp.dir, "/dlink"));
+    try testing.expect(!localPathIsDir(io, tmp.dir, "/f.txt"));
+    try testing.expect(!localPathIsDir(io, tmp.dir, "/flink"));
+    try testing.expect(!localPathIsDir(io, tmp.dir, "/dangling"));
+    try testing.expect(!localPathIsDir(io, tmp.dir, "/missing"));
+    try testing.expect(!localPathIsDir(io, tmp.dir, "relative"));
+    try testing.expect(!localPathIsDir(io, tmp.dir, ""));
 }
 
 test "accentUiColor maps site accents to semantic colors" {

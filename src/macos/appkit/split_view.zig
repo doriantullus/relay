@@ -261,13 +261,6 @@ pub const SplitView = struct {
     fn extent(self: *SplitView, frame: NSRect) f64 {
         return if (self.horizontal) frame.size.width else frame.size.height;
     }
-
-    fn indexOfSubview(self: *SplitView, subview: c.id) ?usize {
-        for (self.children, 0..) |child, i| {
-            if (child.view == subview) return i;
-        }
-        return null;
-    }
 };
 
 // ---------------------------------------------------------------------------
@@ -303,7 +296,7 @@ fn helperConstrainMax(
     if (sv.children[next].collapsible) return proposed; // may collapse to 0
     const frame = sv.subviewFrame(next);
     const end = sv.origin(frame) + sv.extent(frame);
-    const thickness = sv.split.msgSend(f64, "dividerThickness", .{});
+    const thickness = sv.dividerThickness();
     return maxCoordinateForDivider(proposed, end, sv.children[next].min_size, thickness);
 }
 

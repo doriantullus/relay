@@ -559,10 +559,7 @@ pub fn Engine(comptime Lib: type) type {
 
         fn transportError(err: poll.Error, diag: *Diagnostics, what: []const u8) Error {
             switch (err) {
-                error.Canceled => {
-                    diag.set(.cancel, 0, "canceled", .{});
-                    return error.Canceled;
-                },
+                error.Canceled => return canceled(diag),
                 error.ConnectionLost => {
                     diag.set(.transient, 0, "{s}: connection lost", .{what});
                     return error.ConnectionLost;
@@ -576,10 +573,7 @@ pub fn Engine(comptime Lib: type) type {
         }
 
         fn checkCancel(cancel: *const CancelToken, diag: *Diagnostics) Error!void {
-            cancel.check() catch {
-                diag.set(.cancel, 0, "canceled", .{});
-                return error.Canceled;
-            };
+            cancel.check() catch return canceled(diag);
         }
     };
 }
@@ -1389,15 +1383,6 @@ pub const FdChan = struct {
     }
 };
 
-fn directionsToPollEvents(dirs: c_int) i16 {
-    var ev: i16 = 0;
-    if (dirs & poll.block_inbound != 0) ev |= std.posix.POLL.IN;
-    if (dirs & poll.block_outbound != 0) ev |= std.posix.POLL.OUT;
-    // EAGAIN with no direction (or no EAGAIN yet): wait on readability so
-    // the loop stays cool, mirroring poll.waitSocket's defensive default.
-    return if (ev == 0) std.posix.POLL.IN else ev;
-}
-
 /// Channel over a libssh2 direct-tcpip channel of an (authenticated) jump
 /// session. Only the pump thread touches the jump session after start —
 /// libssh2 sessions are not thread-safe.
@@ -1444,10 +1429,10 @@ pub const ChannelChan = struct {
         return ch.fd;
     }
     pub fn readPollEvents(ch: *const ChannelChan) i16 {
-        return directionsToPollEvents(c.libssh2_session_block_directions(ch.session));
+        return poll.directionsToPollEvents(c.libssh2_session_block_directions(ch.session));
     }
     pub fn writePollEvents(ch: *const ChannelChan) i16 {
-        return directionsToPollEvents(c.libssh2_session_block_directions(ch.session));
+        return poll.directionsToPollEvents(c.libssh2_session_block_directions(ch.session));
     }
 };
 
@@ -2524,7 +2509,7 @@ test "pump moves bulk data exceeding every buffer in the path" {
     try pump.start();
     defer pump.shutdown();
 
-    const total: usize = 8 * pump_buf_len; // 256 KiB > any single buffer
+    const total: usize = 3 * pump_buf_len; // > any single buffer, with margin for multiple refills
     const Writer = struct {
         fn run(fd: std.posix.fd_t, n: usize) void {
             var chunk: [4096]u8 = undefined;

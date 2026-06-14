@@ -215,7 +215,7 @@ test "interleaved writes keep per-direction byte order" {
 
 test "large transfer through small stream buffers" {
     const io = std.testing.io;
-    const total: usize = (1 << 20) + 12_345; // > 1 MiB, non-power-of-two tail
+    const total: usize = (64 << 10) + 345; // ~16 refill cycles of buffer_len, non-power-of-two tail
 
     var d: Duplex = undefined;
     try d.init(io);

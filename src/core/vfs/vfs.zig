@@ -62,6 +62,26 @@ pub const ListingSink = struct {
     }
 };
 
+/// Accumulates streamed listing batches into one arena-backed slice. Shared
+/// by the FTP and SFTP backends, whose non-streaming `list()` collects every
+/// batch before returning a snapshot. `failed` flips on arena OOM.
+pub const ListCollector = struct {
+    arena: std.mem.Allocator,
+    entries: std.ArrayList(Entry) = .empty,
+    failed: bool = false,
+
+    pub fn sink(self: *ListCollector) ListingSink {
+        return .{ .context = self, .batchFn = onBatch };
+    }
+
+    fn onBatch(ctx: *anyopaque, batch_entries: []const Entry) void {
+        const self: *ListCollector = @ptrCast(@alignCast(ctx));
+        self.entries.appendSlice(self.arena, batch_entries) catch {
+            self.failed = true;
+        };
+    }
+};
+
 pub const OpenMode = enum { create_truncate, create_resume, append };
 
 pub const Error = error{

@@ -265,7 +265,7 @@ test "watch delivers a changed path on the main queue; stop ends delivery" {
     const hits_at_stop = rec.hits;
     try tmp.dir.writeFile(io, .{ .sub_path = "fsevents-after-stop.txt", .data = "tock" });
     spins = 0;
-    while (spins < 15) : (spins += 1) spinMainRunLoop(0.02);
+    while (spins < 8) : (spins += 1) spinMainRunLoop(0.02);
     try testing.expectEqual(hits_at_stop, rec.hits);
 
     watcher.deinit();

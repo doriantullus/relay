@@ -179,6 +179,34 @@ pub fn keepAcrossPool(pool: *AutoreleasePool, result: c.id) c.id {
 }
 
 // ---------------------------------------------------------------------------
+// NSPasteboard
+// ---------------------------------------------------------------------------
+const NSPasteboardTypeString = @extern(*const c.id, .{ .name = "NSPasteboardTypeString" });
+
+/// Replace the general pasteboard's contents with `text` as a plain string.
+/// Runs in its own autorelease pool. Main thread only.
+pub fn writeStringToPasteboard(text: []const u8) void {
+    const pool = AutoreleasePool.init();
+    defer pool.deinit();
+    const pb = class("NSPasteboard").msgSend(objc.Object, "generalPasteboard", .{});
+    _ = pb.msgSend(NSInteger, "clearContents", .{});
+    _ = pb.msgSend(BOOL, "setString:forType:", .{ nsString(text), NSPasteboardTypeString.* });
+}
+
+// ---------------------------------------------------------------------------
+// AppKit text-attribute keys + drawing constants (shared by the custom
+// drawRect: views: table_source, outline_view, banner, tab_bar).
+// ---------------------------------------------------------------------------
+pub const NSFontAttributeName = @extern(*const c.id, .{ .name = "NSFontAttributeName" });
+pub const NSForegroundColorAttributeName = @extern(*const c.id, .{ .name = "NSForegroundColorAttributeName" });
+pub const NSParagraphStyleAttributeName = @extern(*const c.id, .{ .name = "NSParagraphStyleAttributeName" });
+
+/// NSLineBreakByTruncatingTail.
+pub const line_break_truncating_tail: NSInteger = 4;
+/// NSCompositingOperationSourceOver.
+pub const compositing_source_over: NSUInteger = 2;
+
+// ---------------------------------------------------------------------------
 // NSNotificationCenter (default center; object: is always nil — Relay uses
 // names + Zig-side state, not ObjC notification objects).
 // ---------------------------------------------------------------------------

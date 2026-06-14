@@ -750,7 +750,10 @@ test "parsers survive allocation failure" {
             pk.deinit();
         }
     };
-    inline for (.{ "id_ed25519", "id_rsa_3072", "id_ecdsa_p256" }) |name| {
+    // rsa-3072 is the allocation superset (key-data dupes); ed25519 covers the
+    // zero-dupe shape. ecdsa-p256 adds no distinct allocation site, so it is
+    // omitted here to keep this OOM replay cheap (it is still parse-tested above).
+    inline for (.{ "id_ed25519", "id_rsa_3072" }) |name| {
         const pem = try fixtures.load(t.allocator, name);
         defer t.allocator.free(pem);
         try t.checkAllAllocationFailures(t.allocator, Check.parsePriv, .{ pem, null });

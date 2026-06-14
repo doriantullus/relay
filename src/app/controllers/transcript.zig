@@ -233,148 +233,12 @@ pub const Model = struct {
 
 // ---------------------------------------------------------------------------
 // Shared AppKit control glue.
-// TODO(m2-dedupe): every selector below belongs in relay_mac
-// (appkit/controls.zig); parked here because this task must not touch
-// src/macos/root.zig. transfers.zig imports this namespace — keep it the
-// single copy.
 // ---------------------------------------------------------------------------
-pub const uiglue = struct {
-    // NSAutoresizingMaskOptions.
-    pub const mask_min_x_margin: NSUInteger = 1 << 0;
-    pub const mask_width_sizable: NSUInteger = 1 << 1;
-    pub const mask_max_x_margin: NSUInteger = 1 << 2;
-    pub const mask_min_y_margin: NSUInteger = 1 << 3;
-    pub const mask_height_sizable: NSUInteger = 1 << 4;
-    pub const mask_max_y_margin: NSUInteger = 1 << 5;
-
-    const ns_text_alignment_right: NSInteger = 1;
-    const ns_bezel_style_rounded: NSUInteger = 1;
-    const ns_control_size_small: NSUInteger = 1;
-
-    /// Plain container NSView (retain count 1, caller-owned).
-    pub fn makeView(frame: NSRect) objc.Object {
-        return foundation.class("NSView").msgSend(objc.Object, "alloc", .{})
-            .msgSend(objc.Object, "initWithFrame:", .{frame});
-    }
-
-    pub fn setAutoresizing(view: objc.Object, mask: NSUInteger) void {
-        view.msgSend(void, "setAutoresizingMask:", .{mask});
-    }
-
-    pub fn addSubview(parent: objc.Object, child: objc.Object) void {
-        parent.msgSend(void, "addSubview:", .{child});
-    }
-
-    pub fn setHidden(view: objc.Object, hidden: bool) void {
-        view.msgSend(void, "setHidden:", .{hidden});
-    }
-
-    pub fn setFrame(view: objc.Object, frame: NSRect) void {
-        view.msgSend(void, "setFrame:", .{frame});
-    }
-
-    pub fn release(obj: objc.Object) void {
-        obj.msgSend(void, "release", .{});
-    }
-
-    /// Retain an autoreleased id the caller wants to cache (e.g. an SF
-    /// Symbol NSImage). Null passes through.
-    pub fn retainId(maybe: ?c.id) ?c.id {
-        const id_val = maybe orelse return null;
-        _ = objc.Object.fromId(id_val).msgSend(c.id, "retain", .{});
-        return id_val;
-    }
-
-    pub fn releaseId(maybe: ?c.id) void {
-        const id_val = maybe orelse return;
-        objc.Object.fromId(id_val).msgSend(void, "release", .{});
-    }
-
-    /// Static label (retained, caller-owned).
-    pub fn makeLabel(text: []const u8, frame: NSRect, right_aligned: bool) objc.Object {
-        const label = foundation.class("NSTextField")
-            .msgSend(objc.Object, "labelWithString:", .{foundation.nsString(text)});
-        label.msgSend(void, "setFrame:", .{frame});
-        label.msgSend(void, "setFont:", .{foundation.systemFont(11)});
-        label.msgSend(void, "setTextColor:", .{foundation.secondaryLabelColor()});
-        if (right_aligned) label.msgSend(void, "setAlignment:", .{ns_text_alignment_right});
-        _ = label.msgSend(c.id, "retain", .{});
-        return label;
-    }
-
-    pub fn setLabelText(label: objc.Object, text: []const u8) void {
-        label.msgSend(void, "setStringValue:", .{foundation.nsString(text)});
-    }
-
-    /// Small rounded push button wired to `target`/`action` (caller-owned).
-    pub fn makeButton(title: []const u8, frame: NSRect, target: c.id, action: [:0]const u8) objc.Object {
-        const button = foundation.class("NSButton").msgSend(objc.Object, "alloc", .{})
-            .msgSend(objc.Object, "initWithFrame:", .{frame});
-        button.msgSend(void, "setTitle:", .{foundation.nsString(title)});
-        button.msgSend(void, "setBezelStyle:", .{ns_bezel_style_rounded});
-        button.msgSend(void, "setControlSize:", .{ns_control_size_small});
-        button.msgSend(void, "setFont:", .{foundation.systemFont(11)});
-        button.msgSend(void, "setTarget:", .{target});
-        button.msgSend(void, "setAction:", .{objc.sel(action)});
-        return button;
-    }
-
-    /// Select-one segmented control (caller-owned), segment 0 selected.
-    pub fn makeSegmented(labels: []const []const u8, frame: NSRect, target: c.id, action: [:0]const u8) objc.Object {
-        const seg = foundation.class("NSSegmentedControl").msgSend(objc.Object, "alloc", .{})
-            .msgSend(objc.Object, "initWithFrame:", .{frame});
-        seg.msgSend(void, "setSegmentCount:", .{@as(NSInteger, @intCast(labels.len))});
-        for (labels, 0..) |label, i| setSegmentLabel(seg, i, label);
-        seg.msgSend(void, "setControlSize:", .{ns_control_size_small});
-        seg.msgSend(void, "setSelectedSegment:", .{@as(NSInteger, 0)});
-        seg.msgSend(void, "setTarget:", .{target});
-        seg.msgSend(void, "setAction:", .{objc.sel(action)});
-        return seg;
-    }
-
-    pub fn setSegmentLabel(seg: objc.Object, index: usize, label: []const u8) void {
-        seg.msgSend(void, "setLabel:forSegment:", .{
-            foundation.nsString(label), @as(NSInteger, @intCast(index)),
-        });
-    }
-
-    pub fn selectedSegment(seg: objc.Object) NSInteger {
-        return seg.msgSend(NSInteger, "selectedSegment", .{});
-    }
-
-    /// Empty pull-down-less popup button (caller-owned).
-    pub fn makePopup(frame: NSRect, target: c.id, action: [:0]const u8) objc.Object {
-        const popup = foundation.class("NSPopUpButton").msgSend(objc.Object, "alloc", .{})
-            .msgSend(objc.Object, "initWithFrame:pullsDown:", .{ frame, false });
-        popup.msgSend(void, "setControlSize:", .{ns_control_size_small});
-        popup.msgSend(void, "setFont:", .{foundation.systemFont(11)});
-        popup.msgSend(void, "setTarget:", .{target});
-        popup.msgSend(void, "setAction:", .{objc.sel(action)});
-        return popup;
-    }
-
-    pub fn popupAddItem(popup: objc.Object, title: []const u8) void {
-        popup.msgSend(void, "addItemWithTitle:", .{foundation.nsString(title)});
-    }
-
-    pub fn popupSelectedIndex(popup: objc.Object) NSInteger {
-        return popup.msgSend(NSInteger, "indexOfSelectedItem", .{});
-    }
-
-    const NSDefaultRunLoopMode = @extern(*const c.id, .{ .name = "NSDefaultRunLoopMode" });
-
-    /// Pump the current runloop for up to `seconds` (visual smoke tests).
-    pub fn runLoopSpin(seconds: f64) void {
-        const pool = foundation.AutoreleasePool.init();
-        defer pool.deinit();
-        const run_loop = foundation.class("NSRunLoop").msgSend(objc.Object, "currentRunLoop", .{});
-        const date = foundation.class("NSDate")
-            .msgSend(objc.Object, "dateWithTimeIntervalSinceNow:", .{seconds});
-        _ = run_loop.msgSend(c.BOOL, "runMode:beforeDate:", .{
-            objc.Object.fromId(NSDefaultRunLoopMode.*), date,
-        });
-    }
-};
+/// The shared AppKit control kit now lives in relay_mac. Re-exported under
+/// the historical `uiglue` name so transfers.zig (which imports it) and
+/// this file keep working. The two retained/target-action builders are
+/// `makeFieldLabel` and `makeEmptyPopup` (see appkit/controls.zig).
+pub const uiglue = mac.appkit.controls;
 
 // ---------------------------------------------------------------------------
 // Controller — AppKit view layer (main thread only).
@@ -382,7 +246,6 @@ pub const uiglue = struct {
 
 const NSFontAttributeName = @extern(*const c.id, .{ .name = "NSFontAttributeName" });
 const NSForegroundColorAttributeName = @extern(*const c.id, .{ .name = "NSForegroundColorAttributeName" });
-const NSPasteboardTypeString = @extern(*const c.id, .{ .name = "NSPasteboardTypeString" });
 
 var g_target_class: ?runtime.DefinedClass = null;
 
@@ -491,7 +354,7 @@ pub const TranscriptController = struct {
         // Top bar: filter popup + Copy All + Save…; pinned to the top edge.
         self.bar = uiglue.makeView(foundation.rect(0, default_h - bar_h, default_w, bar_h));
         uiglue.setAutoresizing(self.bar, uiglue.mask_width_sizable | uiglue.mask_min_y_margin);
-        self.popup = uiglue.makePopup(
+        self.popup = uiglue.makeEmptyPopup(
             foundation.rect(8, 3, 190, 22),
             self.target.value,
             "relayTranscriptFilter:",
@@ -668,12 +531,7 @@ pub const TranscriptController = struct {
     fn copyAll(self: *TranscriptController) void {
         const text = self.model.visibleText(self.gpa, self.filter) catch return;
         defer self.gpa.free(text);
-        // TODO(m2-dedupe): NSPasteboard glue → relay_mac.
-        const pb = foundation.class("NSPasteboard").msgSend(objc.Object, "generalPasteboard", .{});
-        _ = pb.msgSend(NSInteger, "clearContents", .{});
-        _ = pb.msgSend(c.BOOL, "setString:forType:", .{
-            foundation.nsString(text), NSPasteboardTypeString.*,
-        });
+        foundation.writeStringToPasteboard(text);
     }
 
     fn beginSave(self: *TranscriptController) void {

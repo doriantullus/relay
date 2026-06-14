@@ -117,9 +117,9 @@ pub fn hitTest(x: f64, y: f64, count: usize, bounds_w: f64) Hit {
     return .none;
 }
 
-const NSFontAttributeName = @extern(*const c.id, .{ .name = "NSFontAttributeName" });
-const NSForegroundColorAttributeName = @extern(*const c.id, .{ .name = "NSForegroundColorAttributeName" });
-const NSParagraphStyleAttributeName = @extern(*const c.id, .{ .name = "NSParagraphStyleAttributeName" });
+const NSFontAttributeName = foundation.NSFontAttributeName;
+const NSForegroundColorAttributeName = foundation.NSForegroundColorAttributeName;
+const NSParagraphStyleAttributeName = foundation.NSParagraphStyleAttributeName;
 
 // ---------------------------------------------------------------------------
 // Runtime class (defined once, shared across every TabBar instance).

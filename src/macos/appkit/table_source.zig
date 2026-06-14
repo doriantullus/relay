@@ -25,6 +25,7 @@ const drag = @import("drag.zig");
 // stub.)
 // ---------------------------------------------------------------------------
 const foundation = @import("../foundation.zig");
+const runtime = @import("../runtime.zig");
 
 pub const NSInteger = foundation.NSInteger; // i64: LP64 long, encoder emits 'q'
 pub const NSUInteger = foundation.NSUInteger;
@@ -34,6 +35,14 @@ pub const NSRect = foundation.NSRect;
 pub const NSRange = foundation.NSRange;
 pub const rect = foundation.rect;
 pub const getClass = foundation.class;
+pub const keepAcrossPool = foundation.keepAcrossPool; // re-export for sibling appkit modules
+
+// AppKit text-attribute keys + draw constants, re-exported for sibling modules.
+pub const NSFontAttributeName = foundation.NSFontAttributeName;
+pub const NSForegroundColorAttributeName = foundation.NSForegroundColorAttributeName;
+pub const NSParagraphStyleAttributeName = foundation.NSParagraphStyleAttributeName;
+pub const line_break_truncating_tail = foundation.line_break_truncating_tail;
+pub const compositing_source_over = foundation.compositing_source_over;
 
 /// NSNotFound (== NSIntegerMax) as seen through NSUInteger-returning APIs.
 pub const ns_not_found: NSUInteger = @intCast(std.math.maxInt(NSInteger));
@@ -207,20 +216,16 @@ fn stateFromIvar(comptime T: type, target: c.id, ivar: c.Ivar) *T {
     return @ptrCast(@alignCast(raw));
 }
 
-/// Integers ride in id-sized ivars as (value+1)<<3 so the fake pointer stays
-/// non-null and 8-byte aligned (Debug @ptrFromInt checks both).
-pub fn indexToIvar(index: usize) c.id {
-    return @ptrFromInt((index + 1) << 3);
-}
+// Integer-in-ivar codec — delegates to the canonical implementation in
+// runtime.zig (the ivar-state convention home). Names are kept so the call
+// sites here and in outline_view.zig stay untouched.
+pub const indexToIvar = runtime.idFromUsize;
 
 pub fn indexFromIvar(raw: usize) ?usize {
-    if (raw == 0) return null;
-    return (raw >> 3) - 1;
+    return runtime.usizeFromId(@ptrFromInt(raw));
 }
 
-fn readIndexIvar(target: c.id, ivar: c.Ivar) ?usize {
-    return indexFromIvar(@intFromPtr(c.object_getIvar(target, ivar)));
-}
+const readIndexIvar = runtime.ivarUsize;
 
 /// Idempotent; must run on the main thread before the first instance.
 pub fn ensureClasses() void {
@@ -564,10 +569,7 @@ fn helperViewForColumnRow(
         objc.Object.fromId(view).msgSend(void, "setNeedsDisplay:", .{true});
         result = view;
     }
-    if (result) |v| _ = objc.Object.fromId(v).msgSend(c.id, "retain", .{});
-    pool.deinit();
-    if (result) |v| _ = objc.Object.fromId(v).msgSend(c.id, "autorelease", .{});
-    return result;
+    return foundation.keepAcrossPool(pool, result);
 }
 
 fn helperSortDescriptorsDidChange(target: c.id, _: c.SEL, table_id: c.id, _: c.id) callconv(.c) void {
@@ -689,10 +691,7 @@ fn tableMenuForEvent(target: c.id, _: c.SEL, event_id: c.id) callconv(.c) c.id {
         }
         result = hook(tv.ds.ctx, if (row < 0) null else @intCast(row)) orelse null;
     }
-    if (result) |m| _ = objc.Object.fromId(m).msgSend(c.id, "retain", .{});
-    pool.deinit();
-    if (result) |m| _ = objc.Object.fromId(m).msgSend(c.id, "autorelease", .{});
-    return result;
+    return foundation.keepAcrossPool(pool, result);
 }
 
 // ---------------------------------------------------------------------------
@@ -712,14 +711,8 @@ fn cellSetBackgroundStyle(target: c.id, _: c.SEL, style: NSInteger) callconv(.c)
     objc.Object.fromId(target).msgSend(void, "setNeedsDisplay:", .{true});
 }
 
-const NSFontAttributeName = @extern(*const c.id, .{ .name = "NSFontAttributeName" });
-const NSForegroundColorAttributeName = @extern(*const c.id, .{ .name = "NSForegroundColorAttributeName" });
-const NSParagraphStyleAttributeName = @extern(*const c.id, .{ .name = "NSParagraphStyleAttributeName" });
-const line_break_truncating_tail: NSInteger = 4; // NSLineBreakByTruncatingTail
-
 const h_pad: f64 = 8;
 const icon_text_gap: f64 = 6;
-const compositing_source_over: NSUInteger = 2;
 
 fn cellDrawRect(target: c.id, _: c.SEL, _: NSRect) callconv(.c) void {
     const pool = objc.AutoreleasePool.init();

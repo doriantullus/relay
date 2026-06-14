@@ -250,22 +250,7 @@ pub const SftpVfs = struct {
         };
     }
 
-    const ListCollector = struct {
-        arena: Allocator,
-        entries: std.ArrayList(vfs.Entry) = .empty,
-        failed: bool = false,
-
-        fn sink(c: *ListCollector) vfs.ListingSink {
-            return .{ .context = c, .batchFn = onBatch };
-        }
-
-        fn onBatch(ctx: *anyopaque, batch: []const vfs.Entry) void {
-            const c: *ListCollector = @ptrCast(@alignCast(ctx));
-            c.entries.appendSlice(c.arena, batch) catch {
-                c.failed = true;
-            };
-        }
-    };
+    const ListCollector = vfs.ListCollector;
 
     // ------------------------------------------------------------------ //
     // Transfer streams (transfer lease held for the stream's lifetime)

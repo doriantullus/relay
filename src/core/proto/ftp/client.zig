@@ -349,7 +349,7 @@ pub const FtpClient = struct {
         const r = try self.readReply(io, cancel, diag);
         if (r.code != 213) return self.replyError(diag, r);
         const text = std.mem.trim(u8, r.lines[0], " \t");
-        return parseTimeVal(text) orelse {
+        return mlsd.parseTimeVal(text) orelse {
             diag.set(.permanent, 213, "unparseable MDTM reply: \"{s}\"", .{r.lines[0]});
             return error.ProtocolViolation;
         };
@@ -1037,31 +1037,6 @@ fn parse257Path(text: []const u8, out: []u8) ?[]u8 {
         i += 1;
     }
     return null; // unterminated quote
-}
-
-/// RFC 3659 time-val: YYYYMMDDHHMMSS with optional ".frac" (truncated).
-/// (listing_mlsd.zig has the same logic for the `modify` fact, but keeps it
-/// private; the civil-time helpers are shared.)
-fn parseTimeVal(val: []const u8) ?i64 {
-    const core = if (std.mem.indexOfScalar(u8, val, '.')) |dot| val[0..dot] else val;
-    if (core.len != 14) return null;
-    for (core) |c| if (!std.ascii.isDigit(c)) return null;
-    const year = digits(i64, core[0..4]);
-    const month: u8 = @intCast(digits(u16, core[4..6]));
-    const day: u8 = @intCast(digits(u16, core[6..8]));
-    const hour = digits(u32, core[8..10]);
-    const minute = digits(u32, core[10..12]);
-    const second = digits(u32, core[12..14]);
-    if (month < 1 or month > 12) return null;
-    if (day < 1 or day > mlsd.daysInMonth(year, month)) return null;
-    if (hour > 23 or minute > 59 or second > 59) return null;
-    return mlsd.epochFromCivil(year, month, day, hour, minute, second);
-}
-
-fn digits(comptime T: type, s: []const u8) T {
-    var v: T = 0;
-    for (s) |c| v = v * 10 + (c - '0');
-    return v;
 }
 
 // ---------------------------------------------------------------------------

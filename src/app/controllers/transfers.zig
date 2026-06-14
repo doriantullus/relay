@@ -61,17 +61,8 @@ const TransferState = events_mod.TransferState;
 // Formatting helpers (pure; headless-tested)
 // ---------------------------------------------------------------------------
 
-/// "532 B", "1.5 KB", "2.4 MB" — one decimal below 10 units, whole above.
-pub fn humanBytes(buf: []u8, bytes: u64) []const u8 {
-    const units = [_][]const u8{ "B", "KB", "MB", "GB", "TB", "PB" };
-    if (bytes < 1024) return std.fmt.bufPrint(buf, "{d} B", .{bytes}) catch "";
-    var value: f64 = @floatFromInt(bytes);
-    var unit: usize = 0;
-    while (value >= 1024 and unit + 1 < units.len) : (unit += 1) value /= 1024;
-    if (value < 10)
-        return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ value, units[unit] }) catch "";
-    return std.fmt.bufPrint(buf, "{d:.0} {s}", .{ value, units[unit] }) catch "";
-}
+/// Shared with browser.zig and others via src/app/format.zig.
+pub const humanBytes = @import("../format.zig").humanBytes;
 
 /// "2.4 MB/s"; zero renders as an em dash (idle).
 pub fn humanRate(buf: []u8, bytes_per_s: u64) []const u8 {
@@ -843,7 +834,7 @@ pub const TransfersController = struct {
         self.resume_btn = uiglue.makeButton("Resume All", foundation.rect(390, 4, 94, 22), self.target.value, "relayTransfersResumeAll:");
         self.retry_btn = uiglue.makeButton("Retry Failed", foundation.rect(490, 4, 96, 22), self.target.value, "relayTransfersRetryFailed:");
         self.clear_btn = uiglue.makeButton("Clear Completed", foundation.rect(592, 4, 120, 22), self.target.value, "relayTransfersClearCompleted:");
-        self.agg_label = uiglue.makeLabel("Idle", foundation.rect(default_w - 158, 8, 150, 16), true);
+        self.agg_label = uiglue.makeFieldLabel("Idle", foundation.rect(default_w - 158, 8, 150, 16), true);
         uiglue.setAutoresizing(self.agg_label, uiglue.mask_min_x_margin);
 
         // Bandwidth limits toggle (the strip below carries the controls).
@@ -1454,16 +1445,7 @@ fn fContextMenu(ctx: *anyopaque, row: ?usize) ?c.id {
 // ---------------------------------------------------------------------------
 const testing = std.testing;
 
-test "humanBytes formatting" {
-    var buf: [32]u8 = undefined;
-    try testing.expectEqualStrings("0 B", humanBytes(&buf, 0));
-    try testing.expectEqualStrings("532 B", humanBytes(&buf, 532));
-    try testing.expectEqualStrings("1.5 KB", humanBytes(&buf, 1536));
-    try testing.expectEqualStrings("250 KB", humanBytes(&buf, 256_000));
-    try testing.expectEqualStrings("2.4 MB", humanBytes(&buf, 2_516_582));
-    try testing.expectEqualStrings("5.0 MB", humanBytes(&buf, 5 * 1024 * 1024));
-    try testing.expectEqualStrings("3.0 GB", humanBytes(&buf, 3 * 1024 * 1024 * 1024));
-}
+// humanBytes itself is tested in src/app/format.zig (shared helper).
 
 test "humanRate formatting" {
     var buf: [32]u8 = undefined;

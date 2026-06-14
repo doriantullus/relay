@@ -450,234 +450,12 @@ pub fn countShortcut(key: []const u8, mods: menu.Modifiers) usize {
 // ---------------------------------------------------------------------------
 // Control kit — small AppKit control builders shared by the prefs window and
 // the inspector panel.
-//
-// TODO(m2-dedupe): this section belongs in relay_mac (an appkit/controls.zig)
-// so its selector strings live in the wrapper layer; it sits here until the
-// wrapper module grows a controls file (same convention as the shared ABI
-// helpers in table_source.zig and app_delegate's setDelegate: note). Nothing
-// outside this section sends raw selectors.
 // ---------------------------------------------------------------------------
-
-pub const controls = struct {
-    const ns_control_state_on: NSInteger = 1;
-    const button_type_switch: NSUInteger = 3; // NSButtonTypeSwitch
-    const button_type_radio: NSUInteger = 4; // NSButtonTypeRadio
-    const bezel_style_rounded: NSUInteger = 1; // NSBezelStyleRounded
-    const line_break_truncate_middle: NSUInteger = 5; // NSLineBreakByTruncatingMiddle
-    const text_alignment_right: NSInteger = 1; // NSTextAlignmentRight
-
-    pub const LabelStyle = struct {
-        bold: bool = false,
-        secondary: bool = false,
-        small: bool = false,
-        right: bool = false,
-        selectable: bool = false,
-        truncate_middle: bool = false,
-    };
-
-    pub fn addSubview(parent: objc.Object, child: objc.Object) void {
-        parent.msgSend(void, "addSubview:", .{child});
-    }
-
-    pub fn release(obj: objc.Object) void {
-        obj.msgSend(void, "release", .{});
-    }
-
-    /// Non-editable text label (autoreleased; a superview must retain it).
-    pub fn makeLabel(text: []const u8, frame: foundation.NSRect, style: LabelStyle) objc.Object {
-        const label = foundation.class("NSTextField")
-            .msgSend(objc.Object, "labelWithString:", .{foundation.nsString(text)});
-        label.msgSend(void, "setFrame:", .{frame});
-        if (style.right) label.msgSend(void, "setAlignment:", .{text_alignment_right});
-        if (style.selectable) label.msgSend(void, "setSelectable:", .{true});
-        if (style.truncate_middle) label.msgSend(void, "setLineBreakMode:", .{line_break_truncate_middle});
-        const font_size: foundation.CGFloat = if (style.small)
-            foundation.smallSystemFontSize()
-        else
-            foundation.systemFontSize();
-        const font = if (style.bold)
-            foundation.boldSystemFont(font_size)
-        else
-            foundation.systemFont(font_size);
-        label.msgSend(void, "setFont:", .{font});
-        if (style.secondary) label.msgSend(void, "setTextColor:", .{foundation.secondaryLabelColor()});
-        return label;
-    }
-
-    pub fn setLabelText(label: objc.Object, text: []const u8) void {
-        label.msgSend(void, "setStringValue:", .{foundation.nsString(text)});
-    }
-
-    pub fn makeCheckbox(title: []const u8, frame: foundation.NSRect) objc.Object {
-        const button = foundation.class("NSButton").msgSend(objc.Object, "alloc", .{})
-            .msgSend(objc.Object, "initWithFrame:", .{frame})
-            .msgSend(objc.Object, "autorelease", .{});
-        button.msgSend(void, "setButtonType:", .{button_type_switch});
-        button.msgSend(void, "setTitle:", .{foundation.nsString(title)});
-        return button;
-    }
-
-    /// Radio button; AppKit groups radios sharing one target+action.
-    pub fn makeRadio(title: []const u8, frame: foundation.NSRect) objc.Object {
-        const button = foundation.class("NSButton").msgSend(objc.Object, "alloc", .{})
-            .msgSend(objc.Object, "initWithFrame:", .{frame})
-            .msgSend(objc.Object, "autorelease", .{});
-        button.msgSend(void, "setButtonType:", .{button_type_radio});
-        button.msgSend(void, "setTitle:", .{foundation.nsString(title)});
-        return button;
-    }
-
-    pub fn makePushButton(title: []const u8, frame: foundation.NSRect) objc.Object {
-        const button = foundation.class("NSButton").msgSend(objc.Object, "alloc", .{})
-            .msgSend(objc.Object, "initWithFrame:", .{frame})
-            .msgSend(objc.Object, "autorelease", .{});
-        button.msgSend(void, "setBezelStyle:", .{bezel_style_rounded});
-        button.msgSend(void, "setTitle:", .{foundation.nsString(title)});
-        return button;
-    }
-
-    pub fn makeSlider(frame: foundation.NSRect, min: f64, max: f64, value: f64) objc.Object {
-        const slider = foundation.class("NSSlider").msgSend(objc.Object, "alloc", .{})
-            .msgSend(objc.Object, "initWithFrame:", .{frame})
-            .msgSend(objc.Object, "autorelease", .{});
-        slider.msgSend(void, "setMinValue:", .{min});
-        slider.msgSend(void, "setMaxValue:", .{max});
-        slider.msgSend(void, "setDoubleValue:", .{value});
-        slider.msgSend(void, "setContinuous:", .{true});
-        return slider;
-    }
-
-    pub fn makeTextField(frame: foundation.NSRect, initial: []const u8) objc.Object {
-        const field = foundation.class("NSTextField").msgSend(objc.Object, "alloc", .{})
-            .msgSend(objc.Object, "initWithFrame:", .{frame})
-            .msgSend(objc.Object, "autorelease", .{});
-        if (initial.len > 0) field.msgSend(void, "setStringValue:", .{foundation.nsString(initial)});
-        return field;
-    }
-
-    pub fn makePopup(frame: foundation.NSRect, options: []const []const u8) objc.Object {
-        const popup = foundation.class("NSPopUpButton").msgSend(objc.Object, "alloc", .{})
-            .msgSend(objc.Object, "initWithFrame:pullsDown:", .{ frame, false })
-            .msgSend(objc.Object, "autorelease", .{});
-        for (options) |option| {
-            popup.msgSend(void, "addItemWithTitle:", .{foundation.nsString(option)});
-        }
-        return popup;
-    }
-
-    pub fn isChecked(control: objc.Object) bool {
-        return control.msgSend(NSInteger, "state", .{}) == ns_control_state_on;
-    }
-
-    pub fn setChecked(control: objc.Object, on: bool) void {
-        control.msgSend(void, "setState:", .{@as(NSInteger, if (on) 1 else 0)});
-    }
-
-    pub fn sliderValue(slider: objc.Object) f64 {
-        return slider.msgSend(f64, "doubleValue", .{});
-    }
-
-    pub fn setSliderValue(slider: objc.Object, value: f64) void {
-        slider.msgSend(void, "setDoubleValue:", .{value});
-    }
-
-    /// UTF-8 copy of an NSControl's stringValue, owned by `gpa`.
-    pub fn textValue(gpa: Allocator, control: objc.Object) Allocator.Error![]u8 {
-        return foundation.utf8FromNSString(gpa, control.msgSend(objc.Object, "stringValue", .{}));
-    }
-
-    pub fn setTextValue(control: objc.Object, text: []const u8) void {
-        control.msgSend(void, "setStringValue:", .{foundation.nsString(text)});
-    }
-
-    pub fn popupIndex(popup: objc.Object) NSInteger {
-        return popup.msgSend(NSInteger, "indexOfSelectedItem", .{});
-    }
-
-    pub fn setPopupIndex(popup: objc.Object, index: NSInteger) void {
-        popup.msgSend(void, "selectItemAtIndex:", .{index});
-    }
-
-    pub fn setEnabled(control: objc.Object, enabled: bool) void {
-        control.msgSend(void, "setEnabled:", .{enabled});
-    }
-
-    pub fn isEnabled(control: objc.Object) bool {
-        return foundation.toBool(control.msgSend(foundation.BOOL, "isEnabled", .{}));
-    }
-
-    pub fn setHidden(view: objc.Object, hidden: bool) void {
-        view.msgSend(void, "setHidden:", .{hidden});
-    }
-
-    pub fn isHidden(view: objc.Object) bool {
-        return foundation.toBool(view.msgSend(foundation.BOOL, "isHidden", .{}));
-    }
-
-    // --- shared target/action dispatcher (mirrors menu.Registry) ----------
-
-    pub const ControlAction = struct {
-        ctx: ?*anyopaque = null,
-        f: *const fn (ctx: ?*anyopaque, sender: c.id) void,
-    };
-
-    var g_target_class: ?runtime.DefinedClass = null;
-
-    fn targetClass() runtime.DefinedClass {
-        if (g_target_class) |dc| return dc;
-        const dc = runtime.defineClass("RelayControlTarget", "NSObject", &.{}, .{
-            .{ "relayControlChanged:", controlChangedImp },
-        }) catch @panic("prefs/controls: failed to define RelayControlTarget");
-        g_target_class = dc;
-        return dc;
-    }
-
-    fn controlChangedImp(target: c.id, _: c.SEL, sender: c.id) callconv(.c) void {
-        const pool = foundation.AutoreleasePool.init();
-        defer pool.deinit();
-        const self = targetClass().state(ControlTarget, target);
-        const tag = objc.Object.fromId(sender).msgSend(NSInteger, "tag", .{});
-        if (tag < 0 or tag >= @as(NSInteger, @intCast(self.entries.items.len))) return;
-        const action = self.entries.items[@intCast(tag)];
-        action.f(action.ctx, sender);
-    }
-
-    /// Owns the tag→action table + the shared target instance. One per
-    /// controller; must outlive every control wired against it.
-    pub const ControlTarget = struct {
-        gpa: Allocator,
-        entries: std.ArrayList(ControlAction) = .empty,
-        target: objc.Object,
-
-        pub fn create(gpa: Allocator) Allocator.Error!*ControlTarget {
-            const self = try gpa.create(ControlTarget);
-            self.* = .{ .gpa = gpa, .target = undefined };
-            self.target = targetClass().newWithState(self);
-            return self;
-        }
-
-        pub fn destroy(self: *ControlTarget) void {
-            self.target.msgSend(void, "release", .{});
-            self.entries.deinit(self.gpa);
-            const gpa = self.gpa;
-            gpa.destroy(self);
-        }
-
-        /// Route `control`'s action to `f(ctx, sender)` (tag-dispatched).
-        pub fn wire(
-            self: *ControlTarget,
-            control: objc.Object,
-            ctx: ?*anyopaque,
-            f: *const fn (?*anyopaque, c.id) void,
-        ) Allocator.Error!void {
-            const tag: NSInteger = @intCast(self.entries.items.len);
-            try self.entries.append(self.gpa, .{ .ctx = ctx, .f = f });
-            control.msgSend(void, "setTag:", .{tag});
-            control.msgSend(void, "setTarget:", .{self.target});
-            control.msgSend(void, "setAction:", .{objc.sel("relayControlChanged:")});
-        }
-    };
-};
+/// The shared AppKit control kit now lives in relay_mac (selectors stay in
+/// the wrapper layer). Re-exported here so existing call sites — and the
+/// inspector/palette/transfers controllers that import `prefs.controls` —
+/// keep working unchanged.
+pub const controls = mac.appkit.controls;
 
 // ---------------------------------------------------------------------------
 // UI-only preferences (ui.zon). Core knobs (connections, rate limits, hidden
@@ -766,26 +544,7 @@ pub fn loadUiPrefs(io: std.Io, dir: std.Io.Dir, gpa: Allocator) error{OutOfMemor
     out.download_dir = try gpa.dupe(u8, parsed.download_dir);
     out.session.pane0_path = try gpa.dupe(u8, parsed.session.pane0_path);
     out.session.pane1_path = try gpa.dupe(u8, parsed.session.pane1_path);
-    // Dup the tabs array + each tab's path strings.
-    if (parsed.session.tabs.len > 0) {
-        const tabs = try gpa.alloc(TabState, parsed.session.tabs.len);
-        errdefer gpa.free(tabs);
-        var done: usize = 0;
-        errdefer for (tabs[0..done]) |*t| {
-            gpa.free(t.pane0_path);
-            gpa.free(t.pane1_path);
-        };
-        for (parsed.session.tabs, 0..) |src, i| {
-            tabs[i] = src;
-            tabs[i].pane0_path = "";
-            tabs[i].pane1_path = "";
-            tabs[i].pane0_path = try gpa.dupe(u8, src.pane0_path);
-            errdefer gpa.free(tabs[i].pane0_path);
-            tabs[i].pane1_path = try gpa.dupe(u8, src.pane1_path);
-            done = i + 1;
-        }
-        out.session.tabs = tabs;
-    }
+    out.session.tabs = try dupTabStates(gpa, parsed.session.tabs);
     return out;
 }
 
@@ -818,6 +577,30 @@ pub fn freeTabStates(gpa: Allocator, tabs: []TabState) void {
         gpa.free(t.pane1_path);
     }
     if (tabs.len > 0) gpa.free(tabs);
+}
+
+/// Deep-copy a TabState slice: the array plus each tab's path strings.
+/// Returns &.{} for empty input (no allocation). Mirror of freeTabStates;
+/// fully unwinds its partial allocations on OOM.
+fn dupTabStates(gpa: Allocator, src: []const TabState) error{OutOfMemory}![]TabState {
+    if (src.len == 0) return &.{};
+    const tabs = try gpa.alloc(TabState, src.len);
+    errdefer gpa.free(tabs);
+    var done: usize = 0;
+    errdefer for (tabs[0..done]) |*t| {
+        gpa.free(t.pane0_path);
+        gpa.free(t.pane1_path);
+    };
+    for (src, 0..) |s, i| {
+        tabs[i] = s;
+        tabs[i].pane0_path = "";
+        tabs[i].pane1_path = "";
+        tabs[i].pane0_path = try gpa.dupe(u8, s.pane0_path);
+        errdefer gpa.free(tabs[i].pane0_path);
+        tabs[i].pane1_path = try gpa.dupe(u8, s.pane1_path);
+        done = i + 1;
+    }
+    return tabs;
 }
 
 /// Crash-safe persist (temp file + fsync + rename, via settings.zig).
@@ -996,26 +779,7 @@ pub const PrefsController = struct {
         errdefer self.gpa.free(p0);
         const p1 = try self.gpa.dupe(u8, session.pane1_path);
         errdefer self.gpa.free(p1);
-        // Dup the tabs array.
-        var new_tabs: []TabState = &.{};
-        if (session.tabs.len > 0) {
-            new_tabs = try self.gpa.alloc(TabState, session.tabs.len);
-            errdefer self.gpa.free(new_tabs);
-            var done: usize = 0;
-            errdefer for (new_tabs[0..done]) |*t| {
-                self.gpa.free(t.pane0_path);
-                self.gpa.free(t.pane1_path);
-            };
-            for (session.tabs, 0..) |src, i| {
-                new_tabs[i] = src;
-                new_tabs[i].pane0_path = "";
-                new_tabs[i].pane1_path = "";
-                new_tabs[i].pane0_path = try self.gpa.dupe(u8, src.pane0_path);
-                errdefer self.gpa.free(new_tabs[i].pane0_path);
-                new_tabs[i].pane1_path = try self.gpa.dupe(u8, src.pane1_path);
-                done = i + 1;
-            }
-        }
+        const new_tabs = try dupTabStates(self.gpa, session.tabs);
         // Free old state AFTER all allocations succeed.
         self.gpa.free(self.ui.session.pane0_path);
         self.gpa.free(self.ui.session.pane1_path);
@@ -1718,6 +1482,10 @@ test "PrefsController: every setter persists immediately and fires listeners" {
     var counter: ChangeCounter = .{};
     try pc.addChangeListener(&counter, ChangeCounter.onChanged);
 
+    // With nothing set yet, the effective download dir falls back to ~/Downloads.
+    var fb_buf: [1024]u8 = undefined;
+    try testing.expect(std.mem.endsWith(u8, pc.effectiveDownloadDir(&fb_buf), "/Downloads"));
+
     // Core settings: persisted via AppCore.saveSettings → settings.zon.
     pc.setConnectionsPerSite(7);
     try testing.expectEqual(@as(u8, 7), h.core.settings.connections_per_site);
@@ -1773,18 +1541,6 @@ test "PrefsController: every setter persists immediately and fires listeners" {
     // Effective download dir honors the explicit setting.
     var buf: [1024]u8 = undefined;
     try testing.expectEqualStrings("/tmp/relay-downloads", pc.effectiveDownloadDir(&buf));
-}
-
-test "PrefsController: effective download dir falls back to ~/Downloads" {
-    var h: TestHarness = undefined;
-    try h.start();
-    defer h.stop();
-
-    const pc = try PrefsController.create(testing.allocator, h.core);
-    defer pc.destroy();
-    var buf: [1024]u8 = undefined;
-    const dir = pc.effectiveDownloadDir(&buf);
-    try testing.expect(std.mem.endsWith(u8, dir, "/Downloads"));
 }
 
 const ControlProbe = struct {

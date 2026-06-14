@@ -495,12 +495,7 @@ pub const Engine = struct {
     }
 
     /// Pending + failed items in persistable form, slices owned by `alloc`.
-    pub fn persistSnapshot(self: *Engine, alloc: std.mem.Allocator) error{OutOfMemory}!persist.PersistedQueue {
-        self.lock();
-        defer self.unlock();
-        return self.persistSnapshotLocked(alloc);
-    }
-
+    /// Callers hold the engine lock (timer tick + shutdown save path).
     fn persistSnapshotLocked(self: *Engine, alloc: std.mem.Allocator) error{OutOfMemory}!persist.PersistedQueue {
         var list: std.ArrayList(persist.PersistedItem) = .empty;
         defer list.deinit(alloc);

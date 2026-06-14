@@ -1069,10 +1069,8 @@ fn dataClose(ctx: *anyopaque) void {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// See events.zig for the 0.16 lock-choice rationale.
-fn lockSpin(m: *std.atomic.Mutex) void {
-    while (!m.tryLock()) std.atomic.spinLoopHint();
-}
+/// See sync.zig for the 0.16 lock-choice rationale.
+const lockSpin = relay.sync.lockSpin;
 
 fn copyClamped(buf: []u8, src: []const u8) usize {
     const n = @min(src.len, buf.len);

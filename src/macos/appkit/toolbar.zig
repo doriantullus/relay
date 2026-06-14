@@ -188,10 +188,7 @@ fn identifiersImp(target: c.id) c.id {
     {
         result = tb.identifierArray().value;
     }
-    if (result) |v| _ = objc.Object.fromId(v).msgSend(c.id, "retain", .{});
-    pool.deinit();
-    if (result) |v| _ = objc.Object.fromId(v).msgSend(c.id, "autorelease", .{});
-    return result;
+    return ts.keepAcrossPool(pool, result);
 }
 
 fn helperAllowedIdentifiers(target: c.id, _: c.SEL, _: c.id) callconv(.c) c.id {
@@ -255,10 +252,7 @@ fn helperItemForIdentifier(
             }
         }
     }
-    if (result) |v| _ = objc.Object.fromId(v).msgSend(c.id, "retain", .{});
-    pool.deinit();
-    if (result) |v| _ = objc.Object.fromId(v).msgSend(c.id, "autorelease", .{});
-    return result;
+    return ts.keepAcrossPool(pool, result);
 }
 
 fn helperOnAction(target: c.id, _: c.SEL, sender: c.id) callconv(.c) void {

@@ -13,9 +13,7 @@ const cancel_mod = @import("../cancel.zig");
 
 const ns_per_s: i128 = std.time.ns_per_s;
 
-fn lockSpin(m: *std.atomic.Mutex) void {
-    while (!m.tryLock()) std.atomic.spinLoopHint();
-}
+const lockSpin = @import("../sync.zig").lockSpin;
 
 fn nowNs(io: std.Io) i96 {
     return std.Io.Clock.awake.now(io).nanoseconds;

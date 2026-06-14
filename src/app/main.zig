@@ -38,6 +38,7 @@ pub const bridge = @import("bridge.zig");
 pub const factories = @import("factories.zig");
 pub const app_delegate = @import("app_delegate.zig");
 pub const fuzzy = @import("fuzzy.zig");
+pub const format = @import("format.zig");
 pub const temp_cache = @import("temp_cache.zig");
 pub const controllers = struct {
     pub const browser = @import("controllers/browser.zig");
@@ -88,7 +89,6 @@ const CancelToken = relay.cancel.CancelToken;
 const Allocator = std.mem.Allocator;
 const gpa = std.heap.c_allocator;
 
-const window_title = "Relay";
 const default_frame = foundation.rect(0, 0, 1240, 780);
 
 pub const Mode = enum { normal, smoke, smoke_sftp };
@@ -327,7 +327,7 @@ fn buildUi() !void {
     g_ui.menu_reg = try menu_kit.Registry.create(gpa);
     g_ui.commands = try prefs_mod.CommandRegistry.create(gpa);
 
-    g_ui.win = windowkit.Window.create(default_frame, window_title, windowkit.StyleMask.standard);
+    g_ui.win = windowkit.Window.create(default_frame, prefs_mod.app_name, windowkit.StyleMask.standard);
     _ = g_ui.win.setFrameAutosaveName("RelayMainWindow");
 
     g_ui.prefs = try prefs_mod.PrefsController.create(gpa, core);
@@ -774,10 +774,7 @@ fn paneSelection(
         return .{ .pane_token = pane.token(), .site_id = site_id };
     var items: std.ArrayList(inspector_mod.SelectedItem) = .empty;
     for (pane.table.selectedRows()) |row| {
-        if (row >= pane.visible.items.len) continue;
-        const slot = pane.visible.items[row];
-        if (slot == browser_mod.virtual_new_folder_row or slot >= snap.entries.len) continue;
-        const entry = &snap.entries[slot];
+        const entry = pane.entryAtRow(row) orelse continue;
         const full_path = path_mod.join(arena, snap.path, entry.name) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidPath => continue, // overlong/garbled name: skip the row
@@ -1067,10 +1064,8 @@ fn quickLookPane(pane: *browser_mod.BrowserPane) bool {
     if (site_id == item_mod.local_site_id) {
         var paths: std.ArrayList([]const u8) = .empty;
         for (pane.table.selectedRows()) |row| {
-            if (row >= pane.visible.items.len) continue;
-            const slot = pane.visible.items[row];
-            if (slot == browser_mod.virtual_new_folder_row or slot >= snap.entries.len) continue;
-            const full = path_mod.join(arena, snap.path, snap.entries[slot].name) catch continue;
+            const entry = pane.entryAtRow(row) orelse continue;
+            const full = path_mod.join(arena, snap.path, entry.name) catch continue;
             paths.append(arena, full) catch return false;
         }
         if (paths.items.len == 0) return false;
@@ -1082,10 +1077,7 @@ fn quickLookPane(pane: *browser_mod.BrowserPane) bool {
     // Remote: preview the first selected FILE through the temp cache.
     const cache = if (g_ui.cache) |*c| c else return false;
     const row = pane.table.selectedRow() orelse return false;
-    if (row >= pane.visible.items.len) return false;
-    const slot = pane.visible.items[row];
-    if (slot == browser_mod.virtual_new_folder_row or slot >= snap.entries.len) return false;
-    const entry = &snap.entries[slot];
+    const entry = pane.entryAtRow(row) orelse return false;
     if (entry.kind != .file) return false;
     const full = path_mod.join(arena, snap.path, entry.name) catch return false;
     if (full.len > g_preview_pending.path_buf.len) return false;
@@ -1209,10 +1201,7 @@ fn cmdEditExternal(_: ?*anyopaque) void {
     const snap = pane.snapshot orelse return;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     for (pane.table.selectedRows()) |row| {
-        if (row >= pane.visible.items.len) continue;
-        const slot = pane.visible.items[row];
-        if (slot == browser_mod.virtual_new_folder_row or slot >= snap.entries.len) continue;
-        const entry = &snap.entries[slot];
+        const entry = pane.entryAtRow(row) orelse continue;
         if (entry.kind != .file) continue;
         const abs = std.fmt.bufPrint(&buf, "{s}/{s}", .{ snap.path, entry.name }) catch continue;
         _ = g_ui.edit.openLocalFile(abs);
@@ -1232,10 +1221,7 @@ fn collectEditTargets(
     if (site_id == item_mod.local_site_id) return;
     const snap = pane.snapshot orelse return;
     for (pane.table.selectedRows()) |row| {
-        if (row >= pane.visible.items.len) continue;
-        const slot = pane.visible.items[row];
-        if (slot == browser_mod.virtual_new_folder_row or slot >= snap.entries.len) continue;
-        const entry = &snap.entries[slot];
+        const entry = pane.entryAtRow(row) orelse continue;
         if (entry.kind != .file) continue;
         try out.append(arena, .{
             .site_id = site_id,
@@ -1263,10 +1249,7 @@ fn terminalContext(_: ?*anyopaque, buf: []u8) ?terminal_mod.RemoteContext {
     };
     const snap = pane.snapshot orelse return out;
     const row = pane.table.selectedRow() orelse return out;
-    if (row >= pane.visible.items.len) return out;
-    const slot = pane.visible.items[row];
-    if (slot == browser_mod.virtual_new_folder_row or slot >= snap.entries.len) return out;
-    const entry = &snap.entries[slot];
+    const entry = pane.entryAtRow(row) orelse return out;
     out.selected_path = path_mod.join(a, snap.path, entry.name) catch return out;
     out.selected_is_dir = entry.kind == .dir;
     return out;
@@ -2123,5 +2106,6 @@ test {
     _ = controllers.palette;
     _ = controllers.terminal;
     _ = fuzzy;
+    _ = format;
     _ = temp_cache;
 }

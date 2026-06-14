@@ -18,9 +18,7 @@ const vfs_mod = @import("../vfs/vfs.zig");
 const diag_mod = @import("../diag.zig");
 const cancel_mod = @import("../cancel.zig");
 
-fn lockSpin(m: *std.atomic.Mutex) void {
-    while (!m.tryLock()) std.atomic.spinLoopHint();
-}
+const lockSpin = @import("../sync.zig").lockSpin;
 
 pub const Op = enum { default_path, stat, list, open_read, open_write, read, write, mkdir, remove, rename, chmod };
 

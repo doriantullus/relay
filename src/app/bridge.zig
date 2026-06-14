@@ -912,8 +912,6 @@ pub const AppCore = struct {
     fn postListingFailure(self: *AppCore, request_id: RequestId, failure: events_mod.Failure) void {
         self.postEvent(.{ .listing_done = .{
             .request_id = request_id,
-            .entry_count = 0,
-            .snapshot = @ptrCast(&listing_event_placeholder),
             .failure = failure,
         } });
     }
@@ -1316,12 +1314,6 @@ fn disconnectWorker(rt: *SiteRuntime) void {
 // Listing worker
 // ---------------------------------------------------------------------------
 
-/// `listing_batch`/failed-`listing_done` CoreEvents carry this placeholder
-/// in their non-optional `snapshot` field; it is NEVER a DirSnapshot. The
-/// real snapshot travels via the bridge's pending-listing table and is
-/// delivered in the enriched `ListingDone` payload.
-var listing_event_placeholder: u8 = 0;
-
 const ListingJob = struct {
     core: *AppCore,
     request_id: RequestId,
@@ -1383,7 +1375,6 @@ const TeeSink = struct {
         self.job.core.postEvent(.{ .listing_batch = .{
             .request_id = self.job.request_id,
             .entry_count = @intCast(@min(self.builder.count(), std.math.maxInt(u32))),
-            .snapshot = @ptrCast(&listing_event_placeholder),
         } });
     }
 };
@@ -1516,8 +1507,6 @@ fn listWorker(job: *ListingJob) void {
     job.sort_index = sort_index;
     core.postEvent(.{ .listing_done = .{
         .request_id = job.request_id,
-        .entry_count = @intCast(@min(snap.entries.len, std.math.maxInt(u32))),
-        .snapshot = @ptrCast(snap),
     } });
 }
 
@@ -1589,11 +1578,9 @@ fn opWorker(job: *OpJob) void {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// See events.zig for why a one-word spin mutex is the 0.16 lock of choice
+/// See sync.zig for why a one-word spin mutex is the 0.16 lock of choice
 /// for these nanosecond-window critical sections.
-fn lockSpin(m: *std.atomic.Mutex) void {
-    while (!m.tryLock()) std.atomic.spinLoopHint();
-}
+const lockSpin = relay.sync.lockSpin;
 
 fn clampConns(v: u8) u8 {
     return @max(1, @min(v, 8));

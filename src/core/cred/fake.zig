@@ -120,9 +120,7 @@ fn composeKey(gpa: std.mem.Allocator, key: store.Key) error{OutOfMemory}![]u8 {
     });
 }
 
-fn lockSpin(m: *std.atomic.Mutex) void {
-    while (!m.tryLock()) std.atomic.spinLoopHint();
-}
+const lockSpin = @import("../sync.zig").lockSpin;
 
 const test_key: store.Key = .{
     .protocol = .sftp,

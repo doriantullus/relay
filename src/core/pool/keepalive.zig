@@ -47,7 +47,7 @@ pub fn sweep(pool: *SitePool, io: std.Io) void {
         pool.mutex.unlock(io);
         return;
     }
-    for (pool.transfers[0..pool.transfers.len]) |*slot| {
+    for (&pool.transfers) |*slot| {
         if (slot.state != .idle) continue;
         if (timeout_ns > 0 and now - slot.last_used_ns >= timeout_ns) {
             reaped[reaped_n] = slot.conn;
@@ -57,7 +57,7 @@ pub fn sweep(pool: *SitePool, io: std.Io) void {
         }
     }
     maybePin(&pool.browse, now, interval_ns, &pinned, &pinned_n);
-    for (pool.transfers[0..pool.transfers.len]) |*slot| {
+    for (&pool.transfers) |*slot| {
         maybePin(slot, now, interval_ns, &pinned, &pinned_n);
     }
     if (reaped_n > 0) pool.cond.broadcast(io);

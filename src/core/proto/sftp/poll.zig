@@ -98,6 +98,16 @@ pub fn pumpBounded(
     }
 }
 
+/// Map libssh2 block directions to poll(2) events. Defensive: EAGAIN with no
+/// reported direction (never observed) polls for readability so callers' loops
+/// stay cancelable, not hot.
+pub fn directionsToPollEvents(directions: c_int) i16 {
+    var events: i16 = 0;
+    if (directions & block_inbound != 0) events |= std.posix.POLL.IN;
+    if (directions & block_outbound != 0) events |= std.posix.POLL.OUT;
+    return if (events == 0) std.posix.POLL.IN else events;
+}
+
 /// One bounded poll(2) on the session socket. Timeouts are not errors —
 /// the caller simply retries the libssh2 call (which re-yields EAGAIN);
 /// error/hangup revents are also left for libssh2 to read and classify.
@@ -106,13 +116,7 @@ pub fn waitSocket(
     directions: c_int,
     cancel: *const CancelToken,
 ) Error!void {
-    var events: i16 = 0;
-    if (directions & block_inbound != 0) events |= std.posix.POLL.IN;
-    if (directions & block_outbound != 0) events |= std.posix.POLL.OUT;
-    // Defensive: EAGAIN with no reported direction (never observed) —
-    // poll for readability so the loop stays cancelable, not hot.
-    if (events == 0) events = std.posix.POLL.IN;
-
+    const events = directionsToPollEvents(directions);
     var fds = [1]std.posix.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
     _ = std.posix.poll(&fds, poll_interval_ms) catch return error.ConnectionLost;
     try cancel.check();

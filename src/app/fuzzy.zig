@@ -324,16 +324,6 @@ pub const Frecency = struct {
         }
     }
 
-    /// Visit every (key, entry) pair, insertion-ordered. `f` must not
-    /// mutate the store.
-    pub fn each(
-        self: *const Frecency,
-        ctx: anytype,
-        comptime f: fn (@TypeOf(ctx), key: []const u8, entry: FrecencyEntry) void,
-    ) void {
-        for (self.map.keys(), self.map.values()) |key, entry| f(ctx, key, entry);
-    }
-
     /// Load `dir/sub_path`; a missing or corrupt file leaves the store
     /// empty (the settings.zon degradation policy). Only OOM propagates.
     pub fn load(

@@ -1143,7 +1143,7 @@ fn parseDuck(a: Allocator, text: []const u8) error{OutOfMemory}!?ImportedSite {
 // SitesController
 // ---------------------------------------------------------------------------
 
-const MenuKind = enum(usize) { servers, servers_connected, ssh, history, background };
+const MenuKind = enum(usize) { servers, servers_connected, ssh, history, history_connected, background };
 const menu_kind_count = @typeInfo(MenuKind).@"enum".fields.len;
 
 const TransientCred = struct {
@@ -1409,7 +1409,7 @@ pub const SitesController = struct {
         const kind: MenuKind = if (item) |sr| switch (sr.section) {
             section_servers => self.serversMenuKind(sr.row),
             section_ssh => .ssh,
-            section_history => .history,
+            section_history => self.historyMenuKind(sr.row),
             else => MenuKind.background,
         } else .background;
         const m = self.menus[@intFromEnum(kind)] orelse return null;
@@ -1424,6 +1424,18 @@ pub const SitesController = struct {
         return switch (status) {
             .connected, .reconnecting => .servers_connected,
             .offline => .servers,
+        };
+    }
+
+    /// History rows carry the connected site's id (the row that shows the
+    /// status dot), so a connected one gets the Disconnect-bearing variant —
+    /// the same "Disconnect on connected rows" rule the Servers rows follow.
+    fn historyMenuKind(self: *const SitesController, row: usize) MenuKind {
+        if (row >= self.history.entries.items.len) return .history;
+        const status = self.statuses.get(self.history.entries.items[row].site_id) orelse return .history;
+        return switch (status) {
+            .connected, .reconnecting => .history_connected,
+            .offline => .history,
         };
     }
 
@@ -1471,6 +1483,17 @@ pub const SitesController = struct {
         };
         self.menus[@intFromEnum(MenuKind.history)] = try menu_mod.buildContextMenu(reg, &history_items);
 
+        // Connected/reconnecting history rows get the same menu plus Disconnect.
+        const history_connected_items = [_]menu_mod.Item{
+            menu_mod.Item.call("Connect", .{ .ctx = self, .f = cmConnect }, "", .{}),
+            menu_mod.Item.call("Disconnect", .{ .ctx = self, .f = cmDisconnect }, "", .{}),
+            .separator,
+            menu_mod.Item.call("Remove from History", .{ .ctx = self, .f = cmRemoveHistory }, "", .{}),
+            menu_mod.Item.call("Clear History", .{ .ctx = self, .f = cmClearHistory }, "", .{}),
+        };
+        self.menus[@intFromEnum(MenuKind.history_connected)] =
+            try menu_mod.buildContextMenu(reg, &history_connected_items);
+
         const background_items = [_]menu_mod.Item{
             menu_mod.Item.call("Add Site…", .{ .ctx = self, .f = cmAddSite }, "", .{}),
             menu_mod.Item.call("Refresh SSH Config", .{ .ctx = self, .f = cmRefreshSsh }, "", .{}),
@@ -1490,9 +1513,15 @@ pub const SitesController = struct {
     fn cmDisconnect(ctx: ?*anyopaque) void {
         const self = fromMenuCtx(ctx);
         const sr = self.clicked orelse return;
-        if (sr.section != section_servers) return;
-        const entry = self.store.persistedAt(sr.row) orelse return;
-        self.disconnectSite(entry.site.id);
+        const site_id = switch (sr.section) {
+            section_servers => (self.store.persistedAt(sr.row) orelse return).site.id,
+            section_history => blk: {
+                if (sr.row >= self.history.entries.items.len) return;
+                break :blk self.history.entries.items[sr.row].site_id;
+            },
+            else => return,
+        };
+        self.disconnectSite(site_id);
     }
 
     fn cmEdit(ctx: ?*anyopaque) void {
@@ -3341,6 +3370,55 @@ test "controller: servers context menu swaps to the Disconnect variant by status
 
     // cmDisconnect drops only the pane bindings pointing at the clicked
     // site (others must survive for Cmd+Shift+K).
+    try ctrl.pane_sites.put(ctrl.gpa, 0, 7);
+    try ctrl.pane_sites.put(ctrl.gpa, 1, 8);
+    ctrl.clicked = sr;
+    SitesController.cmDisconnect(ctrl);
+    try testing.expectEqual(@as(?u64, null), ctrl.pane_sites.get(0));
+    try testing.expectEqual(@as(?u64, 8), ctrl.pane_sites.get(1));
+}
+
+test "controller: history context menu offers Disconnect on a connected row" {
+    var h: Harness = undefined;
+    try h.start(.{ .sites = &.{.{
+        .id = 7,
+        .name = "box",
+        .protocol = .sftp,
+        .host = "box.example",
+        .account = "root",
+    }} });
+
+    const ctrl = try SitesController.create(testing.allocator, h.core, .{
+        .window = null,
+        .home = "/nonexistent-relay-home",
+        .build_sidebar = true,
+        .sidebar_autosave = null,
+    });
+    defer ctrl.destroy();
+    defer h.stop();
+
+    // A history entry pointing at site 7 (as a connect would record).
+    try ctrl.history.push(7, "box", "/srv");
+
+    const ctx: *anyopaque = @ptrCast(ctrl);
+    const plain = ctrl.menus[@intFromEnum(MenuKind.history)].?.value;
+    const connected = ctrl.menus[@intFromEnum(MenuKind.history_connected)].?.value;
+    const sr: outline_mod.SectionRow = .{ .section = section_history, .row = 0 };
+
+    // Offline / no status → the plain menu (no Disconnect).
+    try testing.expectEqual(plain, SitesController.dsContextMenu(ctx, sr).?);
+
+    ctrl.onSiteStatus(.{ .site_id = 7, .status = .connected, .reason = "" });
+    try testing.expectEqual(connected, SitesController.dsContextMenu(ctx, sr).?);
+
+    ctrl.onSiteStatus(.{ .site_id = 7, .status = .reconnecting, .reason = "" });
+    try testing.expectEqual(connected, SitesController.dsContextMenu(ctx, sr).?);
+
+    ctrl.onSiteStatus(.{ .site_id = 7, .status = .offline, .reason = "test" });
+    try testing.expectEqual(plain, SitesController.dsContextMenu(ctx, sr).?);
+
+    // cmDisconnect on the connected history row drops that site's pane bindings.
+    ctrl.onSiteStatus(.{ .site_id = 7, .status = .connected, .reason = "" });
     try ctrl.pane_sites.put(ctrl.gpa, 0, 7);
     try ctrl.pane_sites.put(ctrl.gpa, 1, 8);
     ctrl.clicked = sr;

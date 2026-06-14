@@ -500,22 +500,6 @@ pub fn detectTerminal() ?TerminalApp {
     return null;
 }
 
-// --- NSPasteboard write.
-//
-// TODO(m2-dedupe): NSPasteboard glue → relay_mac (transcript.zig precedent).
-
-const NSPasteboardTypeString = @extern(*const c.id, .{ .name = "NSPasteboardTypeString" });
-
-fn clipboardWrite(text: []const u8) void {
-    const pool = foundation.AutoreleasePool.init();
-    defer pool.deinit();
-    const pb = foundation.class("NSPasteboard").msgSend(objc.Object, "generalPasteboard", .{});
-    _ = pb.msgSend(foundation.NSInteger, "clearContents", .{});
-    _ = pb.msgSend(c.BOOL, "setString:forType:", .{
-        foundation.nsString(text), NSPasteboardTypeString.*,
-    });
-}
-
 // ---------------------------------------------------------------------------
 // Controller
 // ---------------------------------------------------------------------------
@@ -813,7 +797,7 @@ pub const TerminalController = struct {
         };
 
         self.replaceOwned(&self.last_copied, text);
-        if (!self.headless) clipboardWrite(text);
+        if (!self.headless) foundation.writeStringToPasteboard(text);
         return true;
     }
 
@@ -1296,16 +1280,9 @@ test "controller: copyAs builds the right payload per kind and protocol" {
     try testing.expect(!ctrl.copyAsChecked(.scp));
     try testing.expect(!ctrl.copyAsChecked(.rsync));
     try testing.expect(!ctrl.copyAsChecked(.sftp_url));
-}
 
-test "controller: menu surface + registry guards compile pre-integration" {
-    var h: Harness = undefined;
-    try h.start(null);
-    defer h.stop();
-
-    const ctrl = try TerminalController.create(testing.allocator, h.core, .{ .headless = true });
-    defer ctrl.destroy();
-
+    // Menu surface + registry guards (static; independent of pane/site state,
+    // so they ride along on this controller instead of spinning up a new core).
     const item = ctrl.serverMenuItem();
     try testing.expectEqualStrings("Open in Terminal", item.leaf.title);
     try testing.expectEqualStrings("t", item.leaf.key);

@@ -41,8 +41,8 @@ const dismiss_edge: f64 = 20;
 const dismiss_trailing_pad: f64 = 4;
 const font_size: f64 = 12;
 const tint_alpha: f64 = 0.15;
-const compositing_source_over: NSUInteger = 2;
-const line_break_truncating_tail: NSInteger = 4; // NSLineBreakByTruncatingTail
+const compositing_source_over = foundation.compositing_source_over;
+const line_break_truncating_tail = foundation.line_break_truncating_tail;
 
 /// Max bytes of reason text retained for drawing. Diagnostic messages are
 /// short; anything longer is truncated at the byte level (and again
@@ -66,9 +66,9 @@ pub const Kind = enum {
     }
 };
 
-const NSFontAttributeName = @extern(*const c.id, .{ .name = "NSFontAttributeName" });
-const NSForegroundColorAttributeName = @extern(*const c.id, .{ .name = "NSForegroundColorAttributeName" });
-const NSParagraphStyleAttributeName = @extern(*const c.id, .{ .name = "NSParagraphStyleAttributeName" });
+const NSFontAttributeName = foundation.NSFontAttributeName;
+const NSForegroundColorAttributeName = foundation.NSForegroundColorAttributeName;
+const NSParagraphStyleAttributeName = foundation.NSParagraphStyleAttributeName;
 
 const symbol_name: [*:0]const u8 = "exclamationmark.triangle.fill";
 

@@ -68,18 +68,15 @@ pub const CoreEvent = union(enum) {
 
     pub const ListingBatch = struct {
         request_id: u64,
-        /// Entries appended to the snapshot by this batch.
+        /// Entries parsed so far (progress count). The actual snapshot is
+        /// delivered out-of-band via the bridge's pending-listing table.
         entry_count: u32,
-        /// Refcounted *DirSnapshot once vfs/snapshot.zig lands; opaque for now.
-        snapshot: *anyopaque,
     };
 
     pub const ListingDone = struct {
         request_id: u64,
-        /// Total entries in the finished snapshot.
-        entry_count: u32,
-        snapshot: *anyopaque,
-        /// null on success.
+        /// null on success. The finished snapshot is delivered out-of-band
+        /// via the bridge's pending-listing table, not this event.
         failure: ?Failure = null,
     };
 
@@ -126,16 +123,8 @@ pub const CoreEvent = union(enum) {
     };
 };
 
-/// Lock choice: producers (pool workers, libssh2/LibreSSL poll loops) and
-/// the AppKit main thread do not share an `Io`, which rules out
-/// `std.Io.Mutex` (lock/unlock take `io` and park on its futex), and 0.16
-/// has no io-free blocking mutex (`std.Thread.Mutex` is gone). That leaves
-/// `std.atomic.Mutex` — a one-word try-lock — so we spin with
-/// `spinLoopHint`. Critical sections here are a few word writes plus an
-/// arena bump allocation, so contention windows are nanoseconds.
-fn lockSpin(m: *std.atomic.Mutex) void {
-    while (!m.tryLock()) std.atomic.spinLoopHint();
-}
+/// One-word spin mutex; see sync.zig for the 0.16 lock-choice rationale.
+const lockSpin = @import("sync.zig").lockSpin;
 
 /// MPSC double-buffered event queue. Producers append to the active buffer
 /// under the lock; `drain` (main thread only) swaps buffers and returns the
@@ -239,8 +228,6 @@ fn dupeEvent(arena: std.mem.Allocator, event: CoreEvent) error{OutOfMemory}!Core
         .listing_batch, .transfer_progress => event,
         .listing_done => |e| .{ .listing_done = .{
             .request_id = e.request_id,
-            .entry_count = e.entry_count,
-            .snapshot = e.snapshot,
             .failure = try dupeFailure(arena, e.failure),
         } },
         .transfer_state => |e| .{ .transfer_state = .{

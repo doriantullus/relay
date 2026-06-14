@@ -530,10 +530,7 @@ fn helperViewForItem(target: c.id, _: c.SEL, _: c.id, _: c.id, item: c.id) callc
         objc.Object.fromId(view).msgSend(void, "setNeedsDisplay:", .{true});
         result = view;
     }
-    if (result) |v| _ = objc.Object.fromId(v).msgSend(c.id, "retain", .{});
-    pool.deinit();
-    if (result) |v| _ = objc.Object.fromId(v).msgSend(c.id, "autorelease", .{});
-    return result;
+    return ts.keepAcrossPool(pool, result);
 }
 
 fn helperSelectionDidChange(target: c.id, _: c.SEL, _: c.id) callconv(.c) void {
@@ -607,10 +604,7 @@ fn outlineMenuForEvent(target: c.id, _: c.SEL, event_id: c.id) callconv(.c) c.id
         }
         result = hook(ov.ds.ctx, sr) orelse null;
     }
-    if (result) |m| _ = objc.Object.fromId(m).msgSend(c.id, "retain", .{});
-    pool.deinit();
-    if (result) |m| _ = objc.Object.fromId(m).msgSend(c.id, "autorelease", .{});
-    return result;
+    return ts.keepAcrossPool(pool, result);
 }
 
 // ---------------------------------------------------------------------------
@@ -620,17 +614,17 @@ fn cellIsFlipped(_: c.id, _: c.SEL) callconv(.c) c.BOOL {
     return 1;
 }
 
-const NSFontAttributeName = @extern(*const c.id, .{ .name = "NSFontAttributeName" });
-const NSForegroundColorAttributeName = @extern(*const c.id, .{ .name = "NSForegroundColorAttributeName" });
-const NSParagraphStyleAttributeName = @extern(*const c.id, .{ .name = "NSParagraphStyleAttributeName" });
-const line_break_truncating_tail: NSInteger = 4; // NSLineBreakByTruncatingTail
+const NSFontAttributeName = ts.NSFontAttributeName;
+const NSForegroundColorAttributeName = ts.NSForegroundColorAttributeName;
+const NSParagraphStyleAttributeName = ts.NSParagraphStyleAttributeName;
+const line_break_truncating_tail = ts.line_break_truncating_tail;
 
 const h_pad: f64 = 6;
 const icon_edge: f64 = 15;
 const icon_text_gap: f64 = 6;
 const status_dot_diameter: f64 = 7;
 const status_dot_gap: f64 = 6;
-const compositing_source_over: NSUInteger = 2;
+const compositing_source_over = ts.compositing_source_over;
 
 fn cellDrawRect(target: c.id, _: c.SEL, _: NSRect) callconv(.c) void {
     const pool = objc.AutoreleasePool.init();

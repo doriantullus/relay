@@ -145,9 +145,7 @@ pub const Transcript = struct {
     }
 };
 
-fn lockSpin(m: *std.atomic.Mutex) void {
-    while (!m.tryLock()) std.atomic.spinLoopHint();
-}
+const lockSpin = @import("../sync.zig").lockSpin;
 
 /// Copies `line` into `dst` (truncating to `dst.len`), masking secret
 /// material:

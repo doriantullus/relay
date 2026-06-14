@@ -11,6 +11,7 @@ pub const version: std.SemanticVersion = .{ .major = 0, .minor = 1, .patch = 0 }
 
 pub const diag = @import("diag.zig");
 pub const cancel = @import("cancel.zig");
+pub const sync = @import("sync.zig");
 pub const events = @import("events.zig");
 
 pub const transcript = @import("log/transcript.zig");
@@ -88,6 +89,7 @@ test "module sanity" {
 test {
     _ = diag;
     _ = cancel;
+    _ = sync;
     _ = events;
     _ = transcript;
     _ = settings;

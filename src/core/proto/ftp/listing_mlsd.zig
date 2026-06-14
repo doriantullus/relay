@@ -168,8 +168,9 @@ pub fn parseAll(
 }
 
 /// RFC 3659 time-val: YYYYMMDDHHMMSS with optional ".frac" (truncated).
-/// Returns null on any malformed or out-of-range field.
-fn parseTimeVal(val: []const u8) ?i64 {
+/// Returns null on any malformed or out-of-range field. Also used by
+/// client.zig's MDTM parse (same wire format).
+pub fn parseTimeVal(val: []const u8) ?i64 {
     const core = if (std.mem.indexOfScalar(u8, val, '.')) |dot| val[0..dot] else val;
     if (core.len != 14) return null;
     for (core) |c| if (!std.ascii.isDigit(c)) return null;

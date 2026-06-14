@@ -332,16 +332,8 @@ pub fn formatCount(buf: []u8, n: u64) []const u8 {
     return buf[0..total];
 }
 
-pub fn humanBytes(buf: []u8, n: u64) []const u8 {
-    if (n < 1024) return std.fmt.bufPrint(buf, "{d} B", .{n}) catch buf[0..0];
-    const units = [_][]const u8{ "KB", "MB", "GB", "TB", "PB" };
-    var value = @as(f64, @floatFromInt(n)) / 1024.0;
-    var unit: usize = 0;
-    while (value >= 1024.0 and unit + 1 < units.len) : (unit += 1) value /= 1024.0;
-    if (value < 10.0)
-        return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ value, units[unit] }) catch buf[0..0];
-    return std.fmt.bufPrint(buf, "{d:.0} {s}", .{ value, units[unit] }) catch buf[0..0];
-}
+/// Shared with transfers.zig and others via src/app/format.zig.
+pub const humanBytes = @import("../format.zig").humanBytes;
 
 /// Size column: "—" for directories, blank for unknown, human bytes else.
 pub fn formatSize(buf: []u8, is_dir: bool, size: ?u64) []const u8 {
@@ -800,12 +792,7 @@ const chrome = struct {
 
     /// vim 'y': the selection's full path onto the general pasteboard.
     fn copyToPasteboard(text_value: []const u8) void {
-        const pb = foundation.class("NSPasteboard").msgSend(objc.Object, "generalPasteboard", .{});
-        _ = pb.msgSend(foundation.NSInteger, "clearContents", .{});
-        _ = pb.msgSend(foundation.BOOL, "setString:forType:", .{
-            foundation.nsString(text_value),
-            foundation.nsString("public.utf8-plain-text"), // NSPasteboardTypeString
-        });
+        foundation.writeStringToPasteboard(text_value);
     }
 
     fn release(obj: objc.Object) void {
@@ -1071,6 +1058,19 @@ pub const BrowserPane = struct {
 
     pub fn token(pane: *const BrowserPane) bridge.PaneToken {
         return pane.pane_token;
+    }
+
+    /// The directory entry shown at visible-list `row`, or null when the row
+    /// is out of range, the virtual "new folder" row, or the pane has no
+    /// snapshot. Centralizes the row → slot → entry resolution that the
+    /// main.zig selection / Quick Look / edit / terminal seams would
+    /// otherwise each open-code.
+    pub fn entryAtRow(pane: *const BrowserPane, row: usize) ?*const vfs_mod.Entry {
+        const snap = pane.snapshot orelse return null;
+        if (row >= pane.visible.items.len) return null;
+        const slot = pane.visible.items[row];
+        if (slot == virtual_new_folder_row or slot >= snap.entries.len) return null;
+        return &snap.entries[slot];
     }
 
     /// True when this pane currently hosts a connected remote site (not the
@@ -2558,8 +2558,10 @@ pub const BrowserController = struct {
         self.bindRemoteToPane(self.panes[1].token(), site_id, initial_path);
     }
 
-    pub fn unbindRemote(self: *BrowserController) void {
-        const pane = self.panes[1];
+    /// Reset a home-remote pane to the empty "Not connected" state: drop the
+    /// site binding and the listing, keep the remote role. (A home-local pane
+    /// that role-switched goes through restoreLocalRole instead.)
+    fn unbindRemotePane(self: *BrowserController, pane: *BrowserPane) void {
         pane.site = null;
         pane.chip = null;
         pane.last_latency_ms = null;
@@ -2972,6 +2974,14 @@ pub const BrowserController = struct {
             // its local role (and path) when the site disconnects. (That
             // navigates a local listing whose success clears the banner.)
             if (e.status == .offline) self.restoreLocalRole(pane);
+            // A home-remote pane has no local role to fall back to. On a clean
+            // user disconnect (no error_class) drop the binding + stale listing
+            // so it shows the empty "Not connected" state. An unexpected drop
+            // (error_class set) keeps the listing + banner so context survives
+            // and a reconnect re-lists in place.
+            if (e.status == .offline and e.error_class == null and
+                pane.role == .remote and pane.home_role == .remote)
+                self.unbindRemotePane(pane);
         }
     }
 
@@ -3361,12 +3371,7 @@ test "formatters: counts, sizes, mtime, mode, status line" {
     try testing.expectEqualStrings("98,412", formatCount(&buf, 98_412));
     try testing.expectEqualStrings("1,234,567", formatCount(&buf, 1_234_567));
 
-    try testing.expectEqualStrings("0 B", humanBytes(&buf, 0));
-    try testing.expectEqualStrings("1023 B", humanBytes(&buf, 1023));
-    try testing.expectEqualStrings("1.5 KB", humanBytes(&buf, 1536));
-    try testing.expectEqualStrings("1.0 MB", humanBytes(&buf, 1 << 20));
-    try testing.expectEqualStrings("10 MB", humanBytes(&buf, 10 << 20));
-
+    // humanBytes itself is tested in src/app/format.zig (shared helper).
     try testing.expectEqualStrings("—", formatSize(&buf, true, 12345));
     try testing.expectEqualStrings("", formatSize(&buf, false, null));
 
@@ -4151,13 +4156,19 @@ test "inline error banner + chip tooltip: status/listing event transitions (head
     }
 
     // --- Clean user disconnect: offline with NO error_class -------------
-    // (a non-empty reason is allowed but must NOT raise the banner).
+    // (a non-empty reason is allowed but must NOT raise the banner). A clean
+    // disconnect also unbinds this home-remote pane to the "Not connected"
+    // state, so reconnect (rebind) before exercising further transitions.
     bc.onSiteStatus(.{
         .site_id = item_mod.local_site_id,
         .status = .offline,
         .reason = "disconnected",
     });
     try testing.expect(!remote.banner.isVisible());
+    try testing.expectEqual(@as(?u64, null), remote.site);
+    bc.bindRemoteToPane(remote.token(), item_mod.local_site_id, "/srv");
+    settled = .{ .pane = remote, .path = "/srv" };
+    try drainUntil(core, &settled, PaneSettled.ready);
 
     // --- Failure again, then a successful (re)list auto-clears it -------
     bc.onSiteStatus(.{
@@ -4208,6 +4219,74 @@ test "inline error banner + chip tooltip: status/listing event transitions (head
         .error_class = .transient,
     });
     try testing.expect(!remote.banner.isVisible());
+
+    core.shutdown();
+    bc.destroy();
+    win.release();
+}
+
+test "clean disconnect clears a home-remote pane; an error drop keeps the listing" {
+    const pool = foundation.AutoreleasePool.init();
+    defer pool.deinit();
+    const gpa = testing.allocator;
+
+    var tmp_conf = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_conf.cleanup();
+    var tmp_root = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_root.cleanup();
+    var fake = FakeStore.init(gpa);
+    defer fake.deinit();
+
+    const core = try bridge.AppCore.initOptions(gpa, .{
+        .pump = .manual,
+        .config_dir = tmp_conf.dir,
+        .local_root = tmp_root.dir,
+        .cred_store = fake.credStore(),
+    });
+
+    const io = core.io;
+    try tmp_root.dir.createDir(io, "srv", .default_dir);
+    try tmp_root.dir.writeFile(io, .{ .sub_path = "srv/file.txt", .data = "x" });
+
+    const win = window_mod.Window.create(
+        foundation.rect(0, 0, 1000, 600),
+        "relay-browser-disconnect-test",
+        window_mod.StyleMask.standard,
+    );
+    const bc = try BrowserController.create(gpa, core, win, .{ .initial_local_path = "/" });
+    win.setContentView(objc.Object.fromId(bc.view()));
+
+    const remote = bc.remotePane();
+    bc.bindRemoteToPane(remote.token(), item_mod.local_site_id, "/srv");
+    var settled: PaneSettled = .{ .pane = remote, .path = "/srv" };
+    try drainUntil(core, &settled, PaneSettled.ready);
+    bc.onSiteStatus(.{ .site_id = item_mod.local_site_id, .status = .connected, .reason = "" });
+
+    // Connected: a real listing is on screen.
+    try testing.expect(remote.snapshot != null);
+    try testing.expect(remote.visible.items.len > 0);
+
+    // Clean user disconnect (no error_class): the pane resets to the empty
+    // "Not connected" state — site + listing dropped, remote role kept.
+    bc.onSiteStatus(.{ .site_id = item_mod.local_site_id, .status = .offline, .reason = "disconnected" });
+    try testing.expectEqual(@as(?u64, null), remote.site);
+    try testing.expectEqual(@as(?*DirSnapshot, null), remote.snapshot);
+    try testing.expectEqual(@as(usize, 0), remote.visible.items.len);
+    try testing.expectEqual(PaneRole.remote, remote.role);
+
+    // Reconnect, then an unexpected DROP (error_class set): the listing and
+    // binding survive so context is preserved for an in-place reconnect.
+    bc.bindRemoteToPane(remote.token(), item_mod.local_site_id, "/srv");
+    settled = .{ .pane = remote, .path = "/srv" };
+    try drainUntil(core, &settled, PaneSettled.ready);
+    bc.onSiteStatus(.{
+        .site_id = item_mod.local_site_id,
+        .status = .offline,
+        .reason = "Connection reset",
+        .error_class = .transient,
+    });
+    try testing.expectEqual(@as(?u64, item_mod.local_site_id), remote.site);
+    try testing.expect(remote.snapshot != null);
 
     core.shutdown();
     bc.destroy();

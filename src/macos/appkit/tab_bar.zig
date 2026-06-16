@@ -46,6 +46,8 @@ const title_trailing_pad: f64 = 8;
 const new_button_edge: f64 = 24;
 const font_size: f64 = 13;
 const glyph_font_size: f64 = 13;
+const status_dot_diameter: f64 = 7;
+const status_dot_gap: f64 = 6;
 const line_break_truncating_middle: NSInteger = 5; // NSLineBreakByTruncatingMiddle
 const text_alignment_center: NSInteger = 2; // NSTextAlignmentCenter
 
@@ -101,6 +103,10 @@ pub const Hit = union(enum) {
     new_tab,
 };
 
+/// Per-tab connection indicator drawn as a small dot at the tab's trailing
+/// edge (semantic system colors; dark-mode safe). Mirrors the sidebar dots.
+pub const Status = enum { none, connected, reconnecting };
+
 /// Classify a click at (x, y) in flipped view coordinates. The "+" button is
 /// tested first: when tabs overflow a narrow bar it is clamped on top of
 /// them and must win.
@@ -115,6 +121,16 @@ pub fn hitTest(x: f64, y: f64, count: usize, bounds_w: f64) Hit {
         return .{ .tab = i };
     }
     return .none;
+}
+
+/// The tab slot a drag at `x` targets: the index whose frame x falls in,
+/// clamped to [0, count-1]. Used to reorder the dragged tab as it moves.
+pub fn tabIndexAtX(x: f64, count: usize, bounds_w: f64) usize {
+    if (count == 0) return 0;
+    if (x <= h_pad) return 0; // leading pad / before the first tab
+    const w = tabWidth(bounds_w, count);
+    const slot: usize = @intFromFloat((x - h_pad) / (w + tab_gap));
+    return @min(slot, count - 1);
 }
 
 const NSFontAttributeName = foundation.NSFontAttributeName;
@@ -132,6 +148,8 @@ fn viewClass() runtime.DefinedClass {
         .{ "drawRect:", tabBarDrawRect },
         .{ "isFlipped", tabBarIsFlipped },
         .{ "mouseDown:", tabBarMouseDown },
+        .{ "mouseDragged:", tabBarMouseDragged },
+        .{ "mouseUp:", tabBarMouseUp },
     }) catch @panic("relay_mac/tab_bar: failed to define RelayTabBar");
     g_view_class = dc;
     return dc;
@@ -146,7 +164,13 @@ pub const Delegate = struct {
     onSelect: *const fn (ctx: *anyopaque, index: usize) void,
     onClose: *const fn (ctx: *anyopaque, index: usize) void,
     onNew: *const fn (ctx: *anyopaque) void,
+    /// Drag-reorder: move the tab at `from` to position `to`. Fired live as
+    /// the dragged tab crosses each slot.
+    onReorder: *const fn (ctx: *anyopaque, from: usize, to: usize) void,
 };
+
+/// A press must travel this far horizontally before a click becomes a drag.
+const drag_threshold: f64 = 4;
 
 pub const TabBar = struct {
     alloc: std.mem.Allocator,
@@ -155,7 +179,17 @@ pub const TabBar = struct {
     delegate: Delegate,
     /// Owned title copies; freed on the next setTabs()/deinit().
     titles: [][]u8 = &.{},
+    /// Per-tab connection status, parallel to `titles` (same length). Owned;
+    /// freed alongside the titles.
+    statuses: []Status = &.{},
     active: usize = 0,
+    // Drag-reorder tracking (mouseDown → mouseDragged → mouseUp). `press_hit`
+    // is what the press landed on; a click dispatches it on mouseUp unless a
+    // drag took over. `drag_index` follows the moving tab across reorders.
+    press_hit: Hit = .none,
+    press_x: f64 = 0,
+    dragging: bool = false,
+    drag_index: usize = 0,
 
     /// Build a tab bar. The returned struct is heap-owned; embed `view()`
     /// into a layout and call deinit() at teardown. Main thread only.
@@ -179,7 +213,7 @@ pub const TabBar = struct {
     }
 
     pub fn deinit(self: *TabBar) void {
-        self.freeTitles();
+        self.freeTabs();
         self.obj.msgSend(void, "removeFromSuperview", .{});
         self.obj.msgSend(void, "release", .{});
         self.alloc.destroy(self);
@@ -192,7 +226,14 @@ pub const TabBar = struct {
 
     /// Replace the tab set: titles are copied into TabBar-owned memory and
     /// the previous set is freed; `active` is clamped to the new count.
-    pub fn setTabs(self: *TabBar, titles: []const []const u8, active: usize) !void {
+    /// `statuses` (parallel to `titles`) drives the per-tab connection dot;
+    /// pass `&.{}` for none. A short `statuses` leaves later tabs dot-less.
+    pub fn setTabs(
+        self: *TabBar,
+        titles: []const []const u8,
+        statuses: []const Status,
+        active: usize,
+    ) !void {
         const copies = try self.alloc.alloc([]u8, titles.len);
         var done: usize = 0;
         errdefer {
@@ -203,8 +244,13 @@ pub const TabBar = struct {
             copies[i] = try self.alloc.dupe(u8, title);
             done = i + 1;
         }
-        self.freeTitles();
+        const status_copy = try self.alloc.alloc(Status, titles.len);
+        errdefer self.alloc.free(status_copy);
+        for (status_copy, 0..) |*s, i| s.* = if (i < statuses.len) statuses[i] else .none;
+
+        self.freeTabs();
         self.titles = copies;
+        self.statuses = status_copy;
         self.active = if (titles.len == 0) 0 else @min(active, titles.len - 1);
         self.obj.msgSend(void, "setNeedsDisplay:", .{true});
     }
@@ -221,10 +267,12 @@ pub const TabBar = struct {
         return self.active;
     }
 
-    fn freeTitles(self: *TabBar) void {
+    fn freeTabs(self: *TabBar) void {
         for (self.titles) |t| self.alloc.free(t);
         if (self.titles.len > 0) self.alloc.free(self.titles);
         self.titles = &.{};
+        if (self.statuses.len > 0) self.alloc.free(self.statuses);
+        self.statuses = &.{};
     }
 
     /// Route a classified click to the delegate (mouseDown: tail; split out
@@ -289,10 +337,24 @@ fn tabBarDrawRect(target: c.id, _: c.SEL, _: NSRect) callconv(.c) void {
         const close = closeFrame(tab);
         drawGlyph("\u{00D7}", close, foundation.secondaryLabelColor());
 
-        // Title: middle-truncated + clipped between the "×" and the trailing
-        // edge (NSView does not clip drawing to bounds by default).
+        // Connection-status dot at the trailing inside edge (when the tab has
+        // a live binding); the title truncates before it.
+        const status: Status = if (i < self.statuses.len) self.statuses[i] else .none;
+        var trail = tab.origin.x + tab.size.width - title_trailing_pad;
+        if (status != .none) {
+            trail -= status_dot_diameter;
+            const dot = rect(trail, tab.origin.y + (tab.size.height - status_dot_diameter) / 2, status_dot_diameter, status_dot_diameter);
+            statusDotColor(status).msgSend(void, "setFill", .{});
+            getClass("NSBezierPath")
+                .msgSend(objc.Object, "bezierPathWithOvalInRect:", .{dot})
+                .msgSend(void, "fill", .{});
+            trail -= status_dot_gap;
+        }
+
+        // Title: middle-truncated + clipped between the "×" and whatever the
+        // trailing edge/dot leaves (NSView does not clip drawing to bounds).
         const text_x = close.origin.x + close.size.width + close_leading_pad;
-        const avail_w = @max(0, tab.origin.x + tab.size.width - title_trailing_pad - text_x);
+        const avail_w = @max(0, trail - text_x);
         const color = if (is_active) foundation.labelColor() else foundation.secondaryLabelColor();
         drawTitle(title, rect(text_x, tab.origin.y, avail_w, tab.size.height), color);
     }
@@ -333,18 +395,81 @@ fn drawGlyph(glyph: []const u8, frame: NSRect, color: objc.Object) void {
     drawText(glyph, frame, foundation.systemFont(glyph_font_size), color);
 }
 
+/// Semantic system colors only (dark-mode safe); callers gate on != .none.
+fn statusDotColor(status: Status) objc.Object {
+    return switch (status) {
+        .none => unreachable,
+        .connected => getClass("NSColor").msgSend(objc.Object, "systemGreenColor", .{}),
+        .reconnecting => getClass("NSColor").msgSend(objc.Object, "systemOrangeColor", .{}),
+    };
+}
+
+/// Convert an event's window point into this (flipped) view's coordinates.
+fn eventPointIn(view_obj: objc.Object, event_id: c.id) NSPoint {
+    const event = objc.Object.fromId(event_id);
+    const loc = event.msgSend(NSPoint, "locationInWindow", .{});
+    return view_obj.msgSend(NSPoint, "convertPoint:fromView:", .{ loc, @as(c.id, null) });
+}
+
+/// Record the press; the actual select/close/new dispatch is deferred to
+/// mouseUp so a press-and-drag on a tab body becomes a reorder, not a select.
 fn tabBarMouseDown(target: c.id, _: c.SEL, event_id: c.id) callconv(.c) void {
     const pool = objc.AutoreleasePool.init();
     defer pool.deinit();
 
     const self = viewClass().state(TabBar, target);
     const view_obj = objc.Object.fromId(target);
-    const event = objc.Object.fromId(event_id);
-    const loc = event.msgSend(NSPoint, "locationInWindow", .{});
-    // Flipped view: the converted point is y-down, matching the pure math.
-    const p = view_obj.msgSend(NSPoint, "convertPoint:fromView:", .{ loc, @as(c.id, null) });
-    const bounds = view_obj.msgSend(NSRect, "bounds", .{});
-    self.dispatchHit(hitTest(p.x, p.y, self.titles.len, bounds.size.width));
+    const p = eventPointIn(view_obj, event_id);
+    const w = view_obj.msgSend(NSRect, "bounds", .{}).size.width;
+    self.press_hit = hitTest(p.x, p.y, self.titles.len, w);
+    self.press_x = p.x;
+    self.dragging = false;
+}
+
+/// Past the drag threshold on a tab-body press, reorder the tab live as the
+/// pointer crosses each slot (the delegate moves it; we redraw via setTabs).
+fn tabBarMouseDragged(target: c.id, _: c.SEL, event_id: c.id) callconv(.c) void {
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const self = viewClass().state(TabBar, target);
+    const start = switch (self.press_hit) {
+        .tab => |i| i,
+        else => return, // only tab bodies drag
+    };
+    const view_obj = objc.Object.fromId(target);
+    const p = eventPointIn(view_obj, event_id);
+    const w = view_obj.msgSend(NSRect, "bounds", .{}).size.width;
+
+    if (!self.dragging) {
+        if (@abs(p.x - self.press_x) < drag_threshold) return;
+        self.dragging = true;
+        self.drag_index = start;
+    }
+    const target_idx = tabIndexAtX(p.x, self.titles.len, w);
+    if (target_idx != self.drag_index) {
+        self.delegate.onReorder(self.delegate.ctx, self.drag_index, target_idx);
+        self.drag_index = target_idx;
+    }
+}
+
+/// A non-drag release dispatches the original press as a click (select /
+/// close / new) — but only if the release still lands on the same region.
+fn tabBarMouseUp(target: c.id, _: c.SEL, event_id: c.id) callconv(.c) void {
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const self = viewClass().state(TabBar, target);
+    const hit = self.press_hit;
+    self.press_hit = .none;
+    if (self.dragging) {
+        self.dragging = false;
+        return; // reorder already applied live during the drag
+    }
+    const view_obj = objc.Object.fromId(target);
+    const p = eventPointIn(view_obj, event_id);
+    const w = view_obj.msgSend(NSRect, "bounds", .{}).size.width;
+    if (std.meta.eql(hitTest(p.x, p.y, self.titles.len, w), hit)) self.dispatchHit(hit);
 }
 
 // ---------------------------------------------------------------------------
@@ -439,13 +564,31 @@ test "hit test: clamped plus button wins over overflowing tabs" {
     try testing.expectEqual(Hit.new_tab, hit);
 }
 
+test "tabIndexAtX maps a drag x to the slot under it, clamped" {
+    // Leading pad and before resolve to the first slot.
+    try testing.expectEqual(@as(usize, 0), tabIndexAtX(0, 3, 1200));
+    try testing.expectEqual(@as(usize, 0), tabIndexAtX(h_pad, 3, 1200));
+    // A point inside each tab's frame returns that tab's index.
+    inline for (.{ 0, 1, 2 }) |i| {
+        const f = tabFrame(1200, 3, i);
+        try testing.expectEqual(@as(usize, i), tabIndexAtX(f.origin.x + f.size.width / 2, 3, 1200));
+    }
+    // Far past the last tab clamps to count-1.
+    try testing.expectEqual(@as(usize, 2), tabIndexAtX(5000, 3, 1200));
+    // Empty bar is always slot 0.
+    try testing.expectEqual(@as(usize, 0), tabIndexAtX(123, 0, 1200));
+}
+
 // ---------------------------------------------------------------------------
 // Headless ObjC tests (build + drive the real view; nothing on screen).
 // ---------------------------------------------------------------------------
 var g_test_selects: u32 = 0;
 var g_test_closes: u32 = 0;
 var g_test_news: u32 = 0;
+var g_test_reorders: u32 = 0;
 var g_test_last_index: usize = 0;
+var g_test_reorder_from: usize = 0;
+var g_test_reorder_to: usize = 0;
 var g_test_ctx: ?*anyopaque = null;
 
 fn testOnSelect(ctx: *anyopaque, index: usize) void {
@@ -465,16 +608,30 @@ fn testOnNew(ctx: *anyopaque) void {
     g_test_ctx = ctx;
 }
 
+fn testOnReorder(ctx: *anyopaque, from: usize, to: usize) void {
+    g_test_reorders += 1;
+    g_test_reorder_from = from;
+    g_test_reorder_to = to;
+    g_test_ctx = ctx;
+}
+
 fn resetTestCounters() void {
     g_test_selects = 0;
     g_test_closes = 0;
     g_test_news = 0;
+    g_test_reorders = 0;
     g_test_last_index = 0;
     g_test_ctx = null;
 }
 
 fn testDelegate(ctx: *anyopaque) Delegate {
-    return .{ .ctx = ctx, .onSelect = testOnSelect, .onClose = testOnClose, .onNew = testOnNew };
+    return .{
+        .ctx = ctx,
+        .onSelect = testOnSelect,
+        .onClose = testOnClose,
+        .onNew = testOnNew,
+        .onReorder = testOnReorder,
+    };
 }
 
 test "init / setTabs / setHidden state machine" {
@@ -488,19 +645,26 @@ test "init / setTabs / setHidden state machine" {
     try testing.expectEqual(@as(usize, 0), bar.count());
     try testing.expectEqual(@as(usize, 0), bar.activeIndex());
 
-    try bar.setTabs(&.{ "ftp.example.com", "Local" }, 1);
+    try bar.setTabs(&.{ "ftp.example.com", "Local" }, &.{ .connected, .none }, 1);
     try testing.expectEqual(@as(usize, 2), bar.count());
     try testing.expectEqual(@as(usize, 1), bar.activeIndex());
     try testing.expectEqualStrings("ftp.example.com", bar.titles[0]);
     try testing.expectEqualStrings("Local", bar.titles[1]);
+    // Statuses are stored parallel to titles.
+    try testing.expectEqual(@as(usize, 2), bar.statuses.len);
+    try testing.expectEqual(Status.connected, bar.statuses[0]);
+    try testing.expectEqual(Status.none, bar.statuses[1]);
 
-    // Active index clamps to the new count; titles are replaced.
-    try bar.setTabs(&.{"only"}, 5);
+    // Active index clamps to the new count; titles are replaced. A short
+    // statuses slice pads the rest with .none (here: empty → all none).
+    try bar.setTabs(&.{"only"}, &.{}, 5);
     try testing.expectEqual(@as(usize, 1), bar.count());
     try testing.expectEqual(@as(usize, 0), bar.activeIndex());
+    try testing.expectEqual(@as(usize, 1), bar.statuses.len);
+    try testing.expectEqual(Status.none, bar.statuses[0]);
 
     // Back to empty frees everything (leak-checked by testing.allocator).
-    try bar.setTabs(&.{}, 0);
+    try bar.setTabs(&.{}, &.{}, 0);
     try testing.expectEqual(@as(usize, 0), bar.count());
 
     bar.setHidden(true);
@@ -518,7 +682,7 @@ test "setTabs copies titles into owned memory" {
     defer bar.deinit();
 
     var scratch = "mutable".*;
-    try bar.setTabs(&.{&scratch}, 0);
+    try bar.setTabs(&.{&scratch}, &.{}, 0);
     @memset(&scratch, '!');
     try testing.expectEqualStrings("mutable", bar.titles[0]);
 }
@@ -530,7 +694,7 @@ test "hit dispatch routes to the delegate" {
     var fake_ctx: u32 = 0xBEEF;
     const bar = try TabBar.init(testing.allocator, rect(0, 0, 800, bar_height), testDelegate(&fake_ctx));
     defer bar.deinit();
-    try bar.setTabs(&.{ "a", "b", "c" }, 0);
+    try bar.setTabs(&.{ "a", "b", "c" }, &.{}, 0);
 
     resetTestCounters();
     bar.dispatchHit(.{ .tab = 2 });
@@ -549,6 +713,14 @@ test "hit dispatch routes to the delegate" {
     try testing.expectEqual(@as(u32, 1), g_test_selects);
     try testing.expectEqual(@as(u32, 1), g_test_closes);
     try testing.expectEqual(@as(u32, 1), g_test_news);
+
+    // Reorder is delivered out-of-band (from the drag handler), carrying the
+    // ctx and the from/to slots.
+    bar.delegate.onReorder(bar.delegate.ctx, 0, 2);
+    try testing.expectEqual(@as(u32, 1), g_test_reorders);
+    try testing.expectEqual(@as(usize, 0), g_test_reorder_from);
+    try testing.expectEqual(@as(usize, 2), g_test_reorder_to);
+    try testing.expectEqual(@as(?*anyopaque, &fake_ctx), g_test_ctx);
 }
 
 test "view is a RelayTabBar instance with the state attached" {

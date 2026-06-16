@@ -879,6 +879,16 @@ fn bindCommands() void {
     cmds.bind(.close_tab, null, cmdCloseTab);
     cmds.bind(.next_tab, null, cmdNextTab);
     cmds.bind(.prev_tab, null, cmdPrevTab);
+    // Cmd+1…8 jump to that 1-based tab; Cmd+9 jumps to the last tab.
+    cmds.bind(.select_tab_1, null, cmdSelectTab1);
+    cmds.bind(.select_tab_2, null, cmdSelectTab2);
+    cmds.bind(.select_tab_3, null, cmdSelectTab3);
+    cmds.bind(.select_tab_4, null, cmdSelectTab4);
+    cmds.bind(.select_tab_5, null, cmdSelectTab5);
+    cmds.bind(.select_tab_6, null, cmdSelectTab6);
+    cmds.bind(.select_tab_7, null, cmdSelectTab7);
+    cmds.bind(.select_tab_8, null, cmdSelectTab8);
+    cmds.bind(.select_tab_last, null, cmdSelectTabLast);
 }
 
 fn cmdNewWindow(_: ?*anyopaque) void {
@@ -900,16 +910,48 @@ fn newTabRequest() void {
     cmdNewTab(null);
 }
 fn cmdCloseTab(_: ?*anyopaque) void {
-    if (!g_ui.tabs.closeActiveTab()) {
-        // Last tab: close the window.
-        g_ui.win.performClose();
-    }
+    // Confirms first when the tab holds a live connection, disconnects the
+    // tab's server(s) on close, and closes the window for the last tab.
+    g_ui.tabs.requestCloseActiveTab();
 }
 fn cmdNextTab(_: ?*anyopaque) void {
     g_ui.tabs.nextTab();
 }
 fn cmdPrevTab(_: ?*anyopaque) void {
     g_ui.tabs.prevTab();
+}
+/// Jump to the 1-based tab `n` if it exists (Cmd+1…8); no-op otherwise.
+fn selectTabByNumber(n: usize) void {
+    if (n >= 1 and n <= g_ui.tabs.tabs.items.len) g_ui.tabs.selectTab(n - 1);
+}
+fn cmdSelectTab1(_: ?*anyopaque) void {
+    selectTabByNumber(1);
+}
+fn cmdSelectTab2(_: ?*anyopaque) void {
+    selectTabByNumber(2);
+}
+fn cmdSelectTab3(_: ?*anyopaque) void {
+    selectTabByNumber(3);
+}
+fn cmdSelectTab4(_: ?*anyopaque) void {
+    selectTabByNumber(4);
+}
+fn cmdSelectTab5(_: ?*anyopaque) void {
+    selectTabByNumber(5);
+}
+fn cmdSelectTab6(_: ?*anyopaque) void {
+    selectTabByNumber(6);
+}
+fn cmdSelectTab7(_: ?*anyopaque) void {
+    selectTabByNumber(7);
+}
+fn cmdSelectTab8(_: ?*anyopaque) void {
+    selectTabByNumber(8);
+}
+/// Cmd+9 selects the last tab (Safari/Chrome convention), not literally tab 9.
+fn cmdSelectTabLast(_: ?*anyopaque) void {
+    const n = g_ui.tabs.tabs.items.len;
+    if (n > 0) g_ui.tabs.selectTab(n - 1);
 }
 fn cmdConnectServer(_: ?*anyopaque) void {
     g_ui.sites.quickConnect();
@@ -1298,6 +1340,10 @@ fn paneContextMenu(_: ?*anyopaque, pane: *browser_mod.BrowserPane, row: ?usize) 
 // --- toolbar ------------------------------------------------------------------
 
 const toolbar_items = [_]toolbar_mod.ItemSpec{
+    // New Tab: the always-visible affordance for creating a tab (the strip's
+    // "+" only shows once a second tab exists; this is reachable at one tab).
+    .{ .identifier = "RelayNewTab", .label = "New Tab", .symbol = "plus", .tooltip = "New Tab (Cmd+T)", .action = tbNewTab },
+    toolbar_mod.space(),
     .{ .identifier = "RelayBack", .label = "Back", .symbol = "chevron.left", .tooltip = "Back", .action = tbBack },
     .{ .identifier = "RelayForward", .label = "Forward", .symbol = "chevron.right", .tooltip = "Forward", .action = tbForward },
     .{ .identifier = "RelayRefresh", .label = "Refresh", .symbol = "arrow.clockwise", .tooltip = "Refresh the focused pane (Cmd+R)", .action = tbRefresh },
@@ -1308,6 +1354,9 @@ const toolbar_items = [_]toolbar_mod.ItemSpec{
     .{ .identifier = "RelayInfo", .label = "Info", .symbol = "info.circle", .tooltip = "Inspector (Cmd+I)", .action = tbInfo },
 };
 
+fn tbNewTab(_: *anyopaque) void {
+    cmdNewTab(null);
+}
 fn tbBack(_: *anyopaque) void {
     activeBrowser().goBack();
 }

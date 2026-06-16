@@ -22,6 +22,7 @@ const c = objc.c;
 const foundation = mac.foundation;
 const tab_bar_mod = mac.appkit.tab_bar;
 const window_mod = mac.appkit.window;
+const panels = mac.appkit.panels;
 const events_mod = relay.events;
 const item_mod = relay.queue.item;
 
@@ -63,6 +64,13 @@ pub const TabsController = struct {
     /// (the same path as Cmd+T) so the new browser gets the CURRENT prefs
     /// (density, date format, vim mode…) — TabsController doesn't know them.
     on_new_request: ?*const fn () void = null,
+    /// Last site_status per site id, tracked from the site_status listener
+    /// (the core exposes no synchronous query; the sidebar tracks its own
+    /// copy the same way). Drives the per-tab dot and the close-confirm.
+    statuses: std.AutoHashMapUnmanaged(u64, events_mod.SiteStatus) = .empty,
+    /// The tab awaiting a close-confirm answer (held by browser pointer so a
+    /// reorder between prompt and answer can't close the wrong tab).
+    pending_close: ?*BrowserController = null,
 
     // ------------------------------------------------------------------ //
     // Lifecycle
@@ -96,6 +104,7 @@ pub const TabsController = struct {
                 .onSelect = tabBarOnSelect,
                 .onClose = tabBarOnClose,
                 .onNew = tabBarOnNew,
+                .onReorder = tabBarOnReorder,
             },
         );
         errdefer bar.deinit();
@@ -133,6 +142,7 @@ pub const TabsController = struct {
             tab.browser.destroy();
         }
         self.tabs.deinit(self.gpa);
+        self.statuses.deinit(self.gpa);
         self.bar.deinit();
         self.container.msgSend(void, "removeFromSuperview", .{});
         self.container.msgSend(void, "release", .{});
@@ -196,6 +206,109 @@ pub const TabsController = struct {
         return self.closeTab(self.active);
     }
 
+    // ------------------------------------------------------------------ //
+    // Close + disconnect (close button "×" and Cmd+W). Closing a tab drops
+    // the server connection(s) it owns; if a connection is live, a confirm
+    // sheet guards against disconnecting by mistake.
+
+    /// Close the active tab (Cmd+W), confirming first if it holds a live
+    /// connection. The last tab closes the window after disconnecting.
+    pub fn requestCloseActiveTab(self: *TabsController) void {
+        self.requestCloseTab(self.active);
+    }
+
+    /// Entry point for both the "×" button and Cmd+W: confirm when the tab
+    /// has a live connection, else close immediately.
+    pub fn requestCloseTab(self: *TabsController, index: usize) void {
+        if (index >= self.tabs.items.len) return;
+        // A confirm sheet is already up (it is window-modal): ignore a second
+        // request rather than stack sheets / overwrite pending_close.
+        if (self.pending_close != null) return;
+        const browser = self.tabs.items[index].browser;
+        if (!self.tabHasLiveConnection(browser)) {
+            self.finishClose(browser);
+            return;
+        }
+        // Hold the target by pointer: a reorder before the answer must not
+        // close the wrong tab. The sheet copies its strings synchronously, so
+        // a stack-buffered message is safe.
+        self.pending_close = browser;
+        const label = self.liveSiteLabel(browser);
+        var msg_buf: [256]u8 = undefined;
+        var info_buf: [320]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "Disconnect from {s}?", .{label}) catch "Disconnect this server?";
+        const info = std.fmt.bufPrint(&info_buf, "Closing this tab will disconnect the connection to {s}.", .{label}) catch
+            "Closing this tab will disconnect its server.";
+        panels.confirmSheet(self.win, msg, info, "Close & Disconnect", true, self, onCloseConfirmed);
+    }
+
+    fn onCloseConfirmed(self: *TabsController, confirmed: bool) void {
+        const browser = self.pending_close;
+        self.pending_close = null;
+        if (!confirmed) return;
+        self.finishClose(browser orelse return);
+    }
+
+    /// Tear the tab down and disconnect any of its remote sites that no
+    /// surviving tab still uses. The last tab can't be removed, so it
+    /// disconnects and closes the window instead.
+    fn finishClose(self: *TabsController, browser: *BrowserController) void {
+        const idx = self.indexOfBrowser(browser) orelse return;
+        // Snapshot this tab's remote bindings before any teardown. Sized from
+        // panes.len so a future pane-count change can't overflow.
+        var sites: [browser.panes.len]?u64 = @splat(@as(?u64, null));
+        for (browser.panes, 0..) |pane, i| {
+            const sid = pane.site orelse continue;
+            if (sid != item_mod.local_site_id) sites[i] = sid;
+        }
+
+        if (self.tabs.items.len <= 1) {
+            // Last tab: nothing else can hold these sites — disconnect each
+            // (deduped: both panes may bind the same site) and close.
+            for (sites, 0..) |maybe_sid, i| if (maybe_sid) |sid| {
+                if (!sidAppearsBefore(sites[0..i], sid)) self.core.disconnectSite(sid);
+            };
+            self.win.performClose();
+            return;
+        }
+
+        _ = self.closeTab(idx); // removes the tab and tears down the browser
+        for (sites, 0..) |maybe_sid, i| if (maybe_sid) |sid| {
+            if (!sidAppearsBefore(sites[0..i], sid) and !self.siteInUse(sid))
+                self.core.disconnectSite(sid);
+        };
+    }
+
+    /// True if any surviving tab still binds a pane to `site_id`.
+    fn siteInUse(self: *TabsController, site_id: u64) bool {
+        for (self.tabs.items) |tab| {
+            for (tab.browser.panes) |pane| {
+                if (pane.site == site_id) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Label of the first live-or-connecting remote pane in the tab, for the
+    /// confirm message; a generic fallback otherwise. Matches the
+    /// tabHasLiveConnection notion of "live" (absent status = in-flight).
+    fn liveSiteLabel(self: *TabsController, browser: *BrowserController) []const u8 {
+        for (browser.panes) |pane| {
+            const sid = pane.site orelse continue;
+            if (sid == item_mod.local_site_id) continue;
+            const status = self.statuses.get(sid);
+            if (status == null or status.? != .offline) return paneLabel(self.sites_store, pane);
+        }
+        return "this server";
+    }
+
+    /// Free helper: does `sid` already appear in `prev`? Used to disconnect
+    /// each unique site at most once when a tab binds the same site twice.
+    fn sidAppearsBefore(prev: []const ?u64, sid: u64) bool {
+        for (prev) |m| if (m == sid) return true;
+        return false;
+    }
+
     pub fn selectTab(self: *TabsController, index: usize) void {
         if (index >= self.tabs.items.len) return;
         if (index == self.active) return;
@@ -206,6 +319,33 @@ pub const TabsController = struct {
         self.swapViewIn(self.tabs.items[self.active].browser);
         self.refreshTitles() catch {};
         self.activeBrowser().focusPane(self.activeBrowser().focused);
+    }
+
+    /// Drag-reorder: move the tab at `from` to position `to`. The displayed
+    /// view is unchanged — only the order and the (re-derived) active index
+    /// move — so no view swap is needed, just a title/dot refresh.
+    pub fn reorderTab(self: *TabsController, from: usize, to: usize) void {
+        const n = self.tabs.items.len;
+        if (from >= n or to >= n or from == to) return;
+        const active_browser = self.tabs.items[self.active].browser;
+        // In-place shift (no allocation, can't fail): slide the span between
+        // `from` and `to` over by one and drop the moved tab at `to`.
+        const items = self.tabs.items;
+        const moved = items[from];
+        if (from < to) {
+            std.mem.copyForwards(Tab, items[from..to], items[from + 1 .. to + 1]);
+        } else {
+            std.mem.copyBackwards(Tab, items[to + 1 .. from + 1], items[to..from]);
+        }
+        items[to] = moved;
+        // Keep `active` pointing at the same displayed browser.
+        self.active = self.indexOfBrowser(active_browser) orelse self.active;
+        self.refreshTitles() catch {};
+    }
+
+    fn indexOfBrowser(self: *TabsController, browser: *BrowserController) ?usize {
+        for (self.tabs.items, 0..) |tab, i| if (tab.browser == browser) return i;
+        return null;
     }
 
     pub fn nextTab(self: *TabsController) void {
@@ -222,11 +362,14 @@ pub const TabsController = struct {
     // ------------------------------------------------------------------ //
     // Title derivation
 
-    /// Recompute titles from pane site bindings and push to the bar.
+    /// Recompute titles + connection dots from pane site bindings and push to
+    /// the bar.
     pub fn refreshTitles(self: *TabsController) !void {
         const count = self.tabs.items.len;
         const titles = try self.gpa.alloc([]const u8, count);
         defer self.gpa.free(titles);
+        const tab_statuses = try self.gpa.alloc(tab_bar_mod.Status, count);
+        defer self.gpa.free(tab_statuses);
 
         var bufs: [][]u8 = try self.gpa.alloc([]u8, count);
         defer {
@@ -242,9 +385,43 @@ pub const TabsController = struct {
             const buf = try std.fmt.allocPrint(self.gpa, "{s}{s}{s}", .{ left, arrow, right });
             bufs[i] = buf;
             titles[i] = buf;
+            tab_statuses[i] = self.tabStatus(tab.browser);
         }
 
-        try self.bar.setTabs(titles, self.active);
+        try self.bar.setTabs(titles, tab_statuses, self.active);
+    }
+
+    /// The dot status for a tab: orange if any bound remote pane is
+    /// reconnecting, else green if any is connected, else none. Unbound and
+    /// offline panes contribute nothing (matches the sidebar dots).
+    fn tabStatus(self: *TabsController, browser: *BrowserController) tab_bar_mod.Status {
+        var result: tab_bar_mod.Status = .none;
+        for (browser.panes) |pane| {
+            const site_id = pane.site orelse continue;
+            if (site_id == item_mod.local_site_id) continue;
+            switch (self.statuses.get(site_id) orelse continue) {
+                .reconnecting => return .reconnecting, // most urgent: short-circuit
+                .connected => result = .connected,
+                .offline => {},
+            }
+        }
+        return result;
+    }
+
+    /// True when a tab holds a remote binding that is live or still
+    /// connecting — used to warn before a close drops it. A binding whose last
+    /// recorded status is .offline does not count (nothing live to lose);
+    /// unbound/local panes never count. The core has no interim "connecting"
+    /// status, so an in-flight connect shows as an ABSENT status entry —
+    /// treated as live here so closing mid-connect still warns.
+    fn tabHasLiveConnection(self: *TabsController, browser: *BrowserController) bool {
+        for (browser.panes) |pane| {
+            const sid = pane.site orelse continue;
+            if (sid == item_mod.local_site_id) continue;
+            const status = self.statuses.get(sid);
+            if (status == null or status.? != .offline) return true;
+        }
+        return false;
     }
 
     // ------------------------------------------------------------------ //
@@ -283,7 +460,8 @@ pub const TabsController = struct {
     // ------------------------------------------------------------------ //
     // site_status listener (refreshes titles on connect/disconnect)
 
-    fn onSiteStatus(self: *TabsController, _: events_mod.CoreEvent.SiteStatusChange) void {
+    fn onSiteStatus(self: *TabsController, e: events_mod.CoreEvent.SiteStatusChange) void {
+        self.statuses.put(self.gpa, e.site_id, e.status) catch {};
         self.refreshTitles() catch {};
     }
 
@@ -297,7 +475,12 @@ pub const TabsController = struct {
 
     fn tabBarOnClose(ctx: *anyopaque, index: usize) void {
         const self: *TabsController = @ptrCast(@alignCast(ctx));
-        _ = self.closeTab(index);
+        self.requestCloseTab(index);
+    }
+
+    fn tabBarOnReorder(ctx: *anyopaque, from: usize, to: usize) void {
+        const self: *TabsController = @ptrCast(@alignCast(ctx));
+        self.reorderTab(from, to);
     }
 
     fn tabBarOnNew(ctx: *anyopaque) void {
@@ -345,9 +528,90 @@ fn activeAfterClose(active: usize, closed: usize, new_len: usize) usize {
 // Tests
 // ---------------------------------------------------------------------------
 const testing = std.testing;
+const FakeStore = relay.cred.fake.FakeStore;
 
 test {
     testing.refAllDecls(@This());
+}
+
+test "tabs: status dots, siteInUse, and drag reorder track the active tab" {
+    const pool = foundation.AutoreleasePool.init();
+    defer pool.deinit();
+    const gpa = testing.allocator;
+
+    var tmp_conf = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_conf.cleanup();
+    var tmp_root = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_root.cleanup();
+    var fake = FakeStore.init(gpa);
+    defer fake.deinit();
+
+    const core = try bridge.AppCore.initOptions(gpa, .{
+        .pump = .manual,
+        .config_dir = tmp_conf.dir,
+        .local_root = tmp_root.dir,
+        .cred_store = fake.credStore(),
+    });
+
+    const win = window_mod.Window.create(
+        foundation.rect(0, 0, 1000, 600),
+        "relay-tabs-test",
+        window_mod.StyleMask.standard,
+    );
+
+    const first = try BrowserController.create(gpa, core, win, .{});
+    const tabs = try TabsController.create(gpa, core, win, first);
+    try tabs.newTab(.{});
+    try tabs.newTab(.{});
+    try testing.expectEqual(@as(usize, 3), tabs.tabs.items.len);
+    core.drainNow();
+
+    // Bind remote panes without connecting: tabs 0 and 1 share site 100; tab
+    // 2 uses site 200. Statuses come straight from the (manually seeded) map.
+    tabs.tabs.items[0].browser.panes[1].site = 100;
+    tabs.tabs.items[1].browser.panes[1].site = 100;
+    tabs.tabs.items[2].browser.panes[1].site = 200;
+    try tabs.statuses.put(gpa, 100, .connected);
+    try tabs.statuses.put(gpa, 200, .reconnecting);
+
+    // Per-tab dot: connected → green, reconnecting → orange (most urgent).
+    try testing.expectEqual(tab_bar_mod.Status.connected, tabs.tabStatus(tabs.tabs.items[0].browser));
+    try testing.expectEqual(tab_bar_mod.Status.reconnecting, tabs.tabStatus(tabs.tabs.items[2].browser));
+    try testing.expect(tabs.tabHasLiveConnection(tabs.tabs.items[1].browser));
+
+    // siteInUse: 100 spans two tabs, 200 one, 999 none.
+    try testing.expect(tabs.siteInUse(100));
+    try testing.expect(tabs.siteInUse(200));
+    try testing.expect(!tabs.siteInUse(999));
+
+    // Close-confirm gate covers the in-flight window: a binding with NO
+    // recorded status yet (initial connect) still counts as live, while an
+    // explicitly-offline binding does not. (The dot stays .none either way.)
+    tabs.tabs.items[2].browser.panes[1].site = 300; // no status entry yet
+    try testing.expect(tabs.tabHasLiveConnection(tabs.tabs.items[2].browser));
+    try testing.expectEqual(tab_bar_mod.Status.none, tabs.tabStatus(tabs.tabs.items[2].browser));
+    try tabs.statuses.put(gpa, 300, .offline);
+    try testing.expect(!tabs.tabHasLiveConnection(tabs.tabs.items[2].browser));
+
+    // Drag the active tab to the end: active follows it to index 2.
+    tabs.selectTab(0);
+    const moved = tabs.tabs.items[0].browser;
+    tabs.reorderTab(0, 2);
+    try testing.expectEqual(@as(usize, 2), tabs.active);
+    try testing.expectEqual(moved, tabs.tabs.items[2].browser);
+
+    // Reordering other tabs leaves the displayed (active) browser unchanged.
+    tabs.selectTab(0);
+    const active_browser = tabs.tabs.items[0].browser;
+    tabs.reorderTab(2, 1);
+    try testing.expectEqual(active_browser, tabs.tabs.items[tabs.active].browser);
+
+    // Teardown (destroy() doc: unregister the site_status listener first, and
+    // it must run while the core is still alive).
+    core.unregisterListeners(tabs);
+    tabs.destroy();
+    core.shutdown();
+    win.release();
 }
 
 test "activeAfterClose keeps the displayed tab stable" {

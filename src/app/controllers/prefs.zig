@@ -114,6 +114,17 @@ pub const Command = enum {
     close_tab,
     next_tab,
     prev_tab,
+    // Jump to tab N by number (Cmd+1…Cmd+9). Cmd+9 is the last tab, matching
+    // Safari/Chrome; the rest are 1-based positions.
+    select_tab_1,
+    select_tab_2,
+    select_tab_3,
+    select_tab_4,
+    select_tab_5,
+    select_tab_6,
+    select_tab_7,
+    select_tab_8,
+    select_tab_last,
 };
 
 /// Command → callback registry with a validation hook. Heap-pinned
@@ -321,6 +332,17 @@ pub const view_menu: MenuDef = .{ .title = "View", .items = &.{
     .separator,
     cmdLeaf("Next Tab", .next_tab, "]", .{ .shift = true }),
     cmdLeaf("Previous Tab", .prev_tab, "[", .{ .shift = true }),
+    .{ .submenu = .{ .title = "Go to Tab", .items = &.{
+        cmdLeaf("Tab 1", .select_tab_1, "1", .{}),
+        cmdLeaf("Tab 2", .select_tab_2, "2", .{}),
+        cmdLeaf("Tab 3", .select_tab_3, "3", .{}),
+        cmdLeaf("Tab 4", .select_tab_4, "4", .{}),
+        cmdLeaf("Tab 5", .select_tab_5, "5", .{}),
+        cmdLeaf("Tab 6", .select_tab_6, "6", .{}),
+        cmdLeaf("Tab 7", .select_tab_7, "7", .{}),
+        cmdLeaf("Tab 8", .select_tab_8, "8", .{}),
+        cmdLeaf("Last Tab", .select_tab_last, "9", .{}),
+    } } },
 } };
 
 pub const go_menu: MenuDef = .{ .title = "Go", .items = &.{
@@ -1375,17 +1397,22 @@ test "buildItems lowers the tree: separators, selectors, commands, submenus" {
 
     try testing.expect(items[3] == .separator);
 
-    // Submenu lowering (View ▸ Density).
+    // Submenu lowering (View ▸ Density and View ▸ Go to Tab).
     const view_items = try buildItems(arena_state.allocator(), reg, view_menu.items);
     var found_density = false;
+    var found_goto = false;
     for (view_items) |item| {
-        if (item == .submenu) {
-            try testing.expectEqualStrings("Density", item.submenu.title);
+        if (item != .submenu) continue;
+        if (std.mem.eql(u8, item.submenu.title, "Density")) {
             try testing.expectEqual(@as(usize, 3), item.submenu.items.len);
             found_density = true;
+        } else if (std.mem.eql(u8, item.submenu.title, "Go to Tab")) {
+            try testing.expectEqual(@as(usize, 9), item.submenu.items.len);
+            found_goto = true;
         }
     }
     try testing.expect(found_density);
+    try testing.expect(found_goto);
 }
 
 test "ui prefs: save/load round-trip; corrupt or missing file degrades to defaults" {

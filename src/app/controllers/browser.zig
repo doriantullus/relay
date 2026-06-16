@@ -843,6 +843,19 @@ fn impStripDraw(target: c.id, _: c.SEL, _: foundation.NSRect) callconv(.c) void 
 const key_left_arrow: u16 = 123;
 const key_right_arrow: u16 = 124;
 
+/// AppKit reports the arrow keys, Page Up/Down, Home/End, the function row and
+/// forward-delete as Unicode scalars in the function-key private range
+/// (NSUpArrowFunctionKey == 0xF700 … 0xF8FF). Type-to-select must ignore these
+/// so they fall through to NSTableView's built-in keyboard navigation — most
+/// visibly Shift+arrow, which extends the selection. `chars` is UTF-8.
+fn isFunctionKeyChars(chars: []const u8) bool {
+    if (chars.len == 0) return false;
+    const len = std.unicode.utf8ByteSequenceLength(chars[0]) catch return false;
+    if (chars.len < len) return false;
+    const cp = std.unicode.utf8Decode(chars[0..len]) catch return false;
+    return cp >= 0xF700 and cp <= 0xF8FF;
+}
+
 // ---------------------------------------------------------------------------
 // Path-bar / filter-field target class (runtime kit; one instance per pane).
 // ---------------------------------------------------------------------------
@@ -2262,7 +2275,12 @@ pub const BrowserPane = struct {
                 },
                 else => {},
             }
-            if (ev.chars.len > 0 and ev.chars[0] >= 0x20 and ev.chars[0] != 0x7f)
+            // Printables feed type-to-select; control chars, DEL and the
+            // function-key range (arrows, Page/Home/End, …) fall through to
+            // NSTableView so its native keyboard navigation — including
+            // Shift+arrow to extend the selection — keeps working.
+            if (ev.chars.len > 0 and ev.chars[0] >= 0x20 and ev.chars[0] != 0x7f and
+                !isFunctionKeyChars(ev.chars))
                 return pane.typeSelect(ev.chars);
         }
         return false;
@@ -3876,6 +3894,22 @@ fn kev(chars: []const u8) table_source.KeyEvent {
     return .{ .key_code = 0, .chars = chars };
 }
 
+test "isFunctionKeyChars: arrows/function keys yes, real text no" {
+    // The four arrows (U+F700–U+F703) and forward-delete (U+F728) — all UTF-8.
+    try testing.expect(isFunctionKeyChars("\xEF\x9C\x80")); // up    U+F700
+    try testing.expect(isFunctionKeyChars("\xEF\x9C\x81")); // down  U+F701
+    try testing.expect(isFunctionKeyChars("\xEF\x9C\x82")); // left  U+F702
+    try testing.expect(isFunctionKeyChars("\xEF\x9C\x83")); // right U+F703
+    try testing.expect(isFunctionKeyChars("\xEF\x9C\xA8")); // fwd-delete U+F728
+    // Real type-to-select input is never treated as a function key.
+    try testing.expect(!isFunctionKeyChars("a"));
+    try testing.expect(!isFunctionKeyChars("Z"));
+    try testing.expect(!isFunctionKeyChars("7"));
+    try testing.expect(!isFunctionKeyChars("é")); // U+00E9, 2-byte UTF-8
+    try testing.expect(!isFunctionKeyChars("漢")); // U+6F22, 3-byte but < 0xF700
+    try testing.expect(!isFunctionKeyChars("")); // no chars
+}
+
 test "sync browsing, compare mode, vim layer (headless)" {
     const pool = foundation.AutoreleasePool.init();
     defer pool.deinit();
@@ -4071,10 +4105,30 @@ test "sync browsing, compare mode, vim layer (headless)" {
     p0.clearFilter();
     try testing.expectEqual(@as(usize, 5), p0.visible.items.len);
 
+    // Even with vim mode ON, an arrow key is not a vim binding (its chars are
+    // the 3-byte function-key scalar, not a single printable), so vimHandle
+    // declines it and it falls through to NSTableView's native selection —
+    // Shift+arrow extension works in both modes.
+    try testing.expect(!BrowserPane.dsKeyDown(ctx0, .{
+        .key_code = table_source.key_up_arrow,
+        .chars = "\xEF\x9C\x80", // NSUpArrowFunctionKey (U+F700), UTF-8
+        .shift = true,
+    }));
+
     // Vim off: the same key now feeds type-to-select again.
     bc.setVimMode(false);
     try testing.expect(BrowserPane.dsKeyDown(ctx0, kev("j")));
     try testing.expectEqual(@as(usize, 1), p0.ts_len);
+
+    // Arrow keys are NOT swallowed: dsKeyDown returns false so the event
+    // falls through to NSTableView's native keyboard selection (Shift+down
+    // extends the selection). The function-key char must not type-to-select.
+    try testing.expect(!BrowserPane.dsKeyDown(ctx0, .{
+        .key_code = table_source.key_down_arrow,
+        .chars = "\xEF\x9C\x81", // NSDownArrowFunctionKey (U+F701), UTF-8
+        .shift = true,
+    }));
+    try testing.expectEqual(@as(usize, 1), p0.ts_len); // unchanged: no type-select
 
     core.shutdown();
     bc.destroy();

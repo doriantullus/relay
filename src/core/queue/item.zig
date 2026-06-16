@@ -44,6 +44,9 @@ pub const State = enum {
     failed,
     canceled,
     paused,
+    /// Destination exists and the policy is `.ask`; parked until the UI
+    /// resolves it (resolveConflict re-queues with a real policy, or skips).
+    conflict,
 
     pub fn isTerminal(s: State) bool {
         return switch (s) {
@@ -71,6 +74,7 @@ pub const State = enum {
             .failed => .failed,
             .canceled => .canceled,
             .paused => .paused,
+            .conflict => .conflict,
         };
     }
 };
@@ -86,12 +90,17 @@ pub fn legalTransition(from: State, to: State) bool {
             else => false,
         },
         .resolving, .connecting, .transferring, .verifying => switch (to) {
-            .queued, .done, .failed, .canceled, .paused => true,
+            .queued, .done, .failed, .canceled, .paused, .conflict => true,
             .transferring => from == .connecting,
             .verifying => from == .transferring,
             else => false,
         },
         .paused => switch (to) {
+            .queued, .canceled => true,
+            else => false,
+        },
+        // conflict parks like paused: the UI re-queues it (overwrite) or skips it.
+        .conflict => switch (to) {
             .queued, .canceled => true,
             else => false,
         },

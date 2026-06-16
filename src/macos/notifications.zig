@@ -108,7 +108,7 @@ pub const Notifier = struct {
     /// transfer_state listener (main thread, run-to-completion).
     pub fn onTransferState(self: *Notifier, e: relay.events.CoreEvent.TransferStateChange) void {
         switch (e.state) {
-            .queued, .connecting, .transferring, .paused => {
+            .queued, .connecting, .transferring, .paused, .conflict => {
                 // OOM: lose batch tracking for this item, never the app.
                 self.in_flight.put(self.gpa, e.item_id, {}) catch
                     log.warn("transfer batch tracking lost an item (OOM)", .{});

@@ -526,7 +526,7 @@ fn applyOutcome(eng: *Engine, lane: *Lane, it: *TransferItem, raw_outcome: Outco
             it.resume_hint = false;
             eng.setStateLocked(it, .done, null);
         },
-        .conflict_hold => eng.setStateLocked(it, .paused, null),
+        .conflict_hold => eng.setStateLocked(it, .conflict, null),
         .canceled => applyCancelLocked(eng, it),
         .failed => |info| switch (info.class) {
             .cancel => applyCancelLocked(eng, it),

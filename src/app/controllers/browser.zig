@@ -1824,6 +1824,8 @@ pub const BrowserPane = struct {
             .src = .{ .site_id = src_site, .path = src_path },
             .dst = .{ .site_id = dst_site, .path = dst_path },
             .bytes_total = entry.size orelse 0,
+            // Prompt before clobbering an existing destination file.
+            .conflict = .ask,
         }) catch return false;
         return true;
     }
@@ -1852,6 +1854,8 @@ pub const BrowserPane = struct {
             .kind = kind,
             .src = .{ .site_id = item_mod.local_site_id, .path = src_norm },
             .dst = .{ .site_id = dst_site, .path = dst_path },
+            // Prompt before clobbering an existing destination file.
+            .conflict = .ask,
         }) catch return false;
         return true;
     }

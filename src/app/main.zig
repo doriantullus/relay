@@ -369,6 +369,7 @@ fn buildUi() !void {
     g_ui.tabs.on_new_request = newTabRequest;
 
     g_ui.transfers = try transfers_mod.TransfersController.create(gpa, core);
+    g_ui.transfers.setPromptWindow(g_ui.win); // parent for the overwrite-confirm sheet
 
     g_ui.inspector = try inspector_mod.InspectorController.create(gpa, core);
     g_ui.inspector.setParentWindow(g_ui.win);

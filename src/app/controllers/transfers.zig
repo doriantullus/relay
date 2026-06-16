@@ -44,6 +44,8 @@ const runtime = mac.runtime;
 const table_source = mac.appkit.table_source;
 const split_view = mac.appkit.split_view;
 const menu = mac.appkit.menu;
+const panels = mac.appkit.panels;
+const Window = mac.appkit.window.Window;
 
 const uiglue = transcript_mod.uiglue;
 
@@ -97,6 +99,7 @@ pub fn stateLabel(state: TransferState) []const u8 {
         .completed => "Completed",
         .failed => "Failed",
         .canceled => "Canceled",
+        .conflict => "Conflict",
     };
 }
 
@@ -364,10 +367,11 @@ pub const QueueModel = struct {
         var agg: Aggregate = .{};
         for (self.rows.items) |row| {
             switch (row.state) {
-                .queued, .connecting, .transferring, .paused => {
+                .queued, .connecting, .transferring, .paused, .conflict => {
                     agg.done += row.bytes_done;
                     agg.total += row.bytes_total;
-                    if (row.state != .paused) agg.active += 1;
+                    // paused and conflict are parked, not actively transferring.
+                    if (row.state != .paused and row.state != .conflict) agg.active += 1;
                     if (row.state == .transferring) agg.rate += row.rate_bps;
                 },
                 .completed, .failed, .canceled => {},
@@ -618,6 +622,16 @@ pub const TransfersController = struct {
     header_cache: [160]u8 = undefined,
     header_cache_len: usize = 0,
 
+    // Overwrite-conflict prompts (transfers enqueued with ConflictPolicy.ask
+    // park in `.conflict` until resolved here). `prompt_win` is the parent for
+    // the sheet (set by main.zig); without it (headless) conflicts stay parked.
+    prompt_win: ?Window = null,
+    pending_conflicts: std.ArrayList(u64) = .empty,
+    conflict_sheet_open: bool = false,
+    conflict_current_id: u64 = 0,
+    /// Set by "Apply to all": auto-resolves the rest of this burst's conflicts.
+    conflict_sticky: ?bridge.ConflictPolicy = null,
+
     /// Background transfer-failure notifications (coalesced per drain). Inert
     /// until main.zig calls `attachFailureNotifier`.
     fail_notifier: FailureNotifier = .{},
@@ -778,6 +792,7 @@ pub const TransfersController = struct {
         uiglue.release(self.target);
         self.control_target.destroy();
         self.failed.deinit(self.gpa);
+        self.pending_conflicts.deinit(self.gpa);
         self.model.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
@@ -1027,8 +1042,111 @@ pub const TransfersController = struct {
             if (e.state == .failed) self.recordFailure("Transfer", failureReason(e.failure, ""));
             self.refreshFromEngine();
         }
+        if (e.state == .conflict) self.handleConflict(e.item_id);
         self.refreshFailedUi();
         self.updateAggregateLabel();
+        self.maybeResetConflictSticky();
+    }
+
+    // ------------------------------------------------------------------ //
+    // Overwrite-conflict prompts
+
+    /// main.zig wiring: the parent window for the overwrite-confirm sheet.
+    pub fn setPromptWindow(self: *TransfersController, win: ?Window) void {
+        self.prompt_win = win;
+    }
+
+    /// A transfer enqueued with ConflictPolicy.ask hit an existing destination
+    /// and parked in `.conflict`. Auto-resolve under a sticky "apply to all"
+    /// choice, else queue it for the confirm sheet.
+    fn handleConflict(self: *TransfersController, id: u64) void {
+        if (self.conflict_sticky) |policy| {
+            _ = self.core.resolveConflict(id, policy) catch {};
+            return;
+        }
+        self.pending_conflicts.append(self.gpa, id) catch {
+            // OOM: skip rather than ever silently overwrite.
+            _ = self.core.resolveConflict(id, .skip) catch {};
+            return;
+        };
+        self.presentNextConflict();
+    }
+
+    /// Show the confirm sheet for the front pending conflict (one at a time;
+    /// the sheet is window-modal). Skips stale ids (already resolved/removed).
+    fn presentNextConflict(self: *TransfersController) void {
+        if (self.conflict_sheet_open) return;
+        const win = self.prompt_win orelse return; // headless: leave parked
+        while (self.pending_conflicts.items.len > 0) {
+            const id = self.pending_conflicts.items[0];
+            const idx = self.model.rowOf(id) orelse {
+                _ = self.pending_conflicts.orderedRemove(0);
+                continue;
+            };
+            const row = &self.model.rows.items[idx];
+            if (row.state != .conflict) {
+                _ = self.pending_conflicts.orderedRemove(0);
+                continue;
+            }
+            self.conflict_current_id = id;
+            self.conflict_sheet_open = true;
+
+            const name = path_mod.basename(row.dst_path);
+            const dir = path_mod.parent(row.dst_path) orelse "/";
+            const where = switch (row.direction) {
+                .upload => "the server",
+                .download => "this Mac",
+            };
+            const verb = switch (row.direction) {
+                .upload => "uploading",
+                .download => "downloading",
+            };
+            var msg_buf: [name_cap + 64]u8 = undefined;
+            var info_buf: [1024]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "\"{s}\" already exists on {s}.", .{ name, where }) catch name;
+            const info = std.fmt.bufPrint(&info_buf, "In {s}. Overwrite it with the file you're {s}?", .{ dir, verb }) catch
+                "Overwrite the existing file?";
+            panels.beginAlertSheet(win, .{
+                .style = .warning,
+                .message = msg,
+                .informative = info,
+                .buttons = &.{ "Overwrite", "Skip" },
+                .destructive_button = 0,
+                .suppression_title = "Apply to all conflicts",
+            }, self, onConflictAnswer);
+            return;
+        }
+    }
+
+    fn onConflictAnswer(self: *TransfersController, result: panels.AlertResult) void {
+        self.conflict_sheet_open = false;
+        const id = self.conflict_current_id;
+        if (self.pending_conflicts.items.len > 0 and self.pending_conflicts.items[0] == id)
+            _ = self.pending_conflicts.orderedRemove(0);
+        const policy: bridge.ConflictPolicy = if (result.button == 0) .overwrite else .skip;
+        _ = self.core.resolveConflict(id, policy) catch {};
+        if (result.suppressed) {
+            // Apply to all: resolve every pending conflict now, and auto-resolve
+            // any that arrive later in this burst.
+            self.conflict_sticky = policy;
+            while (self.pending_conflicts.items.len > 0) {
+                const pid = self.pending_conflicts.orderedRemove(0);
+                _ = self.core.resolveConflict(pid, policy) catch {};
+            }
+        } else {
+            self.presentNextConflict();
+        }
+    }
+
+    /// Drop the sticky "apply to all" choice once the burst has fully settled
+    /// (no pending prompts, nothing in flight, no remaining conflicts), so a
+    /// later transfer prompts afresh.
+    fn maybeResetConflictSticky(self: *TransfersController) void {
+        if (self.conflict_sticky == null) return;
+        if (self.pending_conflicts.items.len > 0) return;
+        if (self.model.aggregate().active > 0) return;
+        for (self.model.rows.items) |row| if (row.state == .conflict) return;
+        self.conflict_sticky = null;
     }
 
     /// Feed a `.failed` transition into the background notifier with the live
@@ -1139,7 +1257,8 @@ pub const TransfersController = struct {
             switch (self.model.rows.items[idx].state) {
                 .paused => _ = self.core.resumeTransfer(id) catch false,
                 .queued, .connecting, .transferring => _ = self.core.pauseTransfer(id),
-                .completed, .failed, .canceled => {},
+                // conflict is resolved via the overwrite prompt, not Space.
+                .completed, .failed, .canceled, .conflict => {},
             }
         }
     }
@@ -1520,6 +1639,25 @@ test "queue model: sync builds id mapping, names, and parent prefixes" {
     // item.State projects onto the event vocabulary.
     try testing.expectEqual(TransferState.connecting, model.rows.items[0].state);
     try testing.expectEqual(TransferState.transferring, model.rows.items[2].state);
+}
+
+test "queue model: conflict rows are labeled and parked (not counted active)" {
+    var model: QueueModel = .{ .gpa = testing.allocator };
+    defer model.deinit();
+
+    const snaps = [_]ItemSnapshot{
+        snapItem(1, 0, .file, .conflict, 2, "/pub/a.txt", "/dl/a.txt", 100),
+        snapItem(2, 0, .file, .transferring, 2, "/pub/b.txt", "/dl/b.txt", 200),
+    };
+    try model.syncFromSnapshot(&snaps);
+
+    try testing.expectEqual(TransferState.conflict, model.rows.items[0].state);
+    try testing.expectEqualStrings("Conflict", stateLabel(model.rows.items[0].state));
+
+    // A parked conflict counts toward the byte totals but not the active set.
+    const agg = model.aggregate();
+    try testing.expectEqual(@as(usize, 1), agg.active);
+    try testing.expectEqual(@as(u64, 300), agg.total);
 }
 
 test "queue model: id mapping survives insert, remove, and reorder" {

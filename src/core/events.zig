@@ -26,6 +26,9 @@ pub const TransferState = enum(u8) {
     completed,
     failed,
     canceled,
+    /// Destination already exists and the item's policy is `.ask`: parked
+    /// until the UI resolves it (overwrite or skip).
+    conflict,
 };
 
 pub const SiteStatus = enum(u8) { connected, reconnecting, offline };

@@ -129,6 +129,7 @@ pub const RequestId = u64;
 pub const PaneToken = u64;
 pub const TransferSpec = engine_mod.Spec;
 pub const ItemId = item_mod.ItemId;
+pub const ConflictPolicy = item_mod.ConflictPolicy;
 
 /// Bridge-issued prompt ids start here; the queue engine's start at 1, so
 /// `respondPrompt` can route an answer by id alone.
@@ -995,6 +996,12 @@ pub const AppCore = struct {
 
     pub fn cancelTransfer(self: *AppCore, id: ItemId) bool {
         return self.engine.cancelItem(id);
+    }
+
+    /// Resolve a conflict-parked transfer (TransferState.conflict): re-run it
+    /// under `policy` (.overwrite) or drop it (.skip). See engine.resolveConflict.
+    pub fn resolveConflict(self: *AppCore, id: ItemId, policy: ConflictPolicy) !bool {
+        return self.engine.resolveConflict(id, policy);
     }
 
     pub fn removeTransfer(self: *AppCore, id: ItemId) bool {

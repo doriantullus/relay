@@ -357,7 +357,8 @@ pub const Engine = struct {
 
     fn cancelLocked(self: *Engine, it: *TransferItem) bool {
         switch (it.state) {
-            .queued, .paused => {
+            // queued/paused/conflict are parked — no worker owns the item.
+            .queued, .paused, .conflict => {
                 self.setStateLocked(it, .canceled, null);
                 self.saver.markDirty();
                 if (it.removed) self.unlinkDestroyLocked(it);
@@ -370,6 +371,27 @@ pub const Engine = struct {
             },
             .done, .failed, .canceled => return false,
         }
+    }
+
+    /// Resolve a conflict-parked item (state `.conflict`): re-run it under a
+    /// concrete `policy` (`.overwrite` / `.resume_existing` / `.rename`), or
+    /// drop it (`.skip`). No-op unless the item is actually waiting on a
+    /// conflict decision. Mirrors resumeLocked for the re-run path.
+    pub fn resolveConflict(self: *Engine, id: ItemId, policy: item_mod.ConflictPolicy) !bool {
+        self.lock();
+        defer self.unlock();
+        const it = self.findLocked(id) orelse return false;
+        if (it.state != .conflict) return false;
+        if (policy == .skip or policy == .ask) return self.cancelLocked(it);
+        it.conflict = policy;
+        it.pending = .none;
+        it.not_before_ns = 0;
+        it.token.reset();
+        self.setStateLocked(it, .queued, null);
+        self.saver.markDirty();
+        const lane = try self.sched.ensureLaneLocked(self, it.siteId());
+        lane.cond.signal(self.io);
+        return true;
     }
 
     /// Move item `id` to position `new_index` in the queue order.
@@ -502,7 +524,7 @@ pub const Engine = struct {
         for (self.items.items) |it| {
             if (it.removed) continue;
             const state: persist.PersistedState = switch (it.state) {
-                .queued, .resolving, .connecting, .transferring, .verifying => .queued,
+                .queued, .resolving, .connecting, .transferring, .verifying, .conflict => .queued,
                 .paused => .paused,
                 .failed => .failed,
                 .done, .canceled => continue,
@@ -1193,8 +1215,25 @@ test "conflict policies: skip, rename, ask, resume_existing" {
         .dst = .{ .site_id = 0, .path = "/ask.txt" },
         .conflict = .ask,
     });
-    try rig.waitState(ask, .paused); // parked for the UI
+    try rig.waitState(ask, .conflict); // parked for the UI
     try TestRig.expectFile(&rig.local, "/ask.txt", "old");
+    // Resolve with overwrite: it re-runs and replaces the file.
+    try testing.expect(try rig.eng.resolveConflict(ask, .overwrite));
+    try rig.waitState(ask, .done);
+    try TestRig.expectFile(&rig.local, "/ask.txt", "0123456789");
+
+    // A second .ask item resolved with .skip is dropped, leaving the file.
+    try rig.local.addFile("/ask2.txt", "keep me");
+    const ask2 = try rig.eng.enqueue(.{
+        .direction = .download,
+        .src = .{ .site_id = 1, .path = "/src.txt" },
+        .dst = .{ .site_id = 0, .path = "/ask2.txt" },
+        .conflict = .ask,
+    });
+    try rig.waitState(ask2, .conflict);
+    try testing.expect(try rig.eng.resolveConflict(ask2, .skip));
+    try rig.waitState(ask2, .canceled);
+    try TestRig.expectFile(&rig.local, "/ask2.txt", "keep me");
 
     const part = try rig.eng.enqueue(.{
         .direction = .download,

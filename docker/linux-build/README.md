@@ -7,6 +7,13 @@ side. No qemu, no second CI runner.
 
 ```sh
 docker build -t relay-linux-build docker/linux-build
+
+# Generate GTK bindings matching this container's GTK exactly (once, vendored).
+docker run --rm -v "$PWD:/src" \
+  -e ZIG_GLOBAL_CACHE_DIR=/src/zig-pkg-linux \
+  relay-linux-build ./docker/linux-build/gen-bindings.sh
+
+# Build both arches.
 docker run --rm -v "$PWD:/src" \
   -e ZIG_GLOBAL_CACHE_DIR=/src/zig-pkg-linux \
   relay-linux-build ./docker/linux-build/build-linux.sh
@@ -30,32 +37,50 @@ the one non-hermetic dependency, which is why it is quarantined here.
 
 ## Findings
 
-Four things cost real time to discover. They are encoded in `build-linux.sh`;
-this is the why.
+Five things cost real time to discover. They are encoded in `build-linux.sh`
+and `gen-bindings.sh`; this is the why.
 
-### 1. `translate-c` cannot process GTK4 headers (Zig 0.16.0)
+### 1. Bindings come from zig-gobject, not `translate-c`
 
-It SEGVs on aarch64 and emits **9,155 errors** on x86_64. Every one traces to
+`translate-c` **cannot process GTK4 headers** on Zig 0.16.0. It SEGVs on
+aarch64 and emits **9,155 errors** on x86_64, every one tracing to
 `_Pragma("GCC diagnostic pop")` inside glib's `G_DECLARE_FINAL_TYPE` /
 `G_GNUC_BEGIN_IGNORE_DEPRECATIONS` macros — Aro cannot expand `_Pragma` there,
-and glib uses it pervasively. `@cImport` is the same frontend.
+and glib uses it pervasively. `@cImport` is the same frontend, so it fails too.
 
-So `src/gtk/` reaches GTK the way `src/macos/` reaches AppKit: **declared by
-hand, in one module**. `relay_mac` imports no AppKit headers either — it
-hand-writes selector strings under the law in `src/macos/root.zig`. The same
-law applies here: ALL `extern fn` declarations live in `relay_gtk`.
+**zig-gobject is the answer.** v0.3.2 declares `minimum_zig_version = "0.16.0"`,
+an exact match for our pinned toolchain. It generates Zig from GIR XML rather
+than parsing C headers, so it sidesteps the frontend entirely, and the result
+is a properly typed API — not raw externs:
 
 ```zig
-const GtkApplication = opaque {};
-extern fn gtk_application_new(app_id: [*:0]const u8, flags: c_uint) ?*GtkApplication;
-extern fn gtk_window_present(window: *GtkWindow) void;
+const list_view = gtk.ListView.new(selection_model.as(gtk.SelectionModel),
+                                   item_factory.as(gtk.ListItemFactory));
+_ = gtk.SignalListItemFactory.signals.bind.connect(
+    item_factory, ?*anyopaque, &bindListItem, null, .{});
 ```
 
-Before committing to hand-declaring the full surface (GtkColumnView,
-GListModel, header bar, popovers, dialogs, DnD, GSettings), evaluate
-**zig-gobject** — it generates bindings from GIR XML rather than C headers, so
-it sidesteps this entirely. `gir1.2-gtk-4.0` is already in the image; it
-arrives as a dependency of `libgtk-4-dev`.
+`gen-bindings.sh` generates from **this container's own GIR**, so the bindings
+match the installed GTK 4.18.6 exactly. The upstream pre-generated artifacts
+track the latest two GNOME releases (49/50 = GTK 4.20/4.22) and would be ahead
+of the runtime. Output: **194,338 lines across 14 modules** (gtk4 alone is
+75,180) in ~12s — that is the binding surface not written by hand. For scale,
+`relay_mac` is 8,104 lines of hand-written AppKit binding.
+
+Verified: zig-gobject's own example suite — including `list_view.zig`, which
+exercises the `GtkListView` + selection-model + factory pattern that Relay's
+file table needs — builds for **both** arches in this container.
+
+Two wrinkles, both handled by `gen-bindings.sh`:
+
+- **`xsltproc` is required.** The GIR fix-ups are XSLT; without it codegen dies
+  with `failed to execute xsltproc Gtk-4.0: error.FileNotFound`.
+- **GIR files are split by arch, like pkg-config data.** Most live in the
+  shared `/usr/share/gir-1.0`, but GLib/GObject ship theirs per-arch under
+  `/usr/lib/<triple>/gir-1.0`. Pass BOTH or codegen fails with `no GIR file
+  found for GLib-2.0`. The two arches' generated output differs by exactly one
+  unused constant (`VA_COPY_AS_ARRAY`), with no type-width differences — so
+  generating once from the native arch serves both.
 
 ### 2. `PKG_CONFIG_LIBDIR` must include `/usr/share/pkgconfig`
 
@@ -90,7 +115,26 @@ fn addPkgConfigLibs(b: *std.Build, mod: *std.Build.Module, pkg: []const u8) void
 `.use_pkg_config = .no` matters: Zig would otherwise re-invoke pkg-config
 itself and lose the arch selection.
 
-### 4. Pin the glibc floor to the container's
+### 4. `--search-prefix` must be LIB-ONLY
+
+pkg-config emits no `-L`, and a cross target will not search the host's
+`/usr/lib`, so linking fails with `unable to find dynamic system library
+'gtk-4' … searched paths: none`. Zig appends `lib/` and `include/` to a
+`--search-prefix`, so the Dockerfile builds `/opt/sys-<arch>/lib ->
+/usr/lib/<triple>` — **with no `include/` symlink**.
+
+That omission is load-bearing. Adding `/usr/include` to the prefix poisons
+every C compilation in the build: the vendored LibreSSL picks up system glibc
+headers over Zig's bundled libc and the hermetic core build collapses
+(`'__INT64_C' macro redefined`, `call to undeclared function 'freezero'`,
+`use of undeclared identifier 'SYSLOG_DATA_INIT'`). GTK's header paths already
+arrive as `-I` flags from pkg-config, scoped to the module that asked for them,
+which is where they belong.
+
+`build-linux.sh` passes `--search-prefix /opt/sys-<arch>` for this reason;
+`relay_core` builds hermetically alongside it, unaffected.
+
+### 5. Pin the glibc floor to the container's
 
 `-Dtarget=x86_64-linux-gnu.2.41`, not `-Dtarget=x86_64-linux-gnu`. Zig
 defaults to a 2.31 floor; trixie's `libvulkan.so` references `dlopen@GLIBC_2.34`

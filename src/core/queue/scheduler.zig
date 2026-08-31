@@ -376,8 +376,8 @@ fn runTransfer(eng: *Engine, lane: *Lane, it: *TransferItem, buf: []u8) Outcome 
             return failOutcome(.transient, "connection lost mid-read: {s}", .{it.src.path});
         };
         if (n == 0) break;
-        global_bucket.acquire(io, token, n) catch return .canceled;
-        lane_bucket.acquire(io, token, n) catch return .canceled;
+        global_bucket.acquire(.fromIo(io), token, n) catch return .canceled;
+        lane_bucket.acquire(.fromIo(io), token, n) catch return .canceled;
         ws.writer.writeAll(buf[0..n]) catch {
             if (token.isCanceled()) return .canceled;
             return failOutcome(.transient, "connection lost mid-write: {s}", .{it.dst.path});

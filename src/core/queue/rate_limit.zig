@@ -15,9 +15,60 @@ const ns_per_s: i128 = std.time.ns_per_s;
 
 const lockSpin = @import("../sync.zig").lockSpin;
 
-fn nowNs(io: std.Io) i96 {
-    return std.Io.Clock.awake.now(io).nanoseconds;
-}
+/// Time source for the bucket. `real` reads the host clock and sleeps on
+/// it (production); `virtual` advances a counter instead, so pacing is
+/// deterministic and instant.
+///
+/// Why the seam exists: the bucket's accuracy is a property of its token
+/// math, but measuring it through real sleeps measures the HOST's scheduler
+/// too. On oversubscribed CI runners `io.sleep` overshoots without bound, so
+/// no wall-clock tolerance can hold — a ±20% window here was red on GitHub's
+/// macOS runners while the arithmetic was exactly right. Under `virtual` the
+/// pacing assertions below are exact, and the one remaining real-clock test
+/// asserts only a lower bound, which any host must satisfy.
+pub const Clock = union(enum) {
+    real: std.Io,
+    virtual: *Virtual,
+
+    pub const Virtual = struct {
+        now_ns: i96 = 0,
+        /// Total virtual time slept — the pacing the bucket actually asked
+        /// for, with no host noise mixed in.
+        slept_ns: u64 = 0,
+        /// Fired after each sleep, to model an event arriving mid-wait.
+        on_sleep: ?*const fn (*Virtual) void = null,
+        /// Opaque payload for `on_sleep`.
+        context: ?*anyopaque = null,
+
+        pub fn clock(self: *Virtual) Clock {
+            return .{ .virtual = self };
+        }
+    };
+
+    pub fn fromIo(io: std.Io) Clock {
+        return .{ .real = io };
+    }
+
+    pub fn nowNs(self: Clock) i96 {
+        return switch (self) {
+            .real => |io| std.Io.Clock.awake.now(io).nanoseconds,
+            .virtual => |v| v.now_ns,
+        };
+    }
+
+    fn sleep(self: Clock, ns: u64) void {
+        switch (self) {
+            // io.sleep's own Canceled belongs to std.Io task cancellation,
+            // which this engine does not use; our token is checked above.
+            .real => |io| io.sleep(.fromNanoseconds(ns), .awake) catch {},
+            .virtual => |v| {
+                v.now_ns += @intCast(ns);
+                v.slept_ns += ns;
+                if (v.on_sleep) |f| f(v);
+            },
+        }
+    }
+};
 
 pub const TokenBucket = struct {
     /// Spin lock (see events.zig for why not std.Io.Mutex): the critical
@@ -45,18 +96,18 @@ pub const TokenBucket = struct {
 
     /// Runtime adjustment. Forgives outstanding debt so lowering the limit
     /// mid-transfer never stalls a pump for the old debt at the new rate.
-    pub fn setRate(self: *TokenBucket, io: std.Io, new_rate: u64) void {
+    pub fn setRate(self: *TokenBucket, clock: Clock, new_rate: u64) void {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        self.refillLocked(nowNs(io));
+        self.refillLocked(clock.nowNs());
         self.rate = new_rate;
         if (self.balance_scaled < 0) self.balance_scaled = 0;
     }
 
-    pub fn setCapacity(self: *TokenBucket, io: std.Io, new_capacity: u64) void {
+    pub fn setCapacity(self: *TokenBucket, clock: Clock, new_capacity: u64) void {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        self.refillLocked(nowNs(io));
+        self.refillLocked(clock.nowNs());
         self.capacity = @max(new_capacity, 1);
     }
 
@@ -64,7 +115,7 @@ pub const TokenBucket = struct {
     /// bucket can cover them. Returns immediately when unlimited.
     pub fn acquire(
         self: *TokenBucket,
-        io: std.Io,
+        clock: Clock,
         token: *const cancel_mod.CancelToken,
         n: u64,
     ) error{Canceled}!void {
@@ -75,7 +126,7 @@ pub const TokenBucket = struct {
                 lockSpin(&self.mutex);
                 defer self.mutex.unlock();
                 if (self.rate == 0) break :blk 0;
-                self.refillLocked(nowNs(io));
+                self.refillLocked(clock.nowNs());
                 if (self.balance_scaled > 0) {
                     self.balance_scaled -= @as(i128, n) * ns_per_s;
                     break :blk 0;
@@ -85,9 +136,7 @@ pub const TokenBucket = struct {
                 break :blk @intCast(@min(ns, std.math.maxInt(u64)));
             };
             if (wait_ns == 0) return;
-            // io.sleep's own Canceled belongs to std.Io task cancellation,
-            // which this engine does not use; our token is checked above.
-            io.sleep(.fromNanoseconds(@min(wait_ns, max_sleep_ns)), .awake) catch {};
+            clock.sleep(@min(wait_ns, max_sleep_ns));
         }
     }
 
@@ -106,79 +155,101 @@ pub const TokenBucket = struct {
 };
 
 test "unlimited bucket never sleeps" {
-    const io = std.testing.io;
+    var v: Clock.Virtual = .{};
     var bucket: TokenBucket = .init(0, 1);
     var token: cancel_mod.CancelToken = .{};
-    const start = nowNs(io);
     var i: usize = 0;
-    while (i < 1000) : (i += 1) try bucket.acquire(io, &token, 1 << 30);
-    const elapsed_ms = @divTrunc(nowNs(io) - start, std.time.ns_per_ms);
-    try std.testing.expect(elapsed_ms < 50);
+    while (i < 1000) : (i += 1) try bucket.acquire(v.clock(), &token, 1 << 30);
+    try std.testing.expectEqual(@as(u64, 0), v.slept_ns);
 }
 
-test "rate accuracy within 20% over a short window" {
-    const io = std.testing.io;
+test "rate accuracy is exact under a virtual clock" {
     const rate: u64 = 1_000_000; // bytes/s
     const capacity: u64 = 10_000;
     const chunk: u64 = 10_000;
     const chunks: u64 = 10;
 
+    var v: Clock.Virtual = .{};
     var bucket: TokenBucket = .init(rate, capacity);
     var token: cancel_mod.CancelToken = .{};
 
-    const start = nowNs(io);
     var i: u64 = 0;
-    while (i < chunks) : (i += 1) try bucket.acquire(io, &token, chunk);
-    const elapsed_ns: i128 = nowNs(io) - start;
+    while (i < chunks) : (i += 1) try bucket.acquire(v.clock(), &token, chunk);
 
     // Borrowing model: the initial burst covers the first chunk and the
     // second is taken on credit, so the paced portion is total − 2 chunks.
     const expected_ns: i128 = @as(i128, (chunks * chunk - capacity - chunk)) * ns_per_s / rate;
-    try std.testing.expect(elapsed_ns >= @divTrunc(expected_ns * 8, 10));
-    try std.testing.expect(elapsed_ns <= @divTrunc(expected_ns * 12, 10));
+    // Exact, not a tolerance: the only slack is the +1 ns rounding in
+    // acquire's deficit math, at most once per paced chunk.
+    try std.testing.expect(v.now_ns >= expected_ns);
+    try std.testing.expect(v.now_ns <= expected_ns + @as(i128, chunks));
+}
+
+test "real clock: pacing is wired through std.Io" {
+    const io = std.testing.io;
+    const rate: u64 = 1_000_000;
+    const capacity: u64 = 10_000;
+    const chunk: u64 = 10_000;
+    const chunks: u64 = 4;
+
+    var bucket: TokenBucket = .init(rate, capacity);
+    var token: cancel_mod.CancelToken = .{};
+
+    const start = std.Io.Clock.awake.now(io).nanoseconds;
+    var i: u64 = 0;
+    while (i < chunks) : (i += 1) try bucket.acquire(.fromIo(io), &token, chunk);
+    const elapsed_ns: i128 = std.Io.Clock.awake.now(io).nanoseconds - start;
+
+    // LOWER BOUND ONLY, and that is the whole point: the bucket cannot hand
+    // out tokens before they accrue, so this holds on any host however
+    // loaded. An upper bound here would measure the host's sleep overshoot
+    // rather than the bucket — see Clock's doc comment. Exactness lives in
+    // the virtual-clock test above.
+    const expected_ns: i128 = @as(i128, (chunks * chunk - capacity - chunk)) * ns_per_s / rate;
+    try std.testing.expect(elapsed_ns >= @divTrunc(expected_ns * 9, 10));
 }
 
 test "pre-canceled token aborts immediately" {
-    const io = std.testing.io;
+    var v: Clock.Virtual = .{};
     var bucket: TokenBucket = .init(10, 1); // 10 B/s: would wait ~forever
     var token: cancel_mod.CancelToken = .{};
-    try bucket.acquire(io, &token, 1_000_000); // burst+borrow: no wait
+    try bucket.acquire(v.clock(), &token, 1_000_000); // burst+borrow: no wait
     token.cancel();
-    try std.testing.expectError(error.Canceled, bucket.acquire(io, &token, 1));
+    try std.testing.expectError(error.Canceled, bucket.acquire(v.clock(), &token, 1));
+    try std.testing.expectEqual(@as(u64, 0), v.slept_ns);
 }
 
-test "cancel during exhaustion wait is bounded by the sleep slice" {
-    const io = std.testing.io;
+test "cancel during exhaustion wait is observed within one sleep slice" {
+    var v: Clock.Virtual = .{};
     var bucket: TokenBucket = .init(100, 1);
     var token: cancel_mod.CancelToken = .{};
-    try bucket.acquire(io, &token, 1_000_000_000); // huge debt
+    try bucket.acquire(v.clock(), &token, 1_000_000_000); // huge debt
 
-    const Canceler = struct {
-        fn run(t: *cancel_mod.CancelToken) void {
-            std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
+    // Model the cancel arriving mid-wait: it fires from inside the sleep.
+    const Hook = struct {
+        fn cancelFromSleep(vc: *Clock.Virtual) void {
+            const t: *cancel_mod.CancelToken = @ptrCast(@alignCast(vc.context.?));
             t.cancel();
         }
     };
-    const thread = try std.Thread.spawn(.{}, Canceler.run, .{&token});
-    defer thread.join();
+    v.on_sleep = Hook.cancelFromSleep;
+    v.context = &token;
+    v.slept_ns = 0;
 
-    const start = nowNs(io);
-    try std.testing.expectError(error.Canceled, bucket.acquire(io, &token, 1));
-    const elapsed_ms = @divTrunc(nowNs(io) - start, std.time.ns_per_ms);
-    // One full slice (20 ms) + scheduling slack.
-    try std.testing.expect(elapsed_ms < 100);
+    try std.testing.expectError(error.Canceled, bucket.acquire(v.clock(), &token, 1));
+    // Exactly one slice — the token is re-checked at the top of every loop.
+    try std.testing.expectEqual(TokenBucket.max_sleep_ns, v.slept_ns);
 }
 
 test "setRate to unlimited releases waiters' future acquires" {
-    const io = std.testing.io;
+    var v: Clock.Virtual = .{};
     var bucket: TokenBucket = .init(100, 1);
     var token: cancel_mod.CancelToken = .{};
-    try bucket.acquire(io, &token, 1_000_000_000);
-    bucket.setRate(io, 0); // also forgives the debt
-    const start = nowNs(io);
-    try bucket.acquire(io, &token, 1_000_000_000);
-    const elapsed_ms = @divTrunc(nowNs(io) - start, std.time.ns_per_ms);
-    try std.testing.expect(elapsed_ms < 50);
+    try bucket.acquire(v.clock(), &token, 1_000_000_000);
+    bucket.setRate(v.clock(), 0); // also forgives the debt
+    v.slept_ns = 0;
+    try bucket.acquire(v.clock(), &token, 1_000_000_000);
+    try std.testing.expectEqual(@as(u64, 0), v.slept_ns);
 }
 
 test {

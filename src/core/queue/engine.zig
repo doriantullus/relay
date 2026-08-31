@@ -467,8 +467,8 @@ pub const Engine = struct {
 
     pub fn setGlobalRateLimit(self: *Engine, direction: item_mod.Direction, bytes_per_s: u64) void {
         switch (direction) {
-            .upload => self.global_up.setRate(self.io, bytes_per_s),
-            .download => self.global_down.setRate(self.io, bytes_per_s),
+            .upload => self.global_up.setRate(.fromIo(self.io), bytes_per_s),
+            .download => self.global_down.setRate(.fromIo(self.io), bytes_per_s),
         }
     }
 
@@ -477,8 +477,8 @@ pub const Engine = struct {
         defer self.unlock();
         const lane = try self.sched.ensureLaneLocked(self, site_id);
         switch (direction) {
-            .upload => lane.up.setRate(self.io, bytes_per_s),
-            .download => lane.down.setRate(self.io, bytes_per_s),
+            .upload => lane.up.setRate(.fromIo(self.io), bytes_per_s),
+            .download => lane.down.setRate(.fromIo(self.io), bytes_per_s),
         }
     }
 
@@ -1316,7 +1316,7 @@ test "rate limited download obeys the global cap" {
     // 1 MB/s cap, 100 KB file with a small burst: expect ≥ ~70 ms.
     try rig.start(.{ .conns = 1, .chunk_size = 10_000, .rate_down = 1_000_000 });
     defer rig.stop();
-    rig.eng.global_down.setCapacity(testing.io, 10_000);
+    rig.eng.global_down.setCapacity(.fromIo(testing.io), 10_000);
 
     const payload = try patternBytes(testing.allocator, 100_000);
     defer testing.allocator.free(payload);

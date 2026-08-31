@@ -1107,8 +1107,9 @@ test "cancel mid-transfer resolves within 150ms" {
 }
 
 test "progress events are coalesced far below chunk count" {
+    const interval_ms: u64 = 4;
     var rig: TestRig = undefined;
-    try rig.start(.{ .conns = 1, .chunk_size = 512, .progress_interval_ms = 4 });
+    try rig.start(.{ .conns = 1, .chunk_size = 512, .progress_interval_ms = interval_ms });
     defer rig.stop();
 
     // 64 KiB in 512-byte mock reads with a 0.5 ms stall ≈ 64 ms transfer.
@@ -1118,20 +1119,38 @@ test "progress events are coalesced far below chunk count" {
     defer testing.allocator.free(payload);
     try rig.remote.addFile("/p.bin", payload);
 
+    const started_ns = std.Io.Clock.awake.now(testing.io).nanoseconds;
     const id = try rig.eng.enqueue(.{
         .direction = .download,
         .src = .{ .site_id = 1, .path = "/p.bin" },
         .dst = .{ .site_id = 0, .path = "/dl/p.bin" },
     });
     try rig.waitState(id, .done);
+    const elapsed_ms: u64 = @intCast(@divTrunc(
+        std.Io.Clock.awake.now(testing.io).nanoseconds - started_ns,
+        std.time.ns_per_ms,
+    ));
     try rig.drainEvents();
 
     const reads = rig.remote.read_calls.load(.monotonic);
     const progress = rig.progressCount(id);
     try testing.expect(reads >= 125); // 64_000 / 512
     try testing.expect(progress >= 1);
-    // "Far below": at least 4x fewer events than stream reads.
-    try testing.expect(progress * 4 < reads);
+
+    // Coalescing is TIMER-driven (timerMain sleeps progress_interval_ms),
+    // so the honest invariant ties events to elapsed time, not to read
+    // count: the ticker cannot emit more than one event per interval.
+    //
+    // Comparing against `reads` instead — the previous `progress * 4 <
+    // reads` — silently required mean per-read wall time below
+    // interval_ms/4 (1 ms here) while the mock only asks for a 0.5 ms
+    // stall. That 2x margin is a property of the HOST, not the engine: it
+    // holds on a quiet dev machine (~0.65 ms/read) and fails in a loaded
+    // VM (~3 ms/read), where the engine coalesces just as correctly.
+    const max_ticks = elapsed_ms / interval_ms + 2; // +2: partial ticks at both ends
+    try testing.expect(progress <= max_ticks);
+    // Still far below the per-chunk rate — the point of coalescing.
+    try testing.expect(progress < reads);
 
     // The EWMA published a nonzero rate while moving.
     var max_rate: u64 = 0;

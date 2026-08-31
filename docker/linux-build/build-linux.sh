@@ -18,7 +18,10 @@
 #  2. `pkg-config --libs-only-L gtk4` is EMPTY (Debian ships GTK on the
 #     default linker path). `--variable=libdir` is what yields the arch dir,
 #     and a cross target will not search the host's /usr/lib without it.
-#  3. The glibc floor MUST be pinned to the container's. Zig defaults to
+#  3. --search-prefix /opt/sys-<arch> (symlink dirs built in the Dockerfile).
+#     pkg-config emits no -L, and a cross target will not search the host's
+#     /usr/lib, so linking otherwise fails "searched paths: none".
+#  4. The glibc floor MUST be pinned to the container's. Zig defaults to
 #     2.31; trixie's libvulkan references 2.34/2.38 symbols and ld.lld
 #     rejects the mismatch. This makes the base image your minimum
 #     supported distro — bump GLIBC with the base image, never alone.
@@ -36,7 +39,9 @@ for pair in aarch64:arm64 x86_64:amd64; do
     name="${pair##*:}"
     echo "=== $name ($triple.$GLIBC) ==="
     PKG_CONFIG_LIBDIR="/usr/lib/$triple/pkgconfig:/usr/share/pkgconfig" \
-        zig build "$STEP" -Dtarget="$triple.$GLIBC" -p "zig-out/linux-$name"
+        zig build "$STEP" -Dtarget="$triple.$GLIBC" \
+            --search-prefix "/opt/sys-$name" \
+            -p "zig-out/linux-$name"
 done
 
 echo "=== done ==="

@@ -23,7 +23,7 @@ Native FTP/FTPS/SFTP client in Zig 0.16. The AppKit frontend targets macOS
 
 ```
 app_gtk (Linux exe)      process assembly: XDG/GLib/Secret Service injection,
-                         factories lifetime, relay_gtk application launch
+                         SiteStore + factories lifetime, relay_gtk launch
 app (macOS exe)          main.zig window assembly + M3 integration (state
                          restoration, Quick Look temp-cache flow, palette/
                          edit/terminal glue) · app_delegate · controllers/

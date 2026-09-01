@@ -1,13 +1,16 @@
 # Relay — Linux port plan
 
-**Status (2026-09-01): first usable Linux slice builds on arm64 and x86_64.**
+**Status (2026-09-01): remote browsing slice builds on arm64 and x86_64.**
 Steps 1–4 are complete: `relay_ui` contains AppCore, factories, paths/main-loop
 seams, and the extracted pure feature models. Step 5 has vendored GTK 4.18.6
 bindings, GLib/XDG implementations, and a libsecret credential backend. Step
-6 now launches a native GTK app with two independently navigable local panes
-driven asynchronously by the shared AppCore. It is a working port foundation,
-not feature parity with the M3 AppKit frontend; the remaining work is tracked
-below.
+6 now launches a native GTK app with a local left pane and a right pane that
+connects to saved or ad-hoc FTP/FTPS/SFTP sites. Saved-site selection, URL and
+SSH-config-alias Quick Connect, password/keyboard-interactive and host-key
+prompts, connection status, disconnect, and asynchronous remote navigation all
+use the shared AppCore and production factories. It is a usable remote browser,
+not feature parity with the M3 AppKit frontend; transfers and the remaining
+power-feature views are tracked below.
 
 Verify the current state:
 
@@ -345,18 +348,27 @@ code never touches it.
 - Wrap the widgets `relay_mac` wraps: a virtual table over `GtkColumnView` +
   `GListModel` (the analogue of `table_source.zig`), tree/outline for the
   sidebar, split view, dialogs, drag & drop. **The application/header bar,
-  split view, path controls, scrollers, and list rows exist; virtualized column
-  views, dialogs, sidebar, and drag/drop remain.**
+  split view, path controls, scrollers, list rows, saved-site picker, Quick
+  Connect form, and authentication/host-key dialogs exist; virtualized column
+  views, a full sites sidebar/editor, transfer dialogs, and drag/drop remain.**
 
-### Step 6 — `src/app_gtk/` (FIRST SLICE DONE)
+### Step 6 — `src/app_gtk/` (REMOTE BROWSING DONE)
 
-`src/app_gtk/main.zig` is intentionally only process assembly. GTK contact
-stays in `relay_gtk/application.zig`, which currently supplies two local panes
-with path entry, up, refresh, async loading status, sorted AppCore snapshots,
-directory activation, stale-request rejection, and deterministic listener/
-snapshot cleanup.
+`src/app_gtk/main.zig` is intentionally only process assembly. It pins the
+shared `SiteStore` until after AppCore shutdown because protocol workers borrow
+site strings. GTK contact stays in `relay_gtk/application.zig`, which supplies
+a local left pane and a local-or-remote right pane with path entry, up, refresh,
+async loading status, sorted AppCore snapshots, directory activation, stale-
+request rejection, and deterministic listener/snapshot cleanup.
 
-The remaining ~10–12k-line view layer should keep deliberate UX divergences —
+The connection slice supports saved sites and Quick Connect targets
+(`sftp://`, `ftps://`, `ftp://`, or an SSH-config alias), optional persistence
+to `sites.zon`, Secret Service password prompts (including transient/non-saved
+credentials), keyboard-interactive and host-key prompts, live connection
+status, server switching, and disconnect back to a local pane. Site CRUD/import
+UI and connection history still belong to later reviewable slices.
+
+The remaining view layer should keep deliberate UX divergences —
 do not try to clone `docs/UX.md` literally:
 
 | macOS | Linux |

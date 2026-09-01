@@ -131,6 +131,8 @@ const Window = struct {
     native: *gtk.ApplicationWindow,
     panes: [2]Pane = undefined,
     panes_initialized: usize = 0,
+    transfers: TransferPanel = undefined,
+    transfers_initialized: bool = false,
     listeners_registered: bool = false,
     site_model: *gtk.StringList,
     site_picker: *gtk.DropDown,
@@ -216,7 +218,13 @@ const Window = struct {
         self.panes_initialized = 2;
         split.setStartChild(self.panes[0].root.as(gtk.Widget));
         split.setEndChild(self.panes[1].root.as(gtk.Widget));
-        window.setChild(split.as(gtk.Widget));
+
+        self.transfers.init(self);
+        self.transfers_initialized = true;
+        const content = gtk.Box.new(.vertical, 0);
+        content.append(split.as(gtk.Widget));
+        content.append(self.transfers.root.as(gtk.Widget));
+        window.setChild(content.as(gtk.Widget));
 
         // Mark registration live before the first append so errdefer cleanup
         // also removes a partially registered listener set.
@@ -225,6 +233,10 @@ const Window = struct {
         try core.registerListener(.listing_done, self, onListingDone);
         try core.registerListener(.site_status, self, onSiteStatus);
         try core.registerListener(.prompt_needed, self, onPromptNeeded);
+        try core.registerListener(.transfer_state, self, onTransferState);
+        try core.registerListener(.transfer_progress, self, onTransferProgress);
+
+        self.transfers.syncFromEngine();
 
         try self.panes[0].navigate("/");
         try self.panes[1].navigate("/");
@@ -250,6 +262,10 @@ const Window = struct {
         self.site_ids.deinit(self.gpa);
         self.ssh.deinit();
         self.site_model.unref();
+        if (self.transfers_initialized) {
+            self.transfers.deinit();
+            self.transfers_initialized = false;
+        }
         var i = self.panes_initialized;
         while (i > 0) {
             i -= 1;
@@ -410,6 +426,14 @@ const Window = struct {
                 else => .{ .auth = false },
             });
         };
+    }
+
+    fn onTransferState(self: *Window, event: relay.events.CoreEvent.TransferStateChange) void {
+        self.transfers.applyState(event);
+    }
+
+    fn onTransferProgress(self: *Window, event: relay.events.CoreEvent.TransferProgress) void {
+        self.transfers.applyProgress(event);
     }
 
     fn ensureSite(self: *Window, fields: SiteFields, persist: bool) !u64 {
@@ -831,12 +855,15 @@ const Pane = struct {
         const path_entry = gtk.Entry.new();
         path_entry.setPlaceholderText("Absolute path");
         path_entry.as(gtk.Widget).setHexpand(1);
+        const copy = gtk.Button.newWithLabel(if (token == 1) "Copy →" else "← Copy");
+        copy.as(gtk.Widget).setTooltipText("Copy selected items to the other pane");
         const spinner = gtk.Spinner.new();
         spinner.as(gtk.Widget).setVisible(0);
         toolbar.append(up.as(gtk.Widget));
         toolbar.append(refresh.as(gtk.Widget));
         toolbar.append(site_label.as(gtk.Widget));
         toolbar.append(path_entry.as(gtk.Widget));
+        toolbar.append(copy.as(gtk.Widget));
         toolbar.append(spinner.as(gtk.Widget));
 
         const list = gtk.ListBox.new();
@@ -872,6 +899,7 @@ const Pane = struct {
 
         _ = gtk.Button.signals.clicked.connect(up, *Pane, onUp, self, .{});
         _ = gtk.Button.signals.clicked.connect(refresh, *Pane, onRefresh, self, .{});
+        _ = gtk.Button.signals.clicked.connect(copy, *Pane, onCopy, self, .{});
         _ = gtk.Entry.signals.activate.connect(path_entry, *Pane, onPathActivated, self, .{});
         _ = gtk.ListBox.signals.row_activated.connect(list, *Pane, onRowActivated, self, .{});
     }
@@ -986,6 +1014,85 @@ const Pane = struct {
         self.navigate(self.currentPath()) catch |err| self.setStatus("Refresh failed: {s}", .{@errorName(err)});
     }
 
+    fn onCopy(_: *gtk.Button, self: *Pane) callconv(.c) void {
+        const destination = if (self == &self.owner.panes[0])
+            &self.owner.panes[1]
+        else
+            &self.owner.panes[0];
+        if (self.pending_request != null or destination.pending_request != null or
+            self.snapshot == null or destination.snapshot == null)
+        {
+            self.setStatus("Both panes must finish loading before copying", .{});
+            return;
+        }
+        if (self.site_id == destination.site_id and
+            std.mem.eql(u8, self.snapshot.?.path, destination.snapshot.?.path))
+        {
+            self.setStatus("Choose a different destination folder", .{});
+            return;
+        }
+        var selection: CopySelection = .{ .source = self, .destination = destination };
+        self.list.selectedForeach(copySelectedRow, &selection);
+        if (selection.selected == 0) {
+            self.setStatus("Select one or more items to copy", .{});
+            return;
+        }
+        if (selection.enqueued == 0) {
+            self.setStatus("Could not queue selected items", .{});
+            return;
+        }
+        self.setStatus("Queued {d} of {d} selected item{s}", .{
+            selection.enqueued,
+            selection.selected,
+            if (selection.selected == 1) "" else "s",
+        });
+        self.owner.transfers.root.setExpanded(1);
+        self.owner.transfers.syncFromEngine();
+    }
+
+    const CopySelection = struct {
+        source: *Pane,
+        destination: *Pane,
+        selected: usize = 0,
+        enqueued: usize = 0,
+    };
+
+    fn copySelectedRow(_: *gtk.ListBox, row: *gtk.ListBoxRow, raw: ?*anyopaque) callconv(.c) void {
+        const selection: *CopySelection = @ptrCast(@alignCast(raw.?));
+        selection.selected += 1;
+        const source = selection.source;
+        const source_snapshot = source.snapshot orelse return;
+        const destination_snapshot = selection.destination.snapshot orelse return;
+        const row_index = row.getIndex();
+        if (row_index < 0 or @as(usize, @intCast(row_index)) >= source.sort_index.len) return;
+        const entry_index = source.sort_index[@intCast(row_index)];
+        if (entry_index >= source_snapshot.entries.len) return;
+        const entry = &source_snapshot.entries[entry_index];
+        if (!relay.vfs.path.isSafeChildName(entry.name)) return;
+
+        const src_path = relay.vfs.path.join(source.owner.gpa, source_snapshot.path, entry.name) catch return;
+        defer source.owner.gpa.free(src_path);
+        const dst_path = relay.vfs.path.join(source.owner.gpa, destination_snapshot.path, entry.name) catch return;
+        defer source.owner.gpa.free(dst_path);
+        if (source.site_id == selection.destination.site_id and
+            (std.mem.eql(u8, src_path, dst_path) or
+                (entry.kind == .dir and pathContains(src_path, dst_path)))) return;
+        _ = source.owner.core.enqueueTransfer(.{
+            .direction = if (selection.destination.site_id != local_site_id) .upload else .download,
+            .kind = if (entry.kind == .dir) .folder else .file,
+            .src = .{ .site_id = source.site_id, .path = src_path },
+            .dst = .{ .site_id = selection.destination.site_id, .path = dst_path },
+            .conflict = .ask,
+            .bytes_total = entry.size orelse 0,
+        }) catch return;
+        selection.enqueued += 1;
+    }
+
+    fn pathContains(parent: []const u8, candidate: []const u8) bool {
+        if (!std.mem.startsWith(u8, candidate, parent) or candidate.len <= parent.len) return false;
+        return parent.len == 1 or candidate[parent.len] == '/';
+    }
+
     fn onPathActivated(_: *gtk.Entry, self: *Pane) callconv(.c) void {
         const path = std.mem.span(self.path_entry.as(gtk.Editable).getText());
         self.navigate(path) catch |err| self.setStatus("Invalid path: {s}", .{@errorName(err)});
@@ -1010,6 +1117,392 @@ const Pane = struct {
         self.navigate(next) catch |err| self.setStatus("Cannot open folder: {s}", .{@errorName(err)});
     }
 };
+
+const TransferPanel = struct {
+    owner: *Window,
+    root: *gtk.Expander,
+    list: *gtk.ListBox,
+    summary: *gtk.Label,
+    rows: std.ArrayList(TransferRow) = .empty,
+    conflict_dialog: ?*ConflictDialog = null,
+
+    fn init(self: *TransferPanel, owner: *Window) void {
+        const root = gtk.Expander.new("Transfers");
+        root.setResizeToplevel(0);
+
+        const body = gtk.Box.new(.vertical, 6);
+        const body_widget = body.as(gtk.Widget);
+        body_widget.setMarginTop(6);
+        body_widget.setMarginBottom(8);
+        body_widget.setMarginStart(8);
+        body_widget.setMarginEnd(8);
+
+        const controls = gtk.Box.new(.horizontal, 6);
+        const summary = gtk.Label.new("No transfers");
+        summary.setXalign(0);
+        summary.as(gtk.Widget).setHexpand(1);
+        summary.as(gtk.Widget).addCssClass("dim-label");
+        const pause = gtk.Button.newWithLabel("Pause / Resume");
+        const cancel = gtk.Button.newWithLabel("Cancel");
+        const retry = gtk.Button.newWithLabel("Retry Failed");
+        const clear = gtk.Button.newWithLabel("Clear Finished");
+        controls.append(summary.as(gtk.Widget));
+        controls.append(pause.as(gtk.Widget));
+        controls.append(cancel.as(gtk.Widget));
+        controls.append(retry.as(gtk.Widget));
+        controls.append(clear.as(gtk.Widget));
+
+        const list = gtk.ListBox.new();
+        list.setSelectionMode(.single);
+        list.setShowSeparators(1);
+        const scroller = gtk.ScrolledWindow.new();
+        scroller.as(gtk.Widget).setSizeRequest(-1, 190);
+        scroller.setPolicy(.automatic, .automatic);
+        scroller.setChild(list.as(gtk.Widget));
+
+        body.append(controls.as(gtk.Widget));
+        body.append(scroller.as(gtk.Widget));
+        root.setChild(body.as(gtk.Widget));
+        self.* = .{
+            .owner = owner,
+            .root = root,
+            .list = list,
+            .summary = summary,
+        };
+
+        _ = gtk.Button.signals.clicked.connect(pause, *TransferPanel, onPauseResume, self, .{});
+        _ = gtk.Button.signals.clicked.connect(cancel, *TransferPanel, onCancel, self, .{});
+        _ = gtk.Button.signals.clicked.connect(retry, *TransferPanel, onRetryFailed, self, .{});
+        _ = gtk.Button.signals.clicked.connect(clear, *TransferPanel, onClearFinished, self, .{});
+    }
+
+    fn deinit(self: *TransferPanel) void {
+        if (self.conflict_dialog) |dialog| dialog.destroy();
+        self.rows.deinit(self.owner.gpa);
+    }
+
+    fn syncFromEngine(self: *TransferPanel) void {
+        var arena: std.heap.ArenaAllocator = .init(self.owner.gpa);
+        defer arena.deinit();
+        const snapshots = self.owner.core.queueSnapshot(arena.allocator()) catch {
+            self.summary.setText("Could not load transfer queue");
+            return;
+        };
+
+        self.list.removeAll();
+        self.rows.clearRetainingCapacity();
+        var complete = true;
+        for (snapshots) |snapshot| {
+            self.appendSnapshot(snapshot) catch {
+                complete = false;
+                break;
+            };
+        }
+        self.updateSummary();
+        if (!complete) self.summary.setText("Not enough memory to display every transfer");
+        self.showNextConflict();
+    }
+
+    fn appendSnapshot(self: *TransferPanel, snapshot: relay.queue.engine.ItemSnapshot) !void {
+        try self.rows.ensureUnusedCapacity(self.owner.gpa, 1);
+        const content = gtk.Box.new(.vertical, 3);
+        const top = gtk.Box.new(.horizontal, 8);
+        const name = relay.vfs.path.basename(snapshot.dst.path);
+        const name_z = try allocPrintZ(self.owner.gpa, "{s}  {s}", .{
+            if (snapshot.direction == .upload) "↑" else "↓",
+            name,
+        });
+        defer self.owner.gpa.free(name_z);
+        const name_label = gtk.Label.new(name_z);
+        name_label.setXalign(0);
+        name_label.as(gtk.Widget).setHexpand(1);
+        const state_label = gtk.Label.new("");
+        state_label.setXalign(1);
+        state_label.setMaxWidthChars(80);
+        state_label.as(gtk.Widget).addCssClass("dim-label");
+        top.append(name_label.as(gtk.Widget));
+        top.append(state_label.as(gtk.Widget));
+
+        const progress = gtk.ProgressBar.new();
+        progress.setShowText(0);
+        content.as(gtk.Widget).setMarginTop(6);
+        content.as(gtk.Widget).setMarginBottom(6);
+        content.as(gtk.Widget).setMarginStart(8);
+        content.as(gtk.Widget).setMarginEnd(8);
+        content.append(top.as(gtk.Widget));
+        content.append(progress.as(gtk.Widget));
+        self.list.append(content.as(gtk.Widget));
+
+        self.rows.appendAssumeCapacity(.{
+            .id = snapshot.id,
+            .state = snapshot.state.toEventState(),
+            .bytes_done = snapshot.bytes_done,
+            .bytes_total = snapshot.bytes_total,
+            .rate = snapshot.rate_bps,
+            .progress = progress,
+            .state_label = state_label,
+        });
+        const row = &self.rows.items[self.rows.items.len - 1];
+        row.name_len = @min(name.len, row.name_buf.len);
+        @memcpy(row.name_buf[0..row.name_len], name[0..row.name_len]);
+        row.failure_len = @min(snapshot.failure_message.len, row.failure_buf.len);
+        @memcpy(row.failure_buf[0..row.failure_len], snapshot.failure_message[0..row.failure_len]);
+        self.updateRow(row);
+    }
+
+    fn applyState(self: *TransferPanel, event: relay.events.CoreEvent.TransferStateChange) void {
+        for (self.rows.items) |*row| {
+            if (row.id != event.item_id) continue;
+            row.state = event.state;
+            if (event.failure) |failure| {
+                row.failure_len = @min(failure.message.len, row.failure_buf.len);
+                @memcpy(row.failure_buf[0..row.failure_len], failure.message[0..row.failure_len]);
+            } else if (event.state != .failed and event.state != .canceled) {
+                row.failure_len = 0;
+            }
+            self.updateRow(row);
+            self.updateSummary();
+            if (event.state == .conflict) self.showConflict(event.item_id);
+            return;
+        }
+        self.syncFromEngine();
+        if (event.state == .conflict) self.showConflict(event.item_id);
+    }
+
+    fn applyProgress(self: *TransferPanel, event: relay.events.CoreEvent.TransferProgress) void {
+        for (self.rows.items) |*row| {
+            if (row.id != event.item_id) continue;
+            row.bytes_done = event.bytes_done;
+            row.rate = event.rate;
+            self.updateRow(row);
+            self.updateSummary();
+            return;
+        }
+        self.syncFromEngine();
+    }
+
+    fn updateRow(_: *TransferPanel, row: *TransferRow) void {
+        if (row.state == .completed) {
+            row.progress.setFraction(1.0);
+        } else if (row.bytes_total > 0) {
+            const done: f64 = @floatFromInt(row.bytes_done);
+            const total: f64 = @floatFromInt(row.bytes_total);
+            row.progress.setFraction(@min(1.0, done / total));
+        } else {
+            row.progress.setFraction(0.0);
+            if (row.state == .transferring) row.progress.pulse();
+        }
+
+        var done_buf: [32]u8 = undefined;
+        var total_buf: [32]u8 = undefined;
+        var rate_value_buf: [32]u8 = undefined;
+        var rate_buf: [32]u8 = undefined;
+        const done = ui.format.humanBytes(&done_buf, row.bytes_done);
+        const total = if (row.bytes_total > 0) ui.format.humanBytes(&total_buf, row.bytes_total) else "?";
+        const rate = if (row.state == .transferring and row.rate > 0)
+            std.fmt.bufPrint(&rate_buf, " · {s}/s", .{ui.format.humanBytes(&rate_value_buf, row.rate)}) catch ""
+        else
+            "";
+        const failure = if (row.failure_len > 0) row.failure_buf[0..row.failure_len] else "";
+        var label_buf: [512]u8 = undefined;
+        const label = std.fmt.bufPrintZ(&label_buf, "{s} · {s} / {s}{s}{s}{s}", .{
+            transferStateLabel(row.state),
+            done,
+            total,
+            rate,
+            if (failure.len > 0) " · " else "",
+            failure,
+        }) catch {
+            row.state_label.setText("Transfer");
+            return;
+        };
+        row.state_label.setText(label);
+    }
+
+    fn updateSummary(self: *TransferPanel) void {
+        var active: usize = 0;
+        var failed: usize = 0;
+        var rate: u64 = 0;
+        for (self.rows.items) |row| {
+            switch (row.state) {
+                .queued, .connecting, .transferring => active += 1,
+                .failed => failed += 1,
+                else => {},
+            }
+            if (row.state == .transferring) rate +|= row.rate;
+        }
+        var rate_buf: [32]u8 = undefined;
+        var summary_buf: [160]u8 = undefined;
+        const text = if (self.rows.items.len == 0)
+            "No transfers"
+        else if (rate > 0)
+            std.fmt.bufPrintZ(&summary_buf, "{d} total · {d} active · {d} failed · {s}/s", .{
+                self.rows.items.len, active, failed, ui.format.humanBytes(&rate_buf, rate),
+            }) catch "Transfers"
+        else
+            std.fmt.bufPrintZ(&summary_buf, "{d} total · {d} active · {d} failed", .{
+                self.rows.items.len, active, failed,
+            }) catch "Transfers";
+        self.summary.setText(text);
+
+        var title_buf: [64]u8 = undefined;
+        const title = std.fmt.bufPrintZ(&title_buf, "Transfers ({d})", .{self.rows.items.len}) catch "Transfers";
+        self.root.setLabel(title);
+    }
+
+    fn selected(self: *TransferPanel) ?*TransferRow {
+        const selected_row = self.list.getSelectedRow() orelse return null;
+        const index = selected_row.getIndex();
+        if (index < 0 or @as(usize, @intCast(index)) >= self.rows.items.len) return null;
+        return &self.rows.items[@intCast(index)];
+    }
+
+    fn onPauseResume(_: *gtk.Button, self: *TransferPanel) callconv(.c) void {
+        const row = self.selected() orelse return;
+        if (row.state == .paused) {
+            _ = self.owner.core.resumeTransfer(row.id) catch false;
+        } else {
+            _ = self.owner.core.pauseTransfer(row.id);
+        }
+    }
+
+    fn onCancel(_: *gtk.Button, self: *TransferPanel) callconv(.c) void {
+        const row = self.selected() orelse return;
+        _ = self.owner.core.cancelTransfer(row.id);
+    }
+
+    fn onRetryFailed(_: *gtk.Button, self: *TransferPanel) callconv(.c) void {
+        if (self.owner.core.requeueFailed() > 0) self.root.setExpanded(1);
+        self.syncFromEngine();
+    }
+
+    fn onClearFinished(_: *gtk.Button, self: *TransferPanel) callconv(.c) void {
+        var i = self.rows.items.len;
+        while (i > 0) {
+            i -= 1;
+            const row = self.rows.items[i];
+            switch (row.state) {
+                .completed, .canceled => _ = self.owner.core.removeTransfer(row.id),
+                else => {},
+            }
+        }
+        self.syncFromEngine();
+    }
+
+    fn showNextConflict(self: *TransferPanel) void {
+        if (self.conflict_dialog != null) return;
+        for (self.rows.items) |row| {
+            if (row.state == .conflict) {
+                self.showConflict(row.id);
+                return;
+            }
+        }
+    }
+
+    fn showConflict(self: *TransferPanel, id: ui.bridge.ItemId) void {
+        if (self.conflict_dialog != null) return;
+        var name: []const u8 = "destination";
+        for (self.rows.items) |*row| {
+            if (row.id == id) name = row.name_buf[0..row.name_len];
+        }
+        ConflictDialog.create(self, id, name) catch {
+            std.log.err("could not open transfer conflict dialog", .{});
+        };
+    }
+};
+
+const TransferRow = struct {
+    id: ui.bridge.ItemId,
+    state: relay.events.TransferState,
+    bytes_done: u64,
+    bytes_total: u64,
+    rate: u64,
+    progress: *gtk.ProgressBar,
+    state_label: *gtk.Label,
+    name_buf: [256]u8 = undefined,
+    name_len: usize = 0,
+    failure_buf: [256]u8 = undefined,
+    failure_len: usize = 0,
+};
+
+fn transferStateLabel(state: relay.events.TransferState) []const u8 {
+    return switch (state) {
+        .queued => "Queued",
+        .connecting => "Connecting",
+        .transferring => "Transferring",
+        .paused => "Paused",
+        .completed => "Completed",
+        .failed => "Failed",
+        .canceled => "Canceled",
+        .conflict => "Needs confirmation",
+    };
+}
+
+const ConflictDialog = struct {
+    owner: *TransferPanel,
+    native: *gtk.Dialog,
+    item_id: ui.bridge.ItemId,
+
+    fn create(owner: *TransferPanel, item_id: ui.bridge.ItemId, name: []const u8) !void {
+        const self = try owner.owner.gpa.create(ConflictDialog);
+        errdefer owner.owner.gpa.destroy(self);
+        const dialog = gtk.Dialog.new();
+        errdefer dialog.as(gtk.Window).destroy();
+        dialog.as(gtk.Window).setTitle("File Already Exists");
+        dialog.as(gtk.Window).setTransientFor(owner.owner.native.as(gtk.Window));
+        dialog.as(gtk.Window).setModal(1);
+        dialog.as(gtk.Window).setDestroyWithParent(1);
+        _ = dialog.addButton("Skip", @intFromEnum(gtk.ResponseType.reject));
+        _ = dialog.addButton("Overwrite", @intFromEnum(gtk.ResponseType.accept));
+        dialog.setDefaultResponse(@intFromEnum(gtk.ResponseType.reject));
+
+        const content = dialog.getContentArea();
+        content.setSpacing(8);
+        const content_widget = content.as(gtk.Widget);
+        content_widget.setMarginTop(16);
+        content_widget.setMarginBottom(16);
+        content_widget.setMarginStart(16);
+        content_widget.setMarginEnd(16);
+        var message_buf: [160]u8 = undefined;
+        const message = std.fmt.bufPrintZ(&message_buf, "“{s}” already exists at the destination. Overwrite it?", .{name}) catch "The destination already exists. Overwrite it?";
+        const label = gtk.Label.new(message);
+        label.setWrap(1);
+        label.setXalign(0);
+        content.append(label.as(gtk.Widget));
+
+        self.* = .{ .owner = owner, .native = dialog, .item_id = item_id };
+        owner.conflict_dialog = self;
+        _ = gtk.Dialog.signals.response.connect(dialog, *ConflictDialog, onResponse, self, .{});
+        dialog.as(gtk.Window).present();
+    }
+
+    fn onResponse(_: *gtk.Dialog, response: c_int, self: *ConflictDialog) callconv(.c) void {
+        const policy: ui.bridge.ConflictPolicy = if (response == @intFromEnum(gtk.ResponseType.accept)) .overwrite else .skip;
+        _ = self.owner.owner.core.resolveConflict(self.item_id, policy) catch false;
+        self.finish();
+    }
+
+    fn finish(self: *ConflictDialog) void {
+        const panel = self.owner;
+        panel.conflict_dialog = null;
+        self.native.as(gtk.Window).destroy();
+        panel.owner.gpa.destroy(self);
+    }
+
+    fn destroy(self: *ConflictDialog) void {
+        self.owner.conflict_dialog = null;
+        self.native.as(gtk.Window).destroy();
+        self.owner.owner.gpa.destroy(self);
+    }
+};
+
+test "copy target containment is component-aware" {
+    try std.testing.expect(Pane.pathContains("/folder", "/folder/child"));
+    try std.testing.expect(Pane.pathContains("/", "/folder"));
+    try std.testing.expect(!Pane.pathContains("/folder", "/folder"));
+    try std.testing.expect(!Pane.pathContains("/folder", "/folder-name"));
+    try std.testing.expect(!Pane.pathContains("/folder", "/other/folder"));
+}
 
 test {
     std.testing.refAllDecls(@This());

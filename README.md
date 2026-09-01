@@ -3,8 +3,9 @@
 A native FTP / FTPS / SFTP client written in Zig — Transmit-level polish with
 ForkLift-level keyboard power, for programmers who dislike FileZilla. The
 existing frontend is native AppKit on macOS. The Linux port now has a native
-GTK4 executable with two AppCore-driven local panes; remote sites and the M3
-power-feature views are the next parity slices.
+GTK4 dual-pane browser: the left pane is local, while the right pane can browse
+saved or Quick Connect FTP/FTPS/SFTP sites with native credential and host-key
+prompts. Transfers and the M3 power-feature views are the next parity slices.
 
 **Status: M3 complete (power features).** The M1 protocol core (FTP/FTPS/
 SFTP engines, SSH userland, VFS, pool, queue; the live Docker integration

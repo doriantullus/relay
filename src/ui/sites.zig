@@ -354,6 +354,16 @@ pub const SiteStore = struct {
         return true;
     }
 
+    /// Promote or demote an existing entry without changing its stable id.
+    /// Quick Connect uses this when an ephemeral target is later saved.
+    /// Returns true only when the persisted flag actually changed.
+    pub fn setPersisted(self: *SiteStore, id: u64, persisted: bool) bool {
+        const idx = self.indexOf(id) orelse return false;
+        if (self.entries.items[idx].persisted == persisted) return false;
+        self.entries.items[idx].persisted = persisted;
+        return true;
+    }
+
     pub fn get(self: *const SiteStore, id: u64) ?*const sites_mod.Site {
         const idx = self.indexOf(id) orelse return null;
         return &self.entries.items[idx].site;
@@ -1130,6 +1140,18 @@ test "import field guard rejects option and control injection" {
     try std.testing.expect(importedFieldSafe("example.com"));
     try std.testing.expect(!importedFieldSafe("-bad"));
     try std.testing.expect(!importedFieldSafe("bad\nvalue"));
+}
+
+test "SiteStore promotes an ephemeral Quick Connect target" {
+    var store: SiteStore = .init(std.testing.allocator);
+    defer store.deinit();
+
+    const id = try store.add(.{ .host = "example.com", .account = "alice" }, false);
+    try std.testing.expectEqual(@as(usize, 0), store.persistedCount());
+    try std.testing.expect(store.setPersisted(id, true));
+    try std.testing.expectEqual(@as(usize, 1), store.persistedCount());
+    try std.testing.expect(!store.setPersisted(id, true));
+    try std.testing.expect(!store.setPersisted(999, true));
 }
 
 test {

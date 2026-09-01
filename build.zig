@@ -4,14 +4,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const is_macos = target.result.os.tag == .macos;
+    const is_linux = target.result.os.tag == .linux;
 
     const test_step = b.step("test", "Run all unit tests");
 
     // ------------------------------------------------------------------
-    // relay_core — protocol engines, queue, VFS. No ObjC; builds anywhere.
-    // ------------------------------------------------------------------
-    // ------------------------------------------------------------------
-    // Vendored C: LibreSSL (static) + libssh2 compiled against it.
+    // relay_core — protocol engines, queue, VFS, plus vendored C.
+    // No ObjC; builds anywhere.
     // ------------------------------------------------------------------
     const libressl_dep = b.dependency("libressl", .{
         .target = target,
@@ -52,6 +51,21 @@ pub fn build(b: *std.Build) void {
 
     const core_tests = b.addTest(.{ .root_module = core_mod });
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
+
+    // ------------------------------------------------------------------
+    // relay_ui — shared app logic. Imports core only; builds everywhere.
+    // ------------------------------------------------------------------
+    const ui_mod = b.addModule("relay_ui", .{
+        .root_source_file = b.path("src/ui/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "relay_core", .module = core_mod },
+        },
+    });
+
+    const ui_tests = b.addTest(.{ .root_module = ui_mod });
+    test_step.dependOn(&b.addRunArtifact(ui_tests).step);
 
     // ------------------------------------------------------------------
     // Spike: ssh — proves libssh2 + LibreSSL static link on aarch64-macos.
@@ -132,6 +146,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "objc", .module = objc_mod },
                 .{ .name = "relay_core", .module = core_mod },
+                .{ .name = "relay_ui", .module = ui_mod },
             },
         });
         mac_mod.linkFramework("AppKit", .{});
@@ -150,6 +165,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "relay_core", .module = core_mod },
                 .{ .name = "relay_mac", .module = mac_mod },
+                .{ .name = "relay_ui", .module = ui_mod },
             },
         });
         const app_exe = b.addExecutable(.{
@@ -196,6 +212,51 @@ pub fn build(b: *std.Build) void {
         if (b.args) |args| spike_ui_run.addArgs(args);
         b.step("spike-ui", "Run the zig-objc NSTableView spike (M0 gate)").dependOn(&spike_ui_run.step);
         spikes_step.dependOn(&spike_ui_exe.step);
+    }
+
+    // ------------------------------------------------------------------
+    // Linux-only: relay_gtk binding/services module and GTK app shell.
+    // ------------------------------------------------------------------
+    if (is_linux) {
+        const gobject = b.dependency("gobject", .{
+            .target = target,
+            .optimize = optimize,
+        });
+
+        const gtk_mod = b.addModule("relay_gtk", .{
+            .root_source_file = b.path("src/gtk/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "relay_core", .module = core_mod },
+                .{ .name = "relay_ui", .module = ui_mod },
+                .{ .name = "gtk", .module = gobject.module("gtk4") },
+                .{ .name = "gio", .module = gobject.module("gio2") },
+                .{ .name = "glib", .module = gobject.module("glib2") },
+                .{ .name = "gobject", .module = gobject.module("gobject2") },
+            },
+        });
+        gtk_mod.addCSourceFile(.{ .file = b.path("src/gtk/secret_store.c") });
+        gtk_mod.linkSystemLibrary("libsecret-1", .{ .use_pkg_config = .force });
+
+        const gtk_tests = b.addTest(.{ .root_module = gtk_mod });
+        test_step.dependOn(&b.addRunArtifact(gtk_tests).step);
+
+        const linux_app_mod = b.createModule(.{
+            .root_source_file = b.path("src/app_gtk/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "relay_ui", .module = ui_mod },
+                .{ .name = "relay_gtk", .module = gtk_mod },
+            },
+        });
+        const linux_app = b.addExecutable(.{
+            .name = "relay",
+            .root_module = linux_app_mod,
+        });
+        b.getInstallStep().dependOn(&b.addInstallArtifact(linux_app, .{}).step);
+        spikes_step.dependOn(&linux_app.step);
     }
 }
 

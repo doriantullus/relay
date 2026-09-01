@@ -1,0 +1,14 @@
+pub const gtk4 = @import("gtk4");
+pub const gsk4 = @import("gsk4");
+pub const graphene1 = @import("graphene1");
+pub const gobject2 = @import("gobject2");
+pub const glib2 = @import("glib2");
+pub const gdk4 = @import("gdk4");
+pub const cairo1 = @import("cairo1");
+pub const pangocairo1 = @import("pangocairo1");
+pub const pango1 = @import("pango1");
+pub const harfbuzz0 = @import("harfbuzz0");
+pub const freetype22 = @import("freetype22");
+pub const gio2 = @import("gio2");
+pub const gmodule2 = @import("gmodule2");
+pub const gdkpixbuf2 = @import("gdkpixbuf2");

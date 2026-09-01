@@ -27,9 +27,10 @@
 const std = @import("std");
 const mac = @import("relay_mac");
 const relay = @import("relay_core");
-const bridge = @import("../bridge.zig");
+const bridge = @import("relay_ui").bridge;
 const prefs = @import("prefs.zig");
-const fuzzy = @import("../fuzzy.zig");
+const fuzzy = @import("relay_ui").fuzzy;
+const shared = @import("relay_ui").palette;
 
 // TODO(m2-dedupe): the control kit moves to relay_mac together with the copy
 // in prefs.zig; this import follows it (same note as inspector.zig).
@@ -145,78 +146,10 @@ pub fn shortcutHint(buf: []u8, key: []const u8, mods: menu_kit.Modifiers) []cons
 }
 
 // ---------------------------------------------------------------------------
-// Model — candidates + ranking (headless; no ObjC).
+// Model — shared from relay_ui.
 // ---------------------------------------------------------------------------
 
-pub const Model = struct {
-    gpa: Allocator,
-    /// Owns every candidate string; reset per rebuild.
-    arena: std.heap.ArenaAllocator,
-    candidates: std.ArrayList(Candidate) = .empty,
-    matcher: fuzzy.Matcher = .{},
-    ranked_buf: [max_results]fuzzy.Ranked = undefined,
-    results: [max_results]fuzzy.Ranked = undefined,
-    result_len: usize = 0,
-
-    pub fn init(gpa: Allocator) Model {
-        return .{ .gpa = gpa, .arena = .init(gpa) };
-    }
-
-    pub fn deinit(self: *Model) void {
-        self.candidates.deinit(self.gpa);
-        self.arena.deinit();
-        self.* = undefined;
-    }
-
-    pub fn reset(self: *Model) void {
-        _ = self.arena.reset(.retain_capacity);
-        self.candidates.clearRetainingCapacity();
-        self.result_len = 0;
-    }
-
-    /// Deep-copies every string (callers may pass stack buffers).
-    pub fn add(self: *Model, candidate: Candidate) error{OutOfMemory}!void {
-        const arena = self.arena.allocator();
-        var copy = candidate;
-        copy.title = try arena.dupe(u8, candidate.title);
-        copy.hint = try arena.dupe(u8, candidate.hint);
-        copy.key = try arena.dupe(u8, candidate.key);
-        copy.path = try arena.dupe(u8, candidate.path);
-        try self.candidates.append(self.gpa, copy);
-    }
-
-    /// True when some candidate carries this frecency key (dedup between
-    /// visited paths and snapshot entries).
-    pub fn hasKey(self: *const Model, key: []const u8) bool {
-        for (self.candidates.items) |cand| {
-            if (std.mem.eql(u8, cand.key, key)) return true;
-        }
-        return false;
-    }
-
-    /// Re-rank every candidate against `query`: fuzzy score × frecency
-    /// boost, best `max_results` kept (no allocation per candidate).
-    pub fn filter(self: *Model, query: []const u8, frec: *const fuzzy.Frecency, now: i64) void {
-        var top = fuzzy.TopList.init(&self.ranked_buf);
-        for (self.candidates.items, 0..) |cand, i| {
-            const m = self.matcher.match(query, cand.title) orelse continue;
-            const boost = if (cand.key.len > 0) frec.boost(cand.key, now) else 1.0;
-            top.consider(.{ .index = i, .score = fuzzy.rank(m.score, boost) });
-        }
-        const items = top.items();
-        @memcpy(self.results[0..items.len], items);
-        self.result_len = items.len;
-    }
-
-    pub fn resultCount(self: *const Model) usize {
-        return self.result_len;
-    }
-
-    pub fn resultAt(self: *const Model, row: usize) ?*const Candidate {
-        if (row >= self.result_len) return null;
-        return &self.candidates.items[self.results[row].index];
-    }
-};
+pub const Model = shared.Model(Candidate, max_results);
 
 // ---------------------------------------------------------------------------
 // Integration hooks (set by the phase-3 integrator; all main thread).

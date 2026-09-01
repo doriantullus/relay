@@ -18,7 +18,8 @@
 const std = @import("std");
 const relay = @import("relay_core");
 const mac = @import("relay_mac");
-const bridge = @import("../bridge.zig");
+const bridge = @import("relay_ui").bridge;
+const shared = @import("relay_ui").transcript;
 
 const objc = mac.objc;
 const c = objc.c;
@@ -33,203 +34,16 @@ const NSRange = foundation.NSRange;
 const NSRect = foundation.NSRect;
 
 // ---------------------------------------------------------------------------
-// Pure model — headless-tested.
+// Pure model — shared from relay_ui.
 // ---------------------------------------------------------------------------
 
-/// Ring cap; matches relay_core's transcript ring (log/transcript.zig).
-pub const ring_capacity: usize = 20_000;
-
-/// Stored bytes per line; longer input is truncated (core caps at 256).
-pub const max_line_bytes: usize = 512;
-
-/// Render class for one line. Direction maps to semantic colors per
-/// docs/UX.md: client=labelColor, server=secondaryLabelColor, errors=
-/// systemRed; info chatter renders tertiary.
-pub const LineKind = enum(u2) { client, server, err, info };
-
-/// FTP 4xx/5xx server replies and info lines announcing errors render red;
-/// everything else colors by direction.
-pub fn classifyLine(dir: relay.transcript.Direction, text: []const u8) LineKind {
-    switch (dir) {
-        .client => return .client,
-        .server => {
-            if (text.len >= 3 and (text[0] == '4' or text[0] == '5') and
-                std.ascii.isDigit(text[1]) and std.ascii.isDigit(text[2]))
-                return .err;
-            return .server;
-        },
-        .info => {
-            if (std.ascii.startsWithIgnoreCase(text, "error")) return .err;
-            return .info;
-        },
-    }
-}
-
-/// Copies `src` into `dst` replacing every invalid UTF-8 byte with '?', so
-/// downstream NSString creation and UTF-16 length math never fail.
-/// `dst.len >= src.len` required; returns the written prefix.
-pub fn sanitizeUtf8(src: []const u8, dst: []u8) []const u8 {
-    std.debug.assert(dst.len >= src.len);
-    var i: usize = 0;
-    var n: usize = 0;
-    while (i < src.len) {
-        const seq_len = std.unicode.utf8ByteSequenceLength(src[i]) catch {
-            dst[n] = '?';
-            n += 1;
-            i += 1;
-            continue;
-        };
-        if (i + seq_len > src.len or !std.unicode.utf8ValidateSlice(src[i..][0..seq_len])) {
-            dst[n] = '?';
-            n += 1;
-            i += 1;
-            continue;
-        }
-        @memcpy(dst[n..][0..seq_len], src[i..][0..seq_len]);
-        n += seq_len;
-        i += seq_len;
-    }
-    return dst[0..n];
-}
-
-/// Follow-tail geometry: the view counts as "at the bottom" when the gap
-/// between the document end and the visible bottom edge is within `slack`
-/// points (scroll-position float noise).
-pub fn isAtBottom(doc_height: f64, clip_origin_y: f64, clip_height: f64, slack: f64) bool {
-    return doc_height - (clip_origin_y + clip_height) <= slack;
-}
-
-pub const Model = struct {
-    pub const Line = struct {
-        conn: u64,
-        kind: LineKind,
-        /// UTF-16 code units of `text` — NSTextStorage range math operates
-        /// in UTF-16, so trims must subtract this (+1 for the newline).
-        utf16_len: u32,
-        /// Sanitized UTF-8, gpa-owned by the model.
-        text: []u8,
-    };
-
-    pub const Appended = struct {
-        /// The new line matches the filter passed to `append`.
-        visible: bool,
-        /// First line ever seen from this connection id (popup grows).
-        new_conn: bool,
-        /// Live lines dropped from the front to hold the cap.
-        trimmed_lines: usize = 0,
-        /// UTF-16 units (newline included) of the dropped lines that
-        /// matched the filter — delete this prefix from the text storage.
-        trimmed_visible_utf16: u64 = 0,
-    };
-
-    gpa: Allocator,
-    capacity: usize,
-    /// Live lines are `lines.items[head..]`; the head offset amortizes
-    /// front-trims, compacted once it crosses `compact_threshold`.
-    lines: std.ArrayList(Line) = .empty,
-    head: usize = 0,
-    compact_threshold: usize = 4096,
-    /// Connection ids in first-seen order (drives the filter popup).
-    conns: std.AutoArrayHashMapUnmanaged(u64, void) = .empty,
-
-    pub fn init(gpa: Allocator, capacity: usize) Model {
-        std.debug.assert(capacity > 0);
-        return .{ .gpa = gpa, .capacity = capacity };
-    }
-
-    pub fn deinit(self: *Model) void {
-        for (self.live()) |line| self.gpa.free(line.text);
-        self.lines.deinit(self.gpa);
-        self.conns.deinit(self.gpa);
-        self.* = undefined;
-    }
-
-    pub fn count(self: *const Model) usize {
-        return self.lines.items.len - self.head;
-    }
-
-    pub fn live(self: *const Model) []const Line {
-        return self.lines.items[self.head..];
-    }
-
-    pub fn connCount(self: *const Model) usize {
-        return self.conns.count();
-    }
-
-    pub fn connAt(self: *const Model, index: usize) u64 {
-        return self.conns.keys()[index];
-    }
-
-    pub fn matchesFilter(line: Line, filter: ?u64) bool {
-        const want = filter orelse return true;
-        return line.conn == want;
-    }
-
-    /// Sanitizes, truncates, appends, and trims the ring back to capacity.
-    /// `filter` is the controller's CURRENT filter, so the result carries
-    /// exactly the text-storage edits the view must mirror.
-    pub fn append(
-        self: *Model,
-        conn: u64,
-        kind: LineKind,
-        raw: []const u8,
-        filter: ?u64,
-    ) error{OutOfMemory}!Appended {
-        const trimmed_input = std.mem.trimEnd(u8, raw, "\r\n");
-        const capped = trimmed_input[0..@min(trimmed_input.len, max_line_bytes)];
-        var buf: [max_line_bytes]u8 = undefined;
-        const clean = sanitizeUtf8(capped, &buf);
-        // Valid UTF-8 by construction; cannot fail.
-        const utf16_len = std.unicode.calcUtf16LeLen(clean) catch unreachable;
-
-        const text = try self.gpa.dupe(u8, clean);
-        errdefer self.gpa.free(text);
-        const gop = try self.conns.getOrPut(self.gpa, conn);
-        const new_conn = !gop.found_existing;
-        const line: Line = .{
-            .conn = conn,
-            .kind = kind,
-            .utf16_len = @intCast(utf16_len),
-            .text = text,
-        };
-        try self.lines.append(self.gpa, line);
-
-        var result: Appended = .{
-            .visible = matchesFilter(line, filter),
-            .new_conn = new_conn,
-        };
-        while (self.count() > self.capacity) {
-            const dropped = self.lines.items[self.head];
-            if (matchesFilter(dropped, filter)) {
-                result.trimmed_visible_utf16 += @as(u64, dropped.utf16_len) + 1;
-            }
-            result.trimmed_lines += 1;
-            self.gpa.free(dropped.text);
-            self.head += 1;
-        }
-        if (self.head >= self.compact_threshold) self.compact();
-        return result;
-    }
-
-    fn compact(self: *Model) void {
-        const n = self.count();
-        std.mem.copyForwards(Line, self.lines.items[0..n], self.lines.items[self.head..]);
-        self.lines.shrinkRetainingCapacity(n);
-        self.head = 0;
-    }
-
-    /// All live lines matching `filter`, newline-joined; caller frees.
-    pub fn visibleText(self: *const Model, gpa: Allocator, filter: ?u64) error{OutOfMemory}![]u8 {
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(gpa);
-        for (self.live()) |line| {
-            if (!matchesFilter(line, filter)) continue;
-            try out.appendSlice(gpa, line.text);
-            try out.append(gpa, '\n');
-        }
-        return out.toOwnedSlice(gpa);
-    }
-};
+pub const ring_capacity = shared.ring_capacity;
+pub const max_line_bytes = shared.max_line_bytes;
+pub const LineKind = shared.LineKind;
+pub const classifyLine = shared.classifyLine;
+pub const sanitizeUtf8 = shared.sanitizeUtf8;
+pub const isAtBottom = shared.isAtBottom;
+pub const Model = shared.Model;
 
 // ---------------------------------------------------------------------------
 // Shared AppKit control glue.

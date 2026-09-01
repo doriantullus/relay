@@ -1,4 +1,4 @@
-//! bridge — AppCore, the ONLY core↔UI crossing (docs/ARCHITECTURE.md law 3).
+//! bridge — relay_ui's AppCore, the ONLY core↔UI crossing.
 //!
 //! AppCore owns the process-lifetime core state: the std.Io.Threaded pool,
 //! loaded settings + site list, the credential store (Keychain in the app,
@@ -16,8 +16,8 @@
 //!
 //!  - Bridge-originated posts go through `postEvent`, which honors the
 //!    queue's "caller must schedule" return by dispatching exactly ONE
-//!    main-queue drain (`pump_inflight` coalesces; relay_mac.dispatch
-//!    wraps every invocation in an autorelease pool).
+//!    UI-loop drain (`pump_inflight` coalesces; the platform MainLoop owns
+//!    toolkit-specific scheduling and callback lifetime).
 //!  - Core-internal producers (SitePool status/keepalive, the Engine's
 //!    progress timer and queue workers) post directly into the queue and
 //!    DISCARD the schedule hint. The bridge recovers it two ways: every
@@ -78,9 +78,9 @@
 //! factory fails with a classified diagnostic (headless tests).
 
 const std = @import("std");
-const builtin = @import("builtin");
 const relay = @import("relay_core");
-const mac = @import("relay_mac");
+const MainLoop = @import("platform/main_loop.zig").MainLoop;
+const Paths = @import("platform/paths.zig").Paths;
 
 const Allocator = std.mem.Allocator;
 
@@ -91,7 +91,6 @@ const transcript_mod = relay.transcript;
 const diag_mod = relay.diag;
 const CancelToken = relay.cancel.CancelToken;
 const cred_store_mod = relay.cred.store;
-const keychain_mod = relay.cred.keychain;
 const vfs_mod = relay.vfs.iface;
 const local_mod = relay.vfs.local;
 const snapshot_mod = relay.vfs.snapshot;
@@ -144,14 +143,21 @@ pub const FactoryProvider = struct {
 
 pub const Options = struct {
     pump: PumpMode = .gcd,
+    /// Platform UI-loop service. Required for `.gcd`; omitted by manual
+    /// headless tests. The name of the mode is retained for source
+    /// compatibility, but the bridge no longer imports libdispatch.
+    main_loop: ?MainLoop = null,
+    /// Platform application directories. Required when `config_dir` is
+    /// not overridden by a test or smoke run.
+    paths: ?Paths = null,
     /// Override the Application Support dir (tests: a tmp dir). Borrowed;
     /// must outlive the AppCore. null = open/create the real one.
     config_dir: ?std.Io.Dir = null,
     /// Override the local-pane filesystem root (tests). Borrowed; must be
     /// opened with `.iterate = true`. null = "/".
     local_root: ?std.Io.Dir = null,
-    /// Override the credential store (tests: cred/fake.zig). null = the
-    /// macOS Keychain.
+    /// Platform credential store (macOS Keychain, Linux backend, or fake).
+    /// Required: relay_ui never selects a platform backend itself.
     cred_store: ?cred_store_mod.CredStore = null,
     factory_provider: ?FactoryProvider = null,
 };
@@ -286,6 +292,7 @@ pub const AppCore = struct {
     threaded: std.Io.Threaded,
     io: std.Io,
     pump_mode: PumpMode,
+    main_loop: ?MainLoop,
     factory_provider: ?FactoryProvider,
 
     config_dir: std.Io.Dir,
@@ -295,7 +302,6 @@ pub const AppCore = struct {
     sites_parsed: ?sites_mod.Parsed,
     site_list: sites_mod.SiteList,
 
-    keychain: keychain_mod.KeychainStore,
     cred_store: cred_store_mod.CredStore,
 
     /// App-level protocol/transcript ring (pool reconnect notes etc.).
@@ -325,7 +331,7 @@ pub const AppCore = struct {
 
     // --- pump state ---
     pump_inflight: std.atomic.Value(bool) = .init(false),
-    pump_timer: ?mac.dispatch.RepeatingTimer = null,
+    pump_timer: ?MainLoop.Timer = null,
 
     // --- main-thread-only state ---
     listeners: [tag_count]std.ArrayList(Listener),
@@ -353,11 +359,18 @@ pub const AppCore = struct {
     // ------------------------------------------------------------------ //
     // Lifecycle
 
-    pub fn init(gpa: Allocator) !*AppCore {
-        return initOptions(gpa, .{});
+    pub fn init(gpa: Allocator, paths: Paths, main_loop: MainLoop) !*AppCore {
+        return initOptions(gpa, .{ .paths = paths, .main_loop = main_loop });
     }
 
     pub fn initOptions(gpa: Allocator, options: Options) !*AppCore {
+        if (options.pump == .gcd and options.main_loop == null)
+            return error.MainLoopRequired;
+        if (options.config_dir == null and options.paths == null)
+            return error.PathsRequired;
+        if (options.cred_store == null)
+            return error.CredStoreRequired;
+
         const self = try gpa.create(AppCore);
         errdefer gpa.destroy(self);
 
@@ -366,13 +379,13 @@ pub const AppCore = struct {
             .threaded = .init(gpa, .{}),
             .io = undefined,
             .pump_mode = options.pump,
+            .main_loop = options.main_loop,
             .factory_provider = options.factory_provider,
             .config_dir = undefined,
             .owns_config_dir = false,
             .settings = .{},
             .sites_parsed = null,
             .site_list = .{},
-            .keychain = .{},
             .cred_store = undefined,
             .transcript = undefined,
             .events_q = undefined,
@@ -391,11 +404,8 @@ pub const AppCore = struct {
         if (options.config_dir) |dir| {
             self.config_dir = dir;
         } else {
-            const home = std.c.getenv("HOME") orelse return error.NoHomeDirectory;
-            var path_buf: [1024]u8 = undefined;
-            const dir_path = std.fmt.bufPrint(&path_buf, "{s}/Library/Application Support/{s}", .{
-                std.mem.span(home), app_support_bundle_id,
-            }) catch return error.NameTooLong;
+            const dir_path = try options.paths.?.configDir(gpa);
+            defer gpa.free(dir_path);
             self.config_dir = try std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
             self.owns_config_dir = true;
         }
@@ -416,7 +426,7 @@ pub const AppCore = struct {
         if (self.sites_parsed) |parsed| self.site_list = parsed.value;
         errdefer if (self.sites_parsed) |*parsed| parsed.deinit();
 
-        self.cred_store = options.cred_store orelse self.keychain.credStore();
+        self.cred_store = options.cred_store.?;
 
         self.transcript = try transcript_mod.Transcript.init(gpa, .{});
         errdefer self.transcript.deinit();
@@ -447,7 +457,7 @@ pub const AppCore = struct {
             g_live_core.store(self, .release);
             // Watchdog for core-posted events (see file header). Failure to
             // create it degrades to command-driven drains only.
-            self.pump_timer = mac.dispatch.RepeatingTimer.startOnMain(
+            self.pump_timer = self.main_loop.?.startTimer(
                 pump_watchdog_ms,
                 self,
                 pumpTimerTick,
@@ -469,7 +479,7 @@ pub const AppCore = struct {
         _ = g_live_core.cmpxchgStrong(self, null, .acq_rel, .acquire);
 
         if (self.pump_timer) |timer| {
-            timer.cancel();
+            self.main_loop.?.cancelTimer(timer);
             self.pump_timer = null;
         }
 
@@ -606,7 +616,7 @@ pub const AppCore = struct {
     fn schedulePump(self: *AppCore) void {
         if (self.pump_mode != .gcd) return;
         if (self.pump_inflight.cmpxchgStrong(false, true, .seq_cst, .seq_cst) != null) return;
-        mac.dispatch.mainQueueAsync(self, drainFromDispatch);
+        self.main_loop.?.post(self, drainFromDispatch);
     }
 
     /// Worker-side nudge after operations whose events were posted by core
@@ -639,8 +649,6 @@ pub const AppCore = struct {
     }
 
     fn drainOnMain(self: *AppCore) void {
-        const pool = mac.foundation.AutoreleasePool.init();
-        defer pool.deinit();
         self.drains += 1;
         const batch = self.events_q.drain();
         for (batch) |event| self.applyCoreEvent(event);
@@ -1622,7 +1630,7 @@ fn unwiredFactory() site_pool_mod.ConnFactory {
 // ---------------------------------------------------------------------------
 // Tests — all headless: manual pump, tmp dirs, fake cred store. The gcd
 // dispatch path is exercised by phase 3's app-level smoke (and the
-// relay_mac dispatch tests cover the marshaling primitive).
+// platform binding tests cover their scheduling primitives).
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;

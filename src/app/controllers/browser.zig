@@ -43,11 +43,11 @@
 const std = @import("std");
 const relay = @import("relay_core");
 const mac = @import("relay_mac");
-const bridge = @import("../bridge.zig");
+const bridge = @import("relay_ui").bridge;
 
 /// The vim-mode keymap layer (pure state machine; instances live on the
 /// panes). Kept a separate file, imported ONLY from here.
-pub const vim = @import("vim.zig");
+pub const vim = @import("relay_ui").vim;
 
 const objc = mac.objc;
 const c = objc.c;
@@ -333,7 +333,7 @@ pub fn formatCount(buf: []u8, n: u64) []const u8 {
 }
 
 /// Shared with transfers.zig and others via src/app/format.zig.
-pub const humanBytes = @import("../format.zig").humanBytes;
+pub const humanBytes = @import("relay_ui").format.humanBytes;
 
 /// Size column: "—" for directories, blank for unknown, human bytes else.
 pub fn formatSize(buf: []u8, is_dir: bool, size: ?u64) []const u8 {

@@ -1,0 +1,24 @@
+.{
+    .name = .gobject,
+    .version = "0.3.2",
+    .fingerprint = 0xca12a75aeca74b4a, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build",
+        "src",
+        "build.zig",
+        "build.zig.zon",
+    },
+    .dependencies = .{
+        // Upstream Autodoc currently has a behavior where alias declarations
+        // are presented using the name of the underlying decl:
+        // https://github.com/ziglang/zig/issues/20905
+        // This is unusable for this library, because it means all our aliased
+        // functions would be given their original C names in the documentation.
+        .zig_autodoc = .{
+            .url = "git+https://github.com/ianprime0509/zig?ref=zig-gobject#08e338bce1897fa893c721dcafa97055321aec93",
+            .hash = "zig-0.0.0-Fp4XJMfK5Q1tetqfhp_lsaUgdwIy08LrKG6PEztKDReL",
+            .lazy = true,
+        },
+    },
+}

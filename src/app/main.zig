@@ -34,12 +34,12 @@ const builtin = @import("builtin");
 const relay = @import("relay_core");
 const mac = @import("relay_mac");
 
-pub const bridge = @import("bridge.zig");
-pub const factories = @import("factories.zig");
+pub const bridge = @import("relay_ui").bridge;
+pub const factories = @import("relay_ui").factories;
 pub const app_delegate = @import("app_delegate.zig");
-pub const fuzzy = @import("fuzzy.zig");
-pub const format = @import("format.zig");
-pub const temp_cache = @import("temp_cache.zig");
+pub const fuzzy = @import("relay_ui").fuzzy;
+pub const format = @import("relay_ui").format;
+pub const temp_cache = @import("relay_ui").temp_cache;
 pub const controllers = struct {
     pub const browser = @import("controllers/browser.zig");
     pub const sites = @import("controllers/sites.zig");
@@ -111,6 +111,9 @@ var g_mode: Mode = .normal;
 var g_smoke: Smoke = undefined;
 /// Production connect factories (normal mode; smoke modes inject their own).
 var g_factories: *factories.Factories = undefined;
+var g_platform_paths: mac.paths.AppPaths = undefined;
+var g_main_loop: mac.main_loop.DispatchMainLoop = .{};
+var g_keychain: relay.cred.keychain.KeychainStore = .{};
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var args = init.args.iterate();
@@ -121,11 +124,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     const boot_pool = objc.AutoreleasePool.init();
 
+    g_platform_paths = .init(bridge.app_support_bundle_id);
     var options: bridge.Options = .{};
     if (g_mode != .normal) {
         g_smoke.setup(g_mode, init.environ) catch |err| smokeFail("setup", @errorName(err));
         options = g_smoke.coreOptions();
     }
+    options.paths = g_platform_paths.service();
+    options.main_loop = g_main_loop.service();
+    if (options.cred_store == null) options.cred_store = g_keychain.credStore();
     g_core = try bridge.AppCore.initOptions(gpa, options);
 
     const app = windowkit.App.shared();
@@ -400,6 +407,7 @@ fn buildUi() !void {
 
     g_ui.edit = try edit_mod.EditSessionsController.create(gpa, core, .{
         .cache_base = if (g_mode != .normal) g_smoke.editCachePath() else null,
+        .paths = g_platform_paths.service(),
         // --smoke runs the real watcher/upload pipeline but must not
         // launch an editor on the host.
         .open_in_editor = g_mode == .normal,
@@ -428,7 +436,7 @@ fn buildUi() !void {
         break :blk temp_cache.TempCache.openDefault(
             gpa,
             core.io,
-            bridge.app_support_bundle_id,
+            g_platform_paths.service(),
             temp_cache.default_budget_bytes,
         ) catch |err| no_cache: {
             std.log.warn("relay: preview cache unavailable ({t}); remote Quick Look disabled", .{err});

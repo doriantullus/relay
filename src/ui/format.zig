@@ -1,4 +1,4 @@
-//! Small, pure, headless-tested formatting helpers shared across the app's
+//! Small, pure, headless-tested formatting helpers shared across both apps'
 //! controllers (no ObjC). Kept here so browser/transfers/etc. share one
 //! implementation instead of each carrying a copy.
 

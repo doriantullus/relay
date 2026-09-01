@@ -19,6 +19,7 @@
 //! preview still works (the cache just runs over budget until the next put).
 
 const std = @import("std");
+const Paths = @import("platform/paths.zig").Paths;
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -90,19 +91,15 @@ pub const TempCache = struct {
 
     pub const InitError = error{ OutOfMemory, Unexpected } || std.Io.Dir.CreateDirPathOpenError;
 
-    /// Open (creating if needed) the production cache dir:
-    /// ~/Library/Caches/<bundle_id>/preview/.
+    /// Open (creating if needed) the platform's production preview cache.
     pub fn openDefault(
         gpa: Allocator,
         io: std.Io,
-        bundle_id: []const u8,
+        paths: Paths,
         budget_bytes: u64,
-    ) (InitError || error{ NoHomeDirectory, NameTooLong })!TempCache {
-        const home = std.c.getenv("HOME") orelse return error.NoHomeDirectory;
-        var buf: [1024]u8 = undefined;
-        const root = std.fmt.bufPrint(&buf, "{s}/Library/Caches/{s}/preview", .{
-            std.mem.span(home), bundle_id,
-        }) catch return error.NameTooLong;
+    ) (InitError || Paths.Error)!TempCache {
+        const root = try paths.cacheDir(gpa, "preview");
+        defer gpa.free(root);
         return initAt(gpa, io, std.Io.Dir.cwd(), root, budget_bytes);
     }
 

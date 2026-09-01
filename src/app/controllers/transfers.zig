@@ -31,7 +31,7 @@
 const std = @import("std");
 const relay = @import("relay_core");
 const mac = @import("relay_mac");
-const bridge = @import("../bridge.zig");
+const bridge = @import("relay_ui").bridge;
 const transcript_mod = @import("transcript.zig");
 const prefs_mod = @import("prefs.zig");
 
@@ -64,7 +64,7 @@ const TransferState = events_mod.TransferState;
 // ---------------------------------------------------------------------------
 
 /// Shared with browser.zig and others via src/app/format.zig.
-pub const humanBytes = @import("../format.zig").humanBytes;
+pub const humanBytes = @import("relay_ui").format.humanBytes;
 
 /// "2.4 MB/s"; zero renders as an em dash (idle).
 pub fn humanRate(buf: []u8, bytes_per_s: u64) []const u8 {

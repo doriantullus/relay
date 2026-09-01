@@ -1,8 +1,9 @@
 # Relay — Architecture
 
-Native macOS FTP/FTPS/SFTP client in Zig 0.16. Target: macOS 15+, aarch64.
+Native FTP/FTPS/SFTP client in Zig 0.16. The AppKit frontend targets macOS
+15+ on aarch64; a GTK4 frontend targets Linux.
 
-## Three architectural laws
+## Four architectural laws
 
 1. **Streams, not sockets.** Every protocol layer codes against
    `*std.Io.Reader` / `*std.Io.Writer`. TLS is stream-stacking; the whole FTP
@@ -10,32 +11,41 @@ Native macOS FTP/FTPS/SFTP client in Zig 0.16. Target: macOS 15+, aarch64.
 2. **`relay_core` never imports ObjC** and stays Linux-buildable. Protocol
    integration tests run against real Docker servers on Linux CI; the macOS
    runner only builds, unit-tests, bundles, and signs.
-3. **The core↔UI boundary is C-ABI-clean at the bridge layer.** CoreEvent
-   (src/core/events.zig) stays a native Zig union — ergonomic for the
-   pure-Zig UI we chose. The extern-struct conversion lives in one place:
-   the app's bridge (M2's `src/app/bridge.zig`, later `capi.zig` if the
-   Ghostty-style Swift-shell pivot or CLI companion ever needs it). No
-   other file may assume either representation crosses the boundary.
+3. **The core↔UI boundary is centralized at the bridge layer.** CoreEvent
+   (`src/core/events.zig`) stays a native Zig union — ergonomic for both
+   pure-Zig native frontends. AppCore and the typed listener conversion live
+   in `src/ui/bridge.zig`; no toolkit reaches around that boundary.
+4. **`relay_ui` imports `relay_core` only, never a toolkit.** Platform
+   bindings and view layers import `relay_ui`; `relay_ui` never imports them.
+   Shared app logic therefore builds and tests on both macOS and Linux.
 
 ## Layers
 
 ```
-app (exe, main thread)   main.zig window assembly + M3 integration (state
+app_gtk (Linux exe)      process assembly: XDG/GLib/Secret Service injection,
+                         factories lifetime, relay_gtk application launch
+app (macOS exe)          main.zig window assembly + M3 integration (state
                          restoration, Quick Look temp-cache flow, palette/
-                         edit/terminal glue) · app_delegate · bridge.zig
-                         (AppCore) · controllers/ (browser+vim, sites+
+                         edit/terminal glue) · app_delegate · controllers/
+                         (browser+vim, sites+
                          importers, transfers+transcript+bandwidth,
                          prefs+commands+menus, inspector, palette,
-                         edit_sessions, terminal) · fuzzy.zig (matcher +
-                         frecency) · temp_cache.zig (preview cache) ·
-                         factories.zig (production connect factories:
-                         known_hosts/auth/prompts/proxy) · --smoke driver
+                         edit_sessions, terminal) · --smoke driver
 relay_mac (module)       zig-objc AppKit wrappers: window/table/outline/
                          menu/toolbar/split_view/panels/drag · libdispatch
                          glue · foundation+runtime kits · fsevents ·
                          quicklook · notifications · app_nap (all selector
                          strings live here)
-── UI bridge: src/app/bridge.zig — the ONLY core↔UI crossing ──
+relay_gtk (module)       GTK4 4.18.6 bindings · GLib MainLoop · XDG Paths ·
+                         libsecret CredStore · GTK application/header bar ·
+                         dual local panes with async AppCore listings
+── shared app layer ──
+relay_ui (module)        toolkit-free app logic shared by both frontends;
+                         AppCore bridge · connect factories · fuzzy/frecency ·
+                         preview cache · vim · sites/import/history · terminal
+                         builders · transcript/palette/inspector/edit models;
+                         imports relay_core only
+── core boundary ──
 relay_core (module)      vfs · pool · queue · cred · settings · transcript
                          proto/ftp (first-party) · proto/sftp (libssh2,
                          + jump-host/ProxyCommand transports)
@@ -43,6 +53,10 @@ relay_core (module)      vfs · pool · queue · cred · settings · transcript
                          tls (TlsProvider → LibreSSL)
 vendored C (static)      LibreSSL 4.0 (crypto/ssl), libssh2 1.11.1
 ```
+
+The extraction is complete: `src/ui/bridge.zig` is the only core↔UI crossing.
+Its `Paths` and `MainLoop` dependencies are injected vtables, implemented by
+libdispatch/Foundation on macOS and GLib/XDG on Linux.
 
 ## M3 integration seams (who owns what)
 
@@ -69,11 +83,12 @@ vendored C (static)      LibreSSL 4.0 (crypto/ssl), libssh2 1.11.1
 
 ## Threading
 
-- AppKit owns the main thread; Zig `main()` runs there and starts `[NSApp run]`.
+- The native toolkit owns the main thread: AppKit starts `[NSApp run]`; GTK
+  runs `GApplication`. Both inject the same `relay_ui.MainLoop` contract.
 - One `std.Io.Threaded` pool for all core work (`io.async`, per-site `Io.Group`).
-- Core→UI: MPSC double-buffered event queue; at most one
-  `dispatch_async(main_queue)` drain per runloop turn (coalescing); events
-  applied run-to-completion.
+- Core→UI: MPSC double-buffered event queue; at most one injected-main-loop
+  post per turn (`dispatch_async` or `g_main_context_invoke`), coalesced;
+  events apply run-to-completion.
 - Cancellation: `Future.cancel` + atomic `CancelToken` checked on ≤100 ms poll
   wakeups inside LibreSSL/libssh2 loops + protocol courtesy (`ABOR`, clean
   SFTP close).

@@ -25,7 +25,7 @@
 
 const std = @import("std");
 const mac = @import("relay_mac");
-const bridge = @import("bridge.zig");
+const bridge = @import("relay_ui").bridge;
 
 const objc = mac.objc;
 const runtime = mac.runtime;

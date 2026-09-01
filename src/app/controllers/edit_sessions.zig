@@ -34,7 +34,9 @@
 const std = @import("std");
 const relay = @import("relay_core");
 const mac = @import("relay_mac");
-const bridge = @import("../bridge.zig");
+const bridge = @import("relay_ui").bridge;
+const shared = @import("relay_ui").edit_sessions;
+const Paths = @import("relay_ui").platform.Paths;
 const prefs_mod = @import("prefs.zig");
 
 const objc = mac.objc;
@@ -119,63 +121,16 @@ pub const SessionState = enum {
 };
 
 // ---------------------------------------------------------------------------
-// Pure logic (headless-tested)
+// Pure logic — shared from relay_ui.
 // ---------------------------------------------------------------------------
 
-pub const SaveDecision = enum { upload, conflict };
-
-/// The conflict rule, pure over mtimes: a conflict exists exactly when both
-/// the recorded (at-download) and re-statted remote mtimes are known and
-/// differ. Either side unknown (server without mtimes, file deleted
-/// remotely, listing failed) degrades to upload — the queue item's own
-/// failure handling covers an unreachable site.
-pub fn decideOnSave(recorded_mtime: ?i64, restat_mtime: ?i64) SaveDecision {
-    const recorded = recorded_mtime orelse return .upload;
-    const current = restat_mtime orelse return .upload;
-    return if (recorded == current) .upload else .conflict;
-}
-
-/// mtime of the named entry in a listing, null when absent or unknown —
-/// the "stat" half of the conflict check, pure for testing.
-pub fn entryMtime(entries: []const vfs_mod.Entry, name: []const u8) ?i64 {
-    for (entries) |entry| {
-        if (std.mem.eql(u8, entry.name, name)) return entry.mtime;
-    }
-    return null;
-}
-
-/// Default cache base in local-VFS coordinates (the app's local root is
-/// "/", so this is also the real filesystem path):
-/// `$HOME/Library/Caches/us.doriantull.relay/edit`.
-pub fn defaultCacheBase(gpa: Allocator) error{ OutOfMemory, NoHomeDirectory }![]u8 {
-    const home = std.c.getenv("HOME") orelse return error.NoHomeDirectory;
-    return std.fmt.allocPrint(gpa, "{s}/Library/Caches/{s}/edit", .{
-        std.mem.span(home), bridge.app_support_bundle_id,
-    }) catch return error.OutOfMemory;
-}
-
-/// `<base>/<session-id>` — the per-session temp dir.
-pub fn sessionDir(gpa: Allocator, base: []const u8, session_id: u64) error{OutOfMemory}![]u8 {
-    return std.fmt.allocPrint(gpa, "{s}/{d}", .{ base, session_id });
-}
-
-/// "Save as Copy" name: `notes.txt` → `notes copy.txt`; extensionless and
-/// dotfile names get a plain ` copy` suffix.
-pub fn duplicateName(gpa: Allocator, name: []const u8) error{OutOfMemory}![]u8 {
-    const dot = std.mem.lastIndexOfScalar(u8, name, '.');
-    if (dot == null or dot.? == 0) {
-        return std.fmt.allocPrint(gpa, "{s} copy", .{name});
-    }
-    return std.fmt.allocPrint(gpa, "{s} copy{s}", .{ name[0..dot.?], name[dot.?..] });
-}
-
-/// Normalized local-VFS path → sub-path relative to the core's local root
-/// ("." for the root itself); mirrors core/vfs/local.zig's mapping so
-/// std.Io.Dir operations land exactly where queue transfers do.
-fn relFromVfs(p: []const u8) []const u8 {
-    std.debug.assert(path_mod.isNormalized(p));
-    return if (p.len == 1) "." else p[1..];
-}
+pub const SaveDecision = shared.SaveDecision;
+pub const decideOnSave = shared.decideOnSave;
+pub const entryMtime = shared.entryMtime;
+pub const defaultCacheBase = shared.defaultCacheBase;
+pub const sessionDir = shared.sessionDir;
+pub const duplicateName = shared.duplicateName;
+const relFromVfs = shared.relFromVfs;
 
 // ---------------------------------------------------------------------------
 // EditSession
@@ -250,6 +205,8 @@ pub const EditSessionsController = struct {
         /// Cache base in local-VFS coordinates (== real filesystem path in
         /// the app, whose local root is "/"). null = defaultCacheBase().
         cache_base: ?[]const u8 = null,
+        /// Required when `cache_base` is null.
+        paths: ?Paths = null,
         headless: bool = false,
         /// false: watch + upload as usual, but never open an editor
         /// (--smoke's local round trip).
@@ -277,7 +234,7 @@ pub const EditSessionsController = struct {
         if (options.cache_base) |b| {
             base = try path_mod.normalize(gpa, b);
         } else {
-            const def = try defaultCacheBase(gpa);
+            const def = try defaultCacheBase(gpa, options.paths orelse return error.CacheUnavailable);
             defer gpa.free(def);
             base = try path_mod.normalize(gpa, def);
         }
@@ -830,7 +787,8 @@ test "temp path construction: session dirs, file paths, default base shape" {
     try testing.expectEqualStrings("edit-cache/7", relFromVfs(dir));
     try testing.expectEqualStrings(".", relFromVfs("/"));
 
-    if (defaultCacheBase(gpa)) |base| {
+    var paths = mac.paths.AppPaths.init(bridge.app_support_bundle_id);
+    if (defaultCacheBase(gpa, paths.service())) |base| {
         defer gpa.free(base);
         try testing.expect(std.mem.endsWith(u8, base, "/Library/Caches/us.doriantull.relay/edit"));
         try testing.expect(base[0] == '/');

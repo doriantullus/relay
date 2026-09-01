@@ -30,15 +30,23 @@ jobs:
       - name: Unit tests
         run: zig build test
 
-  linux-core:
-    name: Linux (relay_core only)
+  linux-core-ui:
+    name: Linux (core + shared UI + GTK)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - name: Unit tests (core)
+      - name: Install GTK development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libsecret-1-dev xvfb xauth
+      - name: Build GTK application
+        run: zig build
+      - name: GTK smoke test
+        run: GTK_A11Y=none RELAY_GTK_SMOKE=1 dbus-run-session -- xvfb-run -a zig-out/bin/relay
+      - name: Unit tests (core + shared UI logic)
         run: zig build test
 
   # Separate job from the unit tests so live-server flakes are visible at

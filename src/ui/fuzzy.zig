@@ -1,4 +1,4 @@
-//! fuzzy — the palette's headless ranking kit (no ObjC imports):
+//! fuzzy — relay_ui's headless palette ranking kit:
 //!
 //!  1. `Matcher` — subsequence fuzzy matcher with scoring: consecutive-run
 //!     bonus, word/separator-boundary bonus, camelCase bonus, start-of-string

@@ -16,8 +16,8 @@
 #     xproto/kbproto/xextproto/renderproto/bzip2 .pc files are
 #     arch-independent and live in /usr/share.
 #  2. `pkg-config --libs-only-L gtk4` is EMPTY (Debian ships GTK on the
-#     default linker path). `--variable=libdir` is what yields the arch dir,
-#     and a cross target will not search the host's /usr/lib without it.
+#     default linker path), so pkg-config alone contributes no arch library
+#     search path to Zig.
 #  3. --search-prefix /opt/sys-<arch> (symlink dirs built in the Dockerfile).
 #     pkg-config emits no -L, and a cross target will not search the host's
 #     /usr/lib, so linking otherwise fails "searched paths: none".
@@ -30,8 +30,8 @@ set -e
 # Keep in step with the Dockerfile's FROM. `ldd --version` in the image.
 GLIBC=2.41
 
-# Which build step to run. Until src/gtk/ exists this is the portable core;
-# it becomes the GUI step at plan step 6.
+# Which build step to run. The default installs the GTK executable; pass
+# `test` for the native leg only or another named Zig build step as needed.
 STEP="${1:-install}"
 
 for pair in aarch64:arm64 x86_64:amd64; do

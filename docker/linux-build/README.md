@@ -17,6 +17,12 @@ docker run --rm -v "$PWD:/src" \
 docker run --rm -v "$PWD:/src" \
   -e ZIG_GLOBAL_CACHE_DIR=/src/zig-pkg-linux \
   relay-linux-build ./docker/linux-build/build-linux.sh
+
+# Exercise real GTK widget construction and two asynchronous local listings.
+docker run --rm -v "$PWD:/src" \
+  -e ZIG_GLOBAL_CACHE_DIR=/src/zig-pkg-linux \
+  relay-linux-build sh -lc \
+  'zig build && GTK_A11Y=none RELAY_GTK_SMOKE=1 dbus-run-session -- xvfb-run -a zig-out/bin/relay'
 ```
 
 `ZIG_GLOBAL_CACHE_DIR` is optional but wanted: it persists the fetched
@@ -26,11 +32,12 @@ separate from the host's `zig-pkg/` so macOS and Linux artifacts never mix.
 Pass a build step as the first argument (`spikes`, `test`, …); it defaults to
 `install`.
 
-Validated 2026-08-31: Debian 13.6 (trixie), glibc 2.41, GTK 4.18.6 for arm64
-and amd64 co-installed with zero conflicts. Both arches built from scratch in
-**9.6s**.
+Validated 2026-09-01: Debian 13.6 (trixie), glibc 2.41, GTK 4.18.6 and
+libsecret 0.21.7 for arm64 and amd64 co-installed with zero conflicts. The
+AppCore-connected GTK executable links for both targets; the native unit suite
+also passes in this image.
 
-Only the GUI needs this container. `relay_core` and `relay_ui` cross-compile
+Only the GUI and Secret Service adapter need this container. `relay_core` and `relay_ui` cross-compile
 straight from macOS (`zig build -Dtarget=x86_64-linux-gnu`, ~8s) because their
 C dependencies — LibreSSL, libssh2 — are vendored and built from source. GTK is
 the one non-hermetic dependency, which is why it is quarantined here.
@@ -90,30 +97,14 @@ It **replaces** the default search path rather than prepending to it.
 arch-independent and live in `/usr/share/pkgconfig`. Omit it and the build
 fails with a wall of `Package 'xproto', required by 'x11', not found`.
 
-### 3. `--libs-only-L` is empty; use `--variable=libdir`
+### 3. `--libs-only-L` is empty
 
-Debian ships GTK on the default linker path, so pkg-config emits no `-L` at
-all. A cross target will not search the host's `/usr/lib`, so the link fails
-with `unable to find dynamic system library 'gtk-4' … searched paths: none`.
-`pkg-config --variable=libdir gtk4` returns `/usr/lib/<triple>` directly, and
-is arch-correct because `PKG_CONFIG_LIBDIR` already selected the arch.
-
-In `build.zig`:
-
-```zig
-fn addPkgConfigLibs(b: *std.Build, mod: *std.Build.Module, pkg: []const u8) void {
-    const libdir = std.mem.trim(u8, b.run(&.{ "pkg-config", "--variable=libdir", pkg }), " \n\r\t");
-    if (libdir.len > 0) mod.addLibraryPath(.{ .cwd_relative = libdir });
-    var libs = std.mem.tokenizeAny(u8, b.run(&.{ "pkg-config", "--libs-only-l", pkg }), " \n\r\t");
-    while (libs.next()) |tok| {
-        if (std.mem.startsWith(u8, tok, "-l"))
-            mod.linkSystemLibrary(tok[2..], .{ .use_pkg_config = .no });
-    }
-}
-```
-
-`.use_pkg_config = .no` matters: Zig would otherwise re-invoke pkg-config
-itself and lose the arch selection.
+Debian ships GTK on its default linker path, so pkg-config emits the `-l`
+flags and header paths but no `-L` at all. A Zig cross target does not search
+the host's `/usr/lib/<triple>` automatically, so pkg-config by itself still
+leads to `unable to find dynamic system library 'gtk-4' … searched paths:
+none`. The next section describes the library-only search prefix that solves
+this without adding system headers to the hermetic core build.
 
 ### 4. `--search-prefix` must be LIB-ONLY
 

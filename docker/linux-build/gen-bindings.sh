@@ -39,6 +39,7 @@ cd - >/dev/null
 rm -rf "$OUT"
 mkdir -p "$(dirname "$OUT")"
 cp -r "$WORK/zig-out/bindings" "$OUT"
+cp "$WORK/LICENSE" "$OUT/LICENSE"
 echo "=== generated into $OUT ==="
 find "$OUT/src" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | tr '\n' ' '; echo
 echo "$(find "$OUT/src" -name '*.zig' | wc -l) files, $(find "$OUT/src" -name '*.zig' -exec cat {} + | wc -l) lines"

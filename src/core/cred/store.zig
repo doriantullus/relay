@@ -1,13 +1,14 @@
 //! store — the CredStore interface: the only place secrets live. Sites
 //! (settings/sites.zig) reference credentials purely by key
 //! (protocol, host, port, account); the backing store is the macOS
-//! Keychain (keychain.zig) in the app and an in-memory fake (fake.zig) in
-//! tests and on Linux.
+//! Keychain (keychain.zig) in the macOS app, Secret Service/libsecret in the
+//! Linux app, and an in-memory fake (fake.zig) in tests.
 //!
-//! No io/CancelToken: the Security.framework calls are synchronous,
-//! short, and not cancelable — callers run them on a worker, never the
-//! main thread. Diagnostics is still threaded through so Keychain OSStatus
-//! context reaches the UI classified (auth failures pause the site).
+//! No io/CancelToken: the backend contract is synchronous and not cancelable,
+//! so callers run it on a worker, never the main thread (libsecret may wait
+//! for the session service or unlock UI). Diagnostics is still threaded
+//! through so native-store context reaches the UI classified; auth failures
+//! pause the site.
 
 const std = @import("std");
 const Diagnostics = @import("../diag.zig").Diagnostics;

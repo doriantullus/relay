@@ -1,19 +1,26 @@
 # Relay — Linux port plan
 
-**Status: not started.** Everything below step 0 is unbuilt. `src/ui/`,
-`src/gtk/` and `src/app_gtk/` do not exist; all 13 files in `src/app/` still
-`@import("relay_mac")`. What *has* been done is de-risking: the build
-environment and the GTK binding strategy are settled and proven (step 0).
+**Status (2026-09-01): first usable Linux slice builds on arm64 and x86_64.**
+Steps 1–4 are complete: `relay_ui` contains AppCore, factories, paths/main-loop
+seams, and the extracted pure feature models. Step 5 has vendored GTK 4.18.6
+bindings, GLib/XDG implementations, and a libsecret credential backend. Step
+6 now launches a native GTK app with two independently navigable local panes
+driven asynchronously by the shared AppCore. It is a working port foundation,
+not feature parity with the M3 AppKit frontend; the remaining work is tracked
+below.
 
-This document is written to be executed by someone — or something — with no
-prior context. Read it start to finish before touching code.
-
-Verify the starting state:
+Verify the current state:
 
 ```sh
-ls -d src/ui src/gtk src/app_gtk        # expect: all missing
-grep -c relay_ui build.zig              # expect: 0
-grep -rl '@import("relay_mac")' src/app | wc -l   # expect: 13
+test -d src/ui && test -d src/gtk && test -d src/app_gtk
+rg 'relay_mac|@import\("(gtk|gio|glib|gobject)' src/ui  # expect: no matches
+docker run --rm -v "$PWD:/src" -e ZIG_GLOBAL_CACHE_DIR=/src/zig-pkg-linux \
+  relay-linux-build zig build test
+docker run --rm -v "$PWD:/src" -e ZIG_GLOBAL_CACHE_DIR=/src/zig-pkg-linux \
+  relay-linux-build ./docker/linux-build/build-linux.sh
+docker run --rm -v "$PWD:/src" -e ZIG_GLOBAL_CACHE_DIR=/src/zig-pkg-linux \
+  relay-linux-build sh -lc \
+  'zig build && GTK_A11Y=none RELAY_GTK_SMOKE=1 dbus-run-session -- xvfb-run -a zig-out/bin/relay'
 ```
 
 ---
@@ -24,38 +31,35 @@ Relay is a native macOS FTP/FTPS/SFTP client in Zig 0.16 (see
 `docs/ARCHITECTURE.md`, `docs/UX.md`). The goal is a Linux GUI **as a second
 frontend**, not a port of the first.
 
-`src/macos/` is never touched. It is already gated — `build.zig` on
-`target.result.os.tag`, `src/macos/root.zig` on `@compileError` — so a Linux
-target never compiles it.
+`src/macos/` remains macOS-only. It is gated by `build.zig` and
+`src/macos/root.zig`, so a Linux target never compiles it. The extraction did
+add small `Paths` and `MainLoop` adapters there; no AppKit view was rewritten.
 
-The work is in `src/app/` (25,623 lines). All 13 controllers import
-`relay_mac`, and the *app logic* — the core↔UI bridge, connect factories,
-fuzzy ranking, session restore, the vim keymap — lives inside AppKit-shaped
-files. Left alone, a GTK frontend reimplements all of it, and every feature
-after M3 gets written twice, forever.
-
-So: extract the platform-neutral half into a new `relay_ui` module (steps
-1–4), then build the GTK binding and view layer against it (steps 5–6).
+At the original handoff, the work was concentrated in `src/app/` (25,623
+lines): 13 files imported `relay_mac`, while the core↔UI bridge, connect
+factories, fuzzy ranking, session restore, and vim keymap lived inside
+AppKit-shaped files. The completed extraction below prevents the GTK frontend
+from reimplementing that logic.
 
 ### Target layering
 
 ```
 src/core/      relay_core   protocol, portable            exists, untouched
-src/ui/        relay_ui     shared app logic, NO toolkit  NEW — steps 1–4
-src/macos/     relay_mac    AppKit binding                exists, untouched
-src/gtk/       relay_gtk    GTK4 binding                  NEW — step 5
+src/ui/        relay_ui     shared app logic, NO toolkit  BUILT
+src/macos/     relay_mac    AppKit binding + adapters     exists
+src/gtk/       relay_gtk    GTK4 binding + services       BUILT, expanding
 src/app/       Relay        AppKit views + assembly       shrinks
-src/app_gtk/   relay        GTK views + assembly          NEW — step 6
+src/app_gtk/   relay        Linux process assembly        BUILT
 ```
 
 **Fourth architectural law**, mirroring law 2 in `docs/ARCHITECTURE.md`:
 *`relay_ui` imports `relay_core` only, never a toolkit.* The bindings and view
-layers import `relay_ui`; never the reverse. Add this to `ARCHITECTURE.md` in
-step 1 and enforce it in review.
+layers import `relay_ui`; never the reverse. This is now recorded in
+`ARCHITECTURE.md` and enforced by the module import graph.
 
 Renaming `src/app/` → `src/app_mac/` is cheap (relative imports survive a
 directory move; only `build.zig`'s `root_source_file` changes) but belongs in
-its own commit *after* step 4, so the extraction diffs stay pure moves.
+a separate follow-up commit so the extraction history stays readable.
 
 ---
 
@@ -138,9 +142,9 @@ docker build -t relay-linux-build docker/linux-build
 docker run --rm -v "$PWD:/src" -e ZIG_GLOBAL_CACHE_DIR=/src/zig-pkg-linux \
   relay-linux-build ./docker/linux-build/gen-bindings.sh
 
-# Compile both arches.
+# Compile and install both GTK executables.
 docker run --rm -v "$PWD:/src" -e ZIG_GLOBAL_CACHE_DIR=/src/zig-pkg-linux \
-  relay-linux-build ./docker/linux-build/build-linux.sh spikes
+  relay-linux-build ./docker/linux-build/build-linux.sh
 
 # Run tests (native arch only — see §8).
 docker run --rm -v "$PWD:/src" -e ZIG_GLOBAL_CACHE_DIR=/src/zig-pkg-linux \
@@ -160,12 +164,12 @@ floor. **Read that file before changing anything under `docker/`.**
 
 ---
 
-## 4. Steps 1–4 — the `relay_ui` extraction
+## 4. Steps 1–4 — the `relay_ui` extraction (DONE)
 
 macOS must keep building and passing throughout. The 201 headless tests in
 `src/app` are the safety net.
 
-### Step 1 — land the empty module
+### Step 1 — land the empty module (DONE)
 
 Nothing moves yet.
 
@@ -180,20 +184,20 @@ Nothing moves yet.
 
 **Done when** `zig build test` passes on macOS and Linux with an empty module.
 
-### Step 2 — move the five zero-dependency files
+### Step 2 — move the five zero-dependency files (DONE)
 
 These import no toolkit at all. Pure moves.
 
 | file | lines |
 |---|---|
-| `src/app/factories.zig` | 1302 |
-| `src/app/fuzzy.zig` | 665 |
-| `src/app/temp_cache.zig` | 505 |
-| `src/app/controllers/vim.zig` | 216 |
-| `src/app/format.zig` | 32 |
+| `src/ui/factories.zig` | 1302 |
+| `src/ui/fuzzy.zig` | 665 |
+| `src/ui/temp_cache.zig` | 502 |
+| `src/ui/vim.zig` | 216 |
+| `src/ui/format.zig` | 32 |
 
-~2,720 lines. Only `temp_cache.zig:103` needs surgery — it builds
-`~/Library/Caches/<id>/preview` from `getenv("HOME")`. Introduce `Paths`:
+~2,720 lines. `src/ui/temp_cache.zig:101` now asks `Paths` for
+the preview cache instead of building a Library path from `HOME`:
 
 ```zig
 /// src/ui/platform/paths.zig
@@ -217,13 +221,14 @@ pub const Paths = struct {
 };
 ```
 
-Three call sites total, spread across steps 2–4: `bridge.zig:396` (config),
-`temp_cache.zig:103` (cache/preview), `edit_sessions.zig:152` (cache/edit).
+The current call sites are `src/ui/bridge.zig:407` (config),
+`src/ui/temp_cache.zig:101` (cache/preview), and
+`src/ui/edit_sessions.zig:27` (cache/edit).
 
 **Done when** the five files live in `src/ui/`, `src/app/` imports them from
 `relay_ui`, and both suites pass.
 
-### Step 3 — `MainLoop`, then move `bridge.zig`
+### Step 3 — `MainLoop`, then move `bridge.zig` (DONE)
 
 The highest-leverage step in the project: **2,499 lines for three call sites.**
 `bridge.zig`'s entire macOS dependency is:
@@ -270,58 +275,61 @@ pub const MainLoop = struct {
 Implementations: `src/macos/` wraps `dispatch.mainQueueAsync` /
 `RepeatingTimer.startOnMain`; `src/gtk/` wraps `g_main_context_invoke` /
 `g_timeout_add` (step 5); `src/ui/` ships a manual fake for tests, which
-`pump = .manual` (`bridge.zig:124`) already models.
+`pump = .manual` (`src/ui/bridge.zig:124`) already models.
 
 **Done when** `bridge.zig` lives in `src/ui/` with zero toolkit imports and
 its headless tests run in the Linux CI job.
 
-Other `dispatch` users stay in the view layer for now — `browser.zig:2868`
-(`globalQueue`, compare diff), `browser.zig:2893`, `transfers.zig:1349`,
-`main.zig:1578`/`:1596` (`after`). Widen `MainLoop` only if step 4 pulls logic
-that needs them.
+Other `dispatch` users stay in the macOS view layer for now — notably
+`src/app/controllers/browser.zig:2868` (background compare) and the scripted
+smoke cadence in `src/app/main.zig`. Widen `MainLoop` only when shared logic
+actually needs those operations.
 
-### Step 4 — lift the already-marked pure models
+### Step 4 — lift the already-marked pure models (DONE for the pure halves)
 
 Each file is *already* split by its author into a pure section and a
 controller section. Lift the pure half; leave the controller behind.
 
-| file | marker | lines |
-|---|---|---|
-| `src/app/controllers/sites.zig:127` | "Quick Connect target parsing (pure; headless-tested)" | 3953 |
-| `src/app/controllers/terminal.zig:5` | "Command builders (pure, headless-tested)" | 1305 |
-| `src/app/controllers/palette.zig:148` | "Model — candidates + ranking (headless; no ObjC)" | 1202 |
-| `src/app/controllers/edit_sessions.zig:122` | "Pure logic (headless-tested)" | 1116 |
-| `src/app/controllers/inspector.zig:78` | "Pure permission/format logic (headless-tested)" | 828 |
-| `src/app/controllers/transcript.zig:36` | "Pure model — headless-tested" | 776 |
+| current shared file | extracted responsibility | lines |
+|---|---|---:|
+| `src/ui/sites.zig` | saved sites, history, SSH config, quick connect, importers | 1137 |
+| `src/ui/terminal.zig` | command builders and launch-plan derivation | 470 |
+| `src/ui/palette.zig` | candidates and fuzzy ranking model | 104 |
+| `src/ui/edit_sessions.zig` | cache paths and conflict decisions | 72 |
+| `src/ui/inspector.zig` | selection, permission, and format model | 123 |
+| `src/ui/transcript.zig` | ring, sanitization, filtering, follow-tail | 197 |
 
-Expect ~3–5k lines to move, bringing the shared layer to **~8–10k**.
-
-Add the remaining service vtables as the lifts demand them:
+The pure halves are now in `src/ui/{sites,terminal,palette,edit_sessions,
+inspector,transcript}.zig`; the macOS controllers import and alias them. The
+remaining platform services are still needed as their controller logic moves:
 
 - `FileWatcher` — FSEvents (`src/macos/fsevents.zig`) vs inotify;
   `edit_sessions`. Note inotify is per-directory with watch limits — different
   semantics, not a drop-in.
-- `Opener` — `NSWorkspace` (`edit_sessions.zig:780`) vs `xdg-open`/`GAppInfo`.
+- `Opener` — `NSWorkspace` (`src/app/controllers/edit_sessions.zig:737`) vs
+  `xdg-open`/`GAppInfo`.
 - `Notifier` — `UNUserNotification` (`src/macos/notifications.zig`) vs
   `GNotification`.
-- `TerminalLauncher` — bundle-ID detection (`terminal.zig:489`) vs `$TERMINAL`
+- `TerminalLauncher` — bundle-ID detection
+  (`src/app/controllers/terminal.zig:121`) vs `$TERMINAL`
   plus a configurable list (foot, kitty, konsole, ghostty, gnome-terminal).
   The plan derivation is already pure.
 
-`CredStore` is **not** one of these — it already exists at core level, so the
-Linux backend lands in `src/core/cred/` (see §6).
+`CredStore` is **not** one of these — the interface already exists at core
+level. The Linux libsecret implementation lives in `relay_gtk`, next to the
+system library it links, and is injected into AppCore by `src/app_gtk/main.zig`.
 
 **Done when** each listed file imports its model from `relay_ui` and those
 tests run on Linux CI.
 
 ---
 
-## 5. Steps 5–6 — the GTK frontend
+## 5. Steps 5–6 — the GTK frontend (IN PROGRESS)
 
-Not yet planned in detail; plan it properly once step 4 lands and the real
-shape of `relay_ui` is known. What is settled:
+The foundations and first native view are implemented. Feature parity remains
+large enough that each remaining controller should land as a reviewable slice.
 
-### Step 5 — `src/gtk/` (relay_gtk)
+### Step 5 — `src/gtk/` (relay_gtk, FOUNDATION DONE)
 
 The GTK4 binding layer, mirroring `relay_mac`'s role. Same law as
 `src/macos/root.zig`: **all** direct GTK contact lives in this module; feature
@@ -329,15 +337,26 @@ code never touches it.
 
 - Vendor the generated bindings (`gen-bindings.sh` → `vendor/zig-gobject-bindings/`)
   and consume via `b.dependency("gobject", …)` + `mod.addImport("gtk", …)`.
-- Implement `MainLoop` (`g_main_context_invoke`, `g_timeout_add`), `Paths`
-  (XDG), `FileWatcher` (inotify), `Opener`, `Notifier`, `TerminalLauncher`.
+- Implement `MainLoop` (`g_main_context_invoke`, `g_timeout_add`) and `Paths`
+  (XDG). **Done and headless-tested.** `FileWatcher` (inotify), `Opener`,
+  `Notifier`, and `TerminalLauncher` remain.
+- Inject a Secret Service backend via libsecret. **Done; compile-tested without
+  touching the developer/CI keyring.**
 - Wrap the widgets `relay_mac` wraps: a virtual table over `GtkColumnView` +
   `GListModel` (the analogue of `table_source.zig`), tree/outline for the
-  sidebar, split view, dialogs, drag & drop.
+  sidebar, split view, dialogs, drag & drop. **The application/header bar,
+  split view, path controls, scrollers, and list rows exist; virtualized column
+  views, dialogs, sidebar, and drag/drop remain.**
 
-### Step 6 — `src/app_gtk/` (the view layer)
+### Step 6 — `src/app_gtk/` (FIRST SLICE DONE)
 
-~10–12k lines of view code against `relay_ui`. Deliberate UX divergences —
+`src/app_gtk/main.zig` is intentionally only process assembly. GTK contact
+stays in `relay_gtk/application.zig`, which currently supplies two local panes
+with path entry, up, refresh, async loading status, sorted AppCore snapshots,
+directory activation, stale-request rejection, and deterministic listener/
+snapshot cleanup.
+
+The remaining ~10–12k-line view layer should keep deliberate UX divergences —
 do not try to clone `docs/UX.md` literally:
 
 | macOS | Linux |
@@ -352,18 +371,19 @@ do not try to clone `docs/UX.md` literally:
 
 ## 6. Required work outside the six steps
 
-- **`CredStore` Linux backend.** `src/core/cred/keychain.zig:18` is
-  `if (macos) MacKeychainStore else UnsupportedStore`. Needs Secret Service /
-  libsecret, or an encrypted file store. ~300–500 lines plus a policy decision.
-  Lands beside `keychain.zig`.
-- **TLS trust on Linux.** `src/core/tls/verify_sectrust.zig:23` already has the
-  Linux branch (`SSL_CTX_set_default_verify_paths` + `SSL_set1_host`). Needs
-  distro CA-path probing and failure-detail parity with the SecTrust path.
+- **`CredStore` Linux backend — DONE.** `src/gtk/secret_store.{zig,c}` maps the
+  portable CredStore key to Secret Service schema attributes and is injected
+  explicitly. The macOS-only `KeychainStore` remains unchanged.
+- **TLS trust on Linux — BASELINE DONE.** LibreSSL uses the distro default CA
+  paths plus `SSL_set1_host`; both Linux binaries link this path. Richer
+  failure-detail parity with SecTrust remains desirable.
 - **Packaging.** Flatpak, built against `org.gnome.Platform`. Flathub's farm
   builds x86_64 and aarch64 from one manifest — the multiarch container is for
   dev and CI, and does **not** produce the Flatpak.
-- **CI.** Add a `linux-gui` job only when `src/gtk/` exists; before that it is
-  a green no-op.
+- **CI — DONE.** The Linux job installs GTK/libsecret, builds the executable,
+  constructs the real GTK window under Xvfb (both local AppCore listings must
+  finish), and runs core/shared-UI/GTK tests. The live Docker integration job
+  remains separate so server flakes cannot mask deterministic failures.
 
 ---
 
@@ -381,18 +401,22 @@ zig build test
 docker run --rm -v "$PWD:/src" -e ZIG_GLOBAL_CACHE_DIR=/src/zig-pkg-linux \
   relay-linux-build zig build test
 
-# Both arches still COMPILE:
+# Both arches still COMPILE and install the GTK executable:
 docker run --rm -v "$PWD:/src" -e ZIG_GLOBAL_CACHE_DIR=/src/zig-pkg-linux \
-  relay-linux-build ./docker/linux-build/build-linux.sh spikes
+  relay-linux-build ./docker/linux-build/build-linux.sh
+
+# GTK construction + AppCore event-loop smoke (native arch, virtual display):
+docker run --rm -v "$PWD:/src" -e ZIG_GLOBAL_CACHE_DIR=/src/zig-pkg-linux \
+  relay-linux-build sh -lc \
+  'zig build && GTK_A11Y=none RELAY_GTK_SMOKE=1 dbus-run-session -- xvfb-run -a zig-out/bin/relay'
 
 zig fmt --check build.zig build.zig.zon src
 ```
 
-The payoff lands at step 3: a large share of the 201 headless tests in
-`src/app` begin running on Linux CI, so the shared layer is verified on both
-platforms **before** any GTK code exists. `relay_ui` is platform-neutral by
-construction, so its tests also run natively on macOS — no container, no
-emulation.
+The step-3 payoff is now live: AppCore and the extracted models run on Linux
+CI as `relay_ui`, alongside compile-only GTK service tests that never touch a
+real keyring or display. `relay_ui` is platform-neutral by construction, so
+the same tests also run natively on macOS — no container or emulation.
 
 ### On timing-sensitive tests
 
@@ -421,13 +445,15 @@ fake should advance virtual time the same way.
 
 | path | role |
 |---|---|
-| `docs/ARCHITECTURE.md` | the three (soon four) laws, layer diagram |
+| `docs/ARCHITECTURE.md` | the four laws and current layer diagram |
 | `docs/UX.md` | keyboard map and interaction spec |
 | `docker/linux-build/README.md` | build environment + five findings |
 | `src/core/cred/store.zig` | the vtable idiom to copy |
-| `src/app/bridge.zig` | AppCore; the only core↔UI crossing |
+| `src/ui/bridge.zig` | AppCore; the only core↔UI crossing |
 | `src/macos/root.zig` | "all selector strings live here" — the law relay_gtk mirrors |
 | `src/macos/appkit/table_source.zig` | the virtual table relay_gtk must match |
+| `src/gtk/application.zig` | current GTK window and dual-pane listing slice |
+| `src/gtk/secret_store.zig` | Linux Secret Service CredStore adapter |
 
-Sizes at time of writing: `src/core` 24,406 lines (44 files), `src/macos`
-8,104 (19), `src/app` 25,623 (18).
+Current shared/GTK/bootstrap surface: about 8.1k lines across `src/ui`,
+`src/gtk`, and `src/app_gtk`, excluding the generated bindings.

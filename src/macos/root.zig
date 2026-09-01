@@ -19,6 +19,8 @@ pub const fsevents = @import("fsevents.zig");
 pub const app_nap = @import("app_nap.zig");
 pub const quicklook = @import("quicklook.zig");
 pub const notifications = @import("notifications.zig");
+pub const paths = @import("paths.zig");
+pub const main_loop = @import("main_loop.zig");
 
 pub const appkit = struct {
     pub const window = @import("appkit/window.zig");
@@ -44,6 +46,8 @@ test {
     _ = app_nap;
     _ = quicklook;
     _ = notifications;
+    _ = paths;
+    _ = main_loop;
     _ = appkit.window;
     _ = appkit.table_source;
     _ = appkit.outline_view;

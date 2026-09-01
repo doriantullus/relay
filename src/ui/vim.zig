@@ -1,4 +1,4 @@
-//! vim — the opt-in browser keymap layer (pref "ui.vimMode", off by
+//! vim — the shared opt-in browser keymap layer (pref "ui.vimMode", off by
 //! default; phase 2 browser power features).
 //!
 //! PURE state machine: a `Keymap` consumes normalized `Key`s and yields

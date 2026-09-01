@@ -42,6 +42,10 @@ pub fn globalQueue() Queue {
 
 /// The one block shape we marshal: a Zig context pointer riding as usize.
 const CtxBlock = objc.Block(struct { ctx: usize }, .{}, void);
+const ErasedBlock = objc.Block(struct {
+    arg: *anyopaque,
+    f_addr: usize,
+}, .{}, void);
 
 fn ctxBlock(ctx: anytype, comptime f: fn (@TypeOf(ctx)) void) CtxBlock.Context {
     const Ptr = @TypeOf(ctx);
@@ -62,6 +66,28 @@ fn ctxBlock(ctx: anytype, comptime f: fn (@TypeOf(ctx)) void) CtxBlock.Context {
 /// the invocation runs on the main thread inside its own autorelease pool.
 pub fn mainQueueAsync(ctx: anytype, comptime f: fn (@TypeOf(ctx)) void) void {
     asyncOnQueue(mainQueue(), ctx, f);
+}
+
+/// Runtime-erased counterpart used by relay_ui's MainLoop vtable.
+pub fn mainQueueAsyncErased(arg: *anyopaque, f: *const fn (*anyopaque) void) void {
+    asyncOnQueueErased(mainQueue(), arg, f);
+}
+
+fn asyncOnQueueErased(
+    queue: Queue,
+    arg: *anyopaque,
+    f: *const fn (*anyopaque) void,
+) void {
+    const Fns = struct {
+        fn invoke(block: *const ErasedBlock.Context) callconv(.c) void {
+            const pool = objc.AutoreleasePool.init();
+            defer pool.deinit();
+            const callback: *const fn (*anyopaque) void = @ptrFromInt(block.f_addr);
+            callback(block.arg);
+        }
+    };
+    var block = ErasedBlock.init(.{ .arg = arg, .f_addr = @intFromPtr(f) }, Fns.invoke);
+    dispatch_async(queue, @ptrCast(&block));
 }
 
 pub fn asyncOnQueue(queue: Queue, ctx: anytype, comptime f: fn (@TypeOf(ctx)) void) void {
@@ -95,6 +121,40 @@ pub const RepeatingTimer = struct {
         comptime f: fn (@TypeOf(ctx)) void,
     ) StartError!RepeatingTimer {
         return startOnQueue(mainQueue(), interval_ms, ctx, f);
+    }
+
+    pub fn startOnMainErased(
+        interval_ms: u64,
+        arg: *anyopaque,
+        f: *const fn (*anyopaque) void,
+    ) StartError!RepeatingTimer {
+        const source = dispatch_source_create(
+            @ptrCast(@constCast(dispatch_source_type_timer)),
+            0,
+            0,
+            mainQueue(),
+        ) orelse return StartError.SourceCreateFailed;
+
+        const Fns = struct {
+            fn invoke(block: *const ErasedBlock.Context) callconv(.c) void {
+                const pool = objc.AutoreleasePool.init();
+                defer pool.deinit();
+                const callback: *const fn (*anyopaque) void = @ptrFromInt(block.f_addr);
+                callback(block.arg);
+            }
+        };
+        var block = ErasedBlock.init(.{ .arg = arg, .f_addr = @intFromPtr(f) }, Fns.invoke);
+        dispatch_source_set_event_handler(source, @ptrCast(&block));
+
+        const interval_ns: u64 = interval_ms * std.time.ns_per_ms;
+        dispatch_source_set_timer(
+            source,
+            dispatch_time(dispatch_time_now, @intCast(interval_ns)),
+            interval_ns,
+            interval_ns / 10,
+        );
+        dispatch_resume(source);
+        return .{ .source = source };
     }
 
     pub fn startOnQueue(

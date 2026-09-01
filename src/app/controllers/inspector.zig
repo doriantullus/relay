@@ -15,7 +15,8 @@
 
 const std = @import("std");
 const mac = @import("relay_mac");
-const bridge = @import("../bridge.zig");
+const bridge = @import("relay_ui").bridge;
+const model = @import("relay_ui").inspector;
 const prefs = @import("prefs.zig");
 
 // TODO(m2-dedupe): the control kit moves to relay_mac together with the copy
@@ -35,105 +36,21 @@ const c = foundation.c;
 // Selection vocabulary (filled by the browser's selection callback).
 // ---------------------------------------------------------------------------
 
-pub const ItemKind = enum {
-    file,
-    dir,
-    symlink,
-    other,
-
-    pub fn label(self: ItemKind) [:0]const u8 {
-        return switch (self) {
-            .file => "File",
-            .dir => "Folder",
-            .symlink => "Symlink",
-            .other => "Item",
-        };
-    }
-};
-
-pub const SelectedItem = struct {
-    name: []const u8,
-    /// Absolute path within the pane's VFS.
-    path: []const u8,
-    kind: ItemKind = .file,
-    size: ?u64 = null,
-    /// Remote permission bits (low 9), when the listing knows them.
-    mode: ?u16 = null,
-};
-
-pub const Selection = struct {
-    pane_token: bridge.PaneToken = 0,
-    /// 0 (item_mod.local_site_id) = local pane: no permissions editor.
-    site_id: u64 = 0,
-    items: []const SelectedItem = &.{},
-};
-
-/// Per-dispatched-chmod notification (path borrowed for the call).
-pub const ChmodStageHook = struct {
-    ctx: ?*anyopaque = null,
-    stage: ?*const fn (ctx: ?*anyopaque, pane_token: bridge.PaneToken, path: []const u8, mode: u16) void = null,
-};
+pub const ItemKind = model.ItemKind;
+pub const SelectedItem = model.SelectedItem;
+pub const Selection = model.Selection;
+pub const ChmodStageHook = model.ChmodStageHook;
 
 // ---------------------------------------------------------------------------
 // Pure permission/format logic (headless-tested).
 // ---------------------------------------------------------------------------
 
-/// Checkbox order: owner r,w,x · group r,w,x · others r,w,x (bit 8 → bit 0).
-pub fn rwxFromMode(mode: u16) [9]bool {
-    var flags: [9]bool = undefined;
-    for (&flags, 0..) |*flag, i| {
-        const bit: u4 = @intCast(8 - i);
-        flag.* = (mode >> bit) & 1 == 1;
-    }
-    return flags;
-}
-
-pub fn modeFromRwx(flags: [9]bool) u16 {
-    var mode: u16 = 0;
-    for (flags, 0..) |flag, i| {
-        if (flag) mode |= @as(u16, 1) << @intCast(8 - i);
-    }
-    return mode;
-}
-
-/// Parse the octal permissions field: 1–4 octal digits, value ≤ 0o777
-/// (special bits are out of M2 scope). Whitespace-tolerant; null = invalid.
-pub fn modeFromOctalText(text: []const u8) ?u16 {
-    const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    if (trimmed.len == 0 or trimmed.len > 4) return null;
-    var value: u32 = 0;
-    for (trimmed) |ch| {
-        if (ch < '0' or ch > '7') return null;
-        value = value * 8 + (ch - '0');
-    }
-    if (value > 0o777) return null;
-    return @intCast(value);
-}
-
-/// "644"-style text for the octal field.
-pub fn octalTextFromMode(mode: u16, buf: *[3]u8) []const u8 {
-    buf[0] = '0' + @as(u8, @intCast((mode >> 6) & 7));
-    buf[1] = '0' + @as(u8, @intCast((mode >> 3) & 7));
-    buf[2] = '0' + @as(u8, @intCast(mode & 7));
-    return buf[0..];
-}
-
-/// Sum of the known sizes in a selection (directories report null).
-pub fn sizeSum(items: []const SelectedItem) u64 {
-    var total: u64 = 0;
-    for (items) |item| total +|= item.size orelse 0;
-    return total;
-}
-
-pub fn formatBytes(bytes: u64, buf: []u8) []const u8 {
-    if (bytes < 1024) return std.fmt.bufPrint(buf, "{d} B", .{bytes}) catch "?";
-    const units = [_][]const u8{ "KB", "MB", "GB", "TB" };
-    var value: f64 = @floatFromInt(bytes);
-    var unit: usize = 0;
-    value /= 1024;
-    while (value >= 1024 and unit < units.len - 1) : (unit += 1) value /= 1024;
-    return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ value, units[unit] }) catch "?";
-}
+pub const rwxFromMode = model.rwxFromMode;
+pub const modeFromRwx = model.modeFromRwx;
+pub const modeFromOctalText = model.modeFromOctalText;
+pub const octalTextFromMode = model.octalTextFromMode;
+pub const sizeSum = model.sizeSum;
+pub const formatBytes = model.formatBytes;
 
 // ---------------------------------------------------------------------------
 // Flipped container view (layout flows top-down like the docs/UX.md panel).

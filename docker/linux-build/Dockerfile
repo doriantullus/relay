@@ -8,9 +8,10 @@ ARG ZIG_VERSION=0.16.0
 RUN dpkg --add-architecture amd64 \
  && apt-get update -qq \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl xz-utils pkg-config git \
+      ca-certificates curl xz-utils pkg-config git xvfb xauth \
       xsltproc \
       libgtk-4-dev:arm64 libgtk-4-dev:amd64 \
+      libsecret-1-dev:arm64 libsecret-1-dev:amd64 \
  && rm -rf /var/lib/apt/lists/*
 
 # Zig is the only toolchain: it cross-compiles without a foreign-arch gcc.

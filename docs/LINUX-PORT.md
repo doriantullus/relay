@@ -1,6 +1,6 @@
 # Relay — Linux port plan
 
-**Status (2026-09-01): browsing and transfer slices build on arm64 and x86_64.**
+**Status (2026-09-02): browsing, transfer, and file-operation slices build on arm64 and x86_64.**
 Steps 1–4 are complete: `relay_ui` contains AppCore, factories, paths/main-loop
 seams, and the extracted pure feature models. Step 5 has vendored GTK 4.18.6
 bindings, GLib/XDG implementations, and a libsecret credential backend. Step
@@ -11,14 +11,16 @@ prompts, connection status, disconnect, asynchronous remote navigation, and
 pane-to-pane file/folder transfers all use the shared AppCore and production
 factories. The transfer panel shows live state/progress/rate, handles overwrite
 conflicts, and exposes pause/resume, cancel, retry-failed, and clear-finished
-commands. This is not yet feature parity with the M3 AppKit frontend; the
-remaining power-feature views are tracked below.
+commands. Both panes can create folders, rename one selected item, and
+recursively delete multiple selected items through the shared asynchronous
+operation bridge. This is not yet feature parity with the M3 AppKit frontend;
+the remaining power-feature views are tracked below.
 
 Verify the current state:
 
 ```sh
 test -d src/ui && test -d src/gtk && test -d src/app_gtk
-rg 'relay_mac|@import\("(gtk|gio|glib|gobject)' src/ui  # expect: no matches
+rg 'relay_mac|@import\("(gtk|gdk|gio|glib|gobject)' src/ui  # expect: no matches
 docker run --rm -v "$PWD:/src" -e ZIG_GLOBAL_CACHE_DIR=/src/zig-pkg-linux \
   relay-linux-build zig build test
 docker run --rm -v "$PWD:/src" -e ZIG_GLOBAL_CACHE_DIR=/src/zig-pkg-linux \
@@ -352,10 +354,11 @@ code never touches it.
   sidebar, split view, dialogs, drag & drop. **The application/header bar,
   split view, path controls, scrollers, list rows, saved-site picker, Quick
   Connect form, authentication/host-key dialogs, transfer queue, and overwrite
-  dialog exist; virtualized column views, a full sites sidebar/editor, and
-  drag/drop remain.**
+  dialog exist. File-operation form/confirmation/error dialogs and a right-click
+  pane menu also exist; virtualized column views, a full sites sidebar/editor,
+  and drag/drop remain.**
 
-### Step 6 — `src/app_gtk/` (BROWSING + TRANSFERS DONE)
+### Step 6 — `src/app_gtk/` (BROWSING + TRANSFERS + FILE OPERATIONS DONE)
 
 `src/app_gtk/main.zig` is intentionally only process assembly. It pins the
 shared `SiteStore` until after AppCore shutdown because protocol workers borrow
@@ -382,6 +385,17 @@ conflicts are resolved through a modal Overwrite/Skip prompt. Drag/drop,
 bandwidth controls, failed/transcript tabs, notifications, and session-facing
 queue affordances remain later parity slices.
 
+The file-operation slice exposes New Folder, Rename, Copy to Other Pane, and
+Delete from pane toolbars and right-click menus. F2 renames, Delete opens the
+destructive confirmation, and Ctrl+Shift+N creates a folder while the file list
+has focus. Actions are selection-sensitive, destructive folder removal is
+explicitly recursive, invalid child names are rejected before dispatch, and
+the dialog rejects a rename/create if its pane changed while it was open.
+`op_done` results drive visible status and modal failure details. Successful
+operations start a tracked refresh only when the pane is still displaying the
+affected site and directory, preserving stale-listing rejection even though
+the shared bridge's automatic relist request is intentionally opaque to views.
+
 The remaining view layer should keep deliberate UX divergences —
 do not try to clone `docs/UX.md` literally:
 
@@ -407,9 +421,10 @@ do not try to clone `docs/UX.md` literally:
   builds x86_64 and aarch64 from one manifest — the multiarch container is for
   dev and CI, and does **not** produce the Flatpak.
 - **CI — DONE.** The Linux job installs GTK/libsecret, builds the executable,
-  constructs the real GTK window under Xvfb (both local AppCore listings must
-  finish), and runs core/shared-UI/GTK tests. The live Docker integration job
-  remains separate so server flakes cannot mask deterministic failures.
+  constructs the real GTK window under Xvfb (both local AppCore listings plus
+  an AppCore mkdir/delete operation cycle must finish), and runs
+  core/shared-UI/GTK tests. The live Docker integration job remains separate
+  so server flakes cannot mask deterministic failures.
 
 ---
 
@@ -481,5 +496,5 @@ fake should advance virtual time the same way.
 | `src/gtk/application.zig` | GTK dual-pane browser, connections, and transfer queue |
 | `src/gtk/secret_store.zig` | Linux Secret Service CredStore adapter |
 
-Current shared/GTK/bootstrap surface: about 9.6k lines across `src/ui`,
+Current shared/GTK/bootstrap surface: about 10.2k lines across `src/ui`,
 `src/gtk`, and `src/app_gtk`, excluding the generated bindings.

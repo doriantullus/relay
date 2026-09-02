@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const gtk = @import("gtk");
+const gdk = @import("gdk");
 const gio = @import("gio");
 const glib = @import("glib");
 const relay = @import("relay_core");
@@ -68,9 +69,12 @@ const Application = struct {
     smoke_mode: bool,
     smoke_timer: c_uint = 0,
     smoke_passed: bool = false,
+    smoke_listings_ready: bool = false,
+    smoke_operation_done: bool = false,
     init_failed: bool = false,
 
-    fn smokeSucceeded(self: *Application) void {
+    fn maybeSmokeSucceeded(self: *Application) void {
+        if (!self.smoke_listings_ready or !self.smoke_operation_done) return;
         if (!self.smoke_mode or self.smoke_passed) return;
         self.smoke_passed = true;
         if (self.smoke_timer != 0) {
@@ -146,6 +150,11 @@ const Window = struct {
     quick_dialog: ?*QuickDialog = null,
     prompt_dialogs: std.ArrayList(*PromptDialog) = .empty,
     ssh: ui.sites.SshGroup,
+    smoke_op_path: [128]u8 = undefined,
+    smoke_op_path_len: usize = 0,
+    smoke_op_stage: SmokeOpStage = .idle,
+
+    const SmokeOpStage = enum { idle, creating, deleting, done };
 
     fn create(application: *Application, app: *gtk.Application) !*Window {
         const gpa = application.gpa;
@@ -235,11 +244,15 @@ const Window = struct {
         try core.registerListener(.prompt_needed, self, onPromptNeeded);
         try core.registerListener(.transfer_state, self, onTransferState);
         try core.registerListener(.transfer_progress, self, onTransferProgress);
+        try core.registerListener(.op_done, self, onOpDone);
 
         self.transfers.syncFromEngine();
 
         try self.panes[0].navigate("/");
         try self.panes[1].navigate("/");
+        if (application.smoke_mode) self.startSmokeOperation() catch {
+            application.smokeFailed();
+        };
         return self;
     }
 
@@ -308,7 +321,10 @@ const Window = struct {
         };
         if (self.panes[0].snapshot != null and self.panes[0].pending_request == null and
             self.panes[1].snapshot != null and self.panes[1].pending_request == null)
-            self.application.smokeSucceeded();
+        {
+            self.application.smoke_listings_ready = true;
+            self.application.maybeSmokeSucceeded();
+        }
     }
 
     fn rebuildSitePicker(self: *Window) !void {
@@ -434,6 +450,43 @@ const Window = struct {
 
     fn onTransferProgress(self: *Window, event: relay.events.CoreEvent.TransferProgress) void {
         self.transfers.applyProgress(event);
+    }
+
+    fn onOpDone(self: *Window, event: ui.bridge.OpDone) void {
+        const pane = self.paneFor(event.pane_token) orelse return;
+        pane.handleOpDone(event);
+        self.advanceSmokeOperation(event);
+    }
+
+    fn startSmokeOperation(self: *Window) !void {
+        const path = try std.fmt.bufPrint(&self.smoke_op_path, "/tmp/relay-gtk-smoke-{d}", .{std.c.getpid()});
+        self.smoke_op_path_len = path.len;
+        self.smoke_op_stage = .creating;
+        try self.core.mkdirPath(self.panes[0].token, local_site_id, path);
+    }
+
+    fn advanceSmokeOperation(self: *Window, event: ui.bridge.OpDone) void {
+        if (!self.application.smoke_mode or self.smoke_op_stage == .idle or self.smoke_op_stage == .done) return;
+        const smoke_path = self.smoke_op_path[0..self.smoke_op_path_len];
+        if (event.site_id != local_site_id or !std.mem.eql(u8, event.path, smoke_path)) return;
+        if (!event.success) {
+            self.application.smokeFailed();
+            return;
+        }
+        switch (self.smoke_op_stage) {
+            .creating => {
+                self.smoke_op_stage = .deleting;
+                self.core.deletePath(self.panes[0].token, local_site_id, smoke_path, true) catch {
+                    self.application.smokeFailed();
+                };
+            },
+            .deleting => {
+                self.smoke_op_stage = .done;
+                self.application.smoke_operation_done = true;
+                self.application.maybeSmokeSucceeded();
+            },
+            .idle, .done => {},
+        }
     }
 
     fn ensureSite(self: *Window, fields: SiteFields, persist: bool) !u64 {
@@ -832,10 +885,19 @@ const Pane = struct {
     spinner: *gtk.Spinner,
     status: *gtk.Label,
     site_label: *gtk.Label,
+    rename_button: *gtk.Button,
+    delete_button: *gtk.Button,
+    context_menu: *gtk.Popover,
+    context_rename: *gtk.Button,
+    context_copy: *gtk.Button,
+    context_delete: *gtk.Button,
     site_id: u64 = local_site_id,
     pending_request: ?ui.bridge.RequestId = null,
     snapshot: ?*DirSnapshot = null,
     sort_index: []u32 = &.{},
+    pending_ops: usize = 0,
+    name_dialog: ?*NameDialog = null,
+    delete_dialog: ?*DeleteDialog = null,
 
     fn init(self: *Pane, owner: *Window, token: ui.bridge.PaneToken) void {
         const root = gtk.Box.new(.vertical, 0);
@@ -855,6 +917,14 @@ const Pane = struct {
         const path_entry = gtk.Entry.new();
         path_entry.setPlaceholderText("Absolute path");
         path_entry.as(gtk.Widget).setHexpand(1);
+        const new_folder = gtk.Button.newFromIconName("folder-new-symbolic");
+        new_folder.as(gtk.Widget).setTooltipText("New Folder (Ctrl+Shift+N)");
+        const rename = gtk.Button.newFromIconName("document-edit-symbolic");
+        rename.as(gtk.Widget).setTooltipText("Rename (F2)");
+        rename.as(gtk.Widget).setSensitive(0);
+        const delete = gtk.Button.newFromIconName("user-trash-symbolic");
+        delete.as(gtk.Widget).setTooltipText("Delete");
+        delete.as(gtk.Widget).setSensitive(0);
         const copy = gtk.Button.newWithLabel(if (token == 1) "Copy →" else "← Copy");
         copy.as(gtk.Widget).setTooltipText("Copy selected items to the other pane");
         const spinner = gtk.Spinner.new();
@@ -863,12 +933,41 @@ const Pane = struct {
         toolbar.append(refresh.as(gtk.Widget));
         toolbar.append(site_label.as(gtk.Widget));
         toolbar.append(path_entry.as(gtk.Widget));
+        toolbar.append(new_folder.as(gtk.Widget));
+        toolbar.append(rename.as(gtk.Widget));
+        toolbar.append(delete.as(gtk.Widget));
         toolbar.append(copy.as(gtk.Widget));
         toolbar.append(spinner.as(gtk.Widget));
 
         const list = gtk.ListBox.new();
         list.setSelectionMode(.multiple);
         list.setShowSeparators(1);
+
+        const context_menu = gtk.Popover.new();
+        context_menu.setAutohide(1);
+        context_menu.setHasArrow(1);
+        const context_box = gtk.Box.new(.vertical, 2);
+        const context_new = gtk.Button.newWithLabel("New Folder");
+        const context_rename = gtk.Button.newWithLabel("Rename");
+        const context_copy = gtk.Button.newWithLabel("Copy to Other Pane");
+        const context_delete = gtk.Button.newWithLabel("Delete");
+        context_rename.as(gtk.Widget).setSensitive(0);
+        context_copy.as(gtk.Widget).setSensitive(0);
+        context_delete.as(gtk.Widget).setSensitive(0);
+        context_box.append(context_new.as(gtk.Widget));
+        context_box.append(context_rename.as(gtk.Widget));
+        context_box.append(context_copy.as(gtk.Widget));
+        context_box.append(context_delete.as(gtk.Widget));
+        context_menu.setChild(context_box.as(gtk.Widget));
+        // GtkListBox.removeAll assumes every direct child is a row, so the
+        // popover belongs to the pane container rather than the list itself.
+        context_menu.as(gtk.Widget).setParent(root.as(gtk.Widget));
+
+        const right_click = gtk.GestureClick.new();
+        right_click.as(gtk.GestureSingle).setButton(3);
+        list.as(gtk.Widget).addController(right_click.as(gtk.EventController));
+        const keys = gtk.EventControllerKey.new();
+        list.as(gtk.Widget).addController(keys.as(gtk.EventController));
         const scroller = gtk.ScrolledWindow.new();
         scroller.as(gtk.Widget).setHexpand(1);
         scroller.as(gtk.Widget).setVexpand(1);
@@ -895,16 +994,36 @@ const Pane = struct {
             .spinner = spinner,
             .status = status,
             .site_label = site_label,
+            .rename_button = rename,
+            .delete_button = delete,
+            .context_menu = context_menu,
+            .context_rename = context_rename,
+            .context_copy = context_copy,
+            .context_delete = context_delete,
         };
 
         _ = gtk.Button.signals.clicked.connect(up, *Pane, onUp, self, .{});
         _ = gtk.Button.signals.clicked.connect(refresh, *Pane, onRefresh, self, .{});
+        _ = gtk.Button.signals.clicked.connect(new_folder, *Pane, onNewFolder, self, .{});
+        _ = gtk.Button.signals.clicked.connect(rename, *Pane, onRename, self, .{});
+        _ = gtk.Button.signals.clicked.connect(delete, *Pane, onDelete, self, .{});
+        _ = gtk.Button.signals.clicked.connect(context_new, *Pane, onContextNewFolder, self, .{});
+        _ = gtk.Button.signals.clicked.connect(context_rename, *Pane, onContextRename, self, .{});
+        _ = gtk.Button.signals.clicked.connect(context_copy, *Pane, onContextCopy, self, .{});
+        _ = gtk.Button.signals.clicked.connect(context_delete, *Pane, onContextDelete, self, .{});
         _ = gtk.Button.signals.clicked.connect(copy, *Pane, onCopy, self, .{});
         _ = gtk.Entry.signals.activate.connect(path_entry, *Pane, onPathActivated, self, .{});
         _ = gtk.ListBox.signals.row_activated.connect(list, *Pane, onRowActivated, self, .{});
+        _ = gtk.ListBox.signals.selected_rows_changed.connect(list, *Pane, onSelectionChanged, self, .{});
+        _ = gtk.GestureClick.signals.pressed.connect(right_click, *Pane, onRightClick, self, .{});
+        _ = gtk.EventControllerKey.signals.key_pressed.connect(keys, *Pane, onKeyPressed, self, .{});
     }
 
     fn deinit(self: *Pane) void {
+        if (self.name_dialog) |dialog| dialog.destroy();
+        if (self.delete_dialog) |dialog| dialog.destroy();
+        self.context_menu.popdown();
+        self.context_menu.as(gtk.Widget).unparent();
         if (self.pending_request) |request| _ = self.owner.core.cancelListing(request);
         self.releaseSnapshot();
     }
@@ -1014,7 +1133,206 @@ const Pane = struct {
         self.navigate(self.currentPath()) catch |err| self.setStatus("Refresh failed: {s}", .{@errorName(err)});
     }
 
+    fn selectionCount(self: *Pane) usize {
+        return self.selectionInfo().count;
+    }
+
+    const SelectionInfo = struct {
+        count: usize = 0,
+        first: ?*gtk.ListBoxRow = null,
+    };
+
+    fn selectionInfo(self: *Pane) SelectionInfo {
+        var info: SelectionInfo = .{};
+        self.list.selectedForeach(collectSelectedRow, &info);
+        return info;
+    }
+
+    fn collectSelectedRow(_: *gtk.ListBox, row: *gtk.ListBoxRow, raw: ?*anyopaque) callconv(.c) void {
+        const info: *SelectionInfo = @ptrCast(@alignCast(raw.?));
+        info.count += 1;
+        if (info.first == null) info.first = row;
+    }
+
+    fn onSelectionChanged(_: *gtk.ListBox, self: *Pane) callconv(.c) void {
+        const count = self.selectionCount();
+        const can_rename = count == 1;
+        const can_delete = count > 0;
+        self.rename_button.as(gtk.Widget).setSensitive(@intFromBool(can_rename));
+        self.delete_button.as(gtk.Widget).setSensitive(@intFromBool(can_delete));
+        self.context_rename.as(gtk.Widget).setSensitive(@intFromBool(can_rename));
+        self.context_copy.as(gtk.Widget).setSensitive(@intFromBool(can_delete));
+        self.context_delete.as(gtk.Widget).setSensitive(@intFromBool(can_delete));
+    }
+
+    fn onNewFolder(_: *gtk.Button, self: *Pane) callconv(.c) void {
+        self.beginNewFolder();
+    }
+
+    fn onRename(_: *gtk.Button, self: *Pane) callconv(.c) void {
+        self.beginRename();
+    }
+
+    fn onDelete(_: *gtk.Button, self: *Pane) callconv(.c) void {
+        self.beginDelete();
+    }
+
+    fn onContextNewFolder(_: *gtk.Button, self: *Pane) callconv(.c) void {
+        self.context_menu.popdown();
+        self.beginNewFolder();
+    }
+
+    fn onContextRename(_: *gtk.Button, self: *Pane) callconv(.c) void {
+        self.context_menu.popdown();
+        self.beginRename();
+    }
+
+    fn onContextDelete(_: *gtk.Button, self: *Pane) callconv(.c) void {
+        self.context_menu.popdown();
+        self.beginDelete();
+    }
+
+    fn onContextCopy(_: *gtk.Button, self: *Pane) callconv(.c) void {
+        self.context_menu.popdown();
+        self.copySelection();
+    }
+
+    fn onRightClick(_: *gtk.GestureClick, _: c_int, x: f64, y: f64, self: *Pane) callconv(.c) void {
+        if (self.list.getRowAtY(@intFromFloat(y))) |row| {
+            if (row.isSelected() == 0) {
+                self.list.unselectAll();
+                self.list.selectRow(row);
+            }
+        } else {
+            self.list.unselectAll();
+        }
+        const point: gdk.Rectangle = .{
+            .f_x = @intFromFloat(x),
+            .f_y = @as(c_int, @intFromFloat(y)) + 52,
+            .f_width = 1,
+            .f_height = 1,
+        };
+        self.context_menu.setPointingTo(&point);
+        self.context_menu.popup();
+    }
+
+    fn onKeyPressed(
+        _: *gtk.EventControllerKey,
+        keyval: c_uint,
+        _: c_uint,
+        state: gdk.ModifierType,
+        self: *Pane,
+    ) callconv(.c) c_int {
+        if (keyval == gdk.KEY_F2) {
+            self.beginRename();
+            return 1;
+        }
+        if (keyval == gdk.KEY_Delete) {
+            self.beginDelete();
+            return 1;
+        }
+        if (state.control_mask and state.shift_mask and (keyval == gdk.KEY_n or keyval == gdk.KEY_N)) {
+            self.beginNewFolder();
+            return 1;
+        }
+        return 0;
+    }
+
+    fn beginNewFolder(self: *Pane) void {
+        if (self.pending_request != null or self.snapshot == null) {
+            self.setStatus("Wait for this folder to finish loading", .{});
+            return;
+        }
+        if (self.name_dialog) |dialog| {
+            dialog.native.as(gtk.Window).present();
+            return;
+        }
+        NameDialog.create(self, .new_folder, null) catch {
+            self.setStatus("Not enough memory to open New Folder", .{});
+        };
+    }
+
+    fn beginRename(self: *Pane) void {
+        if (self.pending_request != null or self.snapshot == null) {
+            self.setStatus("Wait for this folder to finish loading", .{});
+            return;
+        }
+        const selection = self.selectionInfo();
+        if (selection.count != 1) {
+            self.setStatus("Select exactly one item to rename", .{});
+            return;
+        }
+        const row = selection.first orelse return;
+        const row_index = row.getIndex();
+        const snapshot = self.snapshot.?;
+        if (row_index < 0 or @as(usize, @intCast(row_index)) >= self.sort_index.len) return;
+        const entry_index = self.sort_index[@intCast(row_index)];
+        if (entry_index >= snapshot.entries.len) return;
+        if (self.name_dialog) |dialog| {
+            dialog.native.as(gtk.Window).present();
+            return;
+        }
+        NameDialog.create(self, .rename, snapshot.entries[entry_index].name) catch {
+            self.setStatus("Not enough memory to open Rename", .{});
+        };
+    }
+
+    fn beginDelete(self: *Pane) void {
+        if (self.pending_request != null or self.snapshot == null) {
+            self.setStatus("Wait for this folder to finish loading", .{});
+            return;
+        }
+        if (self.selectionCount() == 0) {
+            self.setStatus("Select one or more items to delete", .{});
+            return;
+        }
+        if (self.delete_dialog) |dialog| {
+            dialog.native.as(gtk.Window).present();
+            return;
+        }
+        DeleteDialog.create(self) catch {
+            self.setStatus("Not enough memory to confirm deletion", .{});
+        };
+    }
+
+    fn handleOpDone(self: *Pane, event: ui.bridge.OpDone) void {
+        if (self.pending_ops > 0) self.pending_ops -= 1;
+        if (!event.success) {
+            const failure = if (event.failure) |value| value.message else "Unknown error";
+            self.setStatus("{s} failed: {s}", .{ operationLabel(event.op), failure });
+            self.presentOperationError(event.op, failure);
+            return;
+        }
+        self.setStatus("{s} completed", .{operationLabel(event.op)});
+        const snapshot = self.snapshot orelse return;
+        const affected_dir = relay.vfs.path.parent(event.path) orelse "/";
+        if (event.site_id != self.site_id or !std.mem.eql(u8, snapshot.path, affected_dir)) return;
+        self.navigate(affected_dir) catch |err| {
+            self.setStatus("Refresh after {s} failed: {s}", .{ operationLabel(event.op), @errorName(err) });
+        };
+    }
+
+    fn presentOperationError(self: *Pane, op: ui.bridge.OpKind, detail: []const u8) void {
+        const alert = gtk.AlertDialog.new("File operation failed");
+        const title_z = allocPrintZ(self.owner.gpa, "{s} failed", .{operationLabel(op)}) catch null;
+        if (title_z) |title| {
+            defer self.owner.gpa.free(title);
+            alert.setMessage(title);
+        }
+        const detail_z = allocPrintZ(self.owner.gpa, "{s}", .{detail}) catch null;
+        if (detail_z) |message| {
+            defer self.owner.gpa.free(message);
+            alert.setDetail(message);
+        }
+        alert.show(self.owner.native.as(gtk.Window));
+        alert.unref();
+    }
+
     fn onCopy(_: *gtk.Button, self: *Pane) callconv(.c) void {
+        self.copySelection();
+    }
+
+    fn copySelection(self: *Pane) void {
         const destination = if (self == &self.owner.panes[0])
             &self.owner.panes[1]
         else
@@ -1115,6 +1433,322 @@ const Pane = struct {
         };
         defer self.owner.gpa.free(next);
         self.navigate(next) catch |err| self.setStatus("Cannot open folder: {s}", .{@errorName(err)});
+    }
+};
+
+fn operationLabel(op: ui.bridge.OpKind) []const u8 {
+    return switch (op) {
+        .mkdir => "New folder",
+        .rename => "Rename",
+        .chmod => "Change permissions",
+        .delete => "Delete",
+    };
+}
+
+const NameDialog = struct {
+    owner: *Pane,
+    native: *gtk.Dialog,
+    entry: *gtk.Editable,
+    error_label: *gtk.Label,
+    mode: Mode,
+    site_id: u64,
+    base_path: []u8,
+    old_name: ?[]u8,
+
+    const Mode = enum { new_folder, rename };
+
+    fn create(owner: *Pane, mode: Mode, old_name: ?[]const u8) !void {
+        const snapshot = owner.snapshot orelse return error.NoSnapshot;
+        const base_path = try owner.owner.gpa.dupe(u8, snapshot.path);
+        errdefer owner.owner.gpa.free(base_path);
+        const old_owned = if (old_name) |name| try owner.owner.gpa.dupe(u8, name) else null;
+        errdefer if (old_owned) |name| owner.owner.gpa.free(name);
+        const self = try owner.owner.gpa.create(NameDialog);
+        errdefer owner.owner.gpa.destroy(self);
+        const dialog = gtk.Dialog.new();
+        errdefer dialog.as(gtk.Window).destroy();
+
+        const title = if (mode == .new_folder) "New Folder" else "Rename";
+        dialog.as(gtk.Window).setTitle(title);
+        dialog.as(gtk.Window).setTransientFor(owner.owner.native.as(gtk.Window));
+        dialog.as(gtk.Window).setModal(1);
+        dialog.as(gtk.Window).setDestroyWithParent(1);
+        _ = dialog.addButton("Cancel", @intFromEnum(gtk.ResponseType.cancel));
+        _ = dialog.addButton(if (mode == .new_folder) "Create" else "Rename", @intFromEnum(gtk.ResponseType.accept));
+        dialog.setDefaultResponse(@intFromEnum(gtk.ResponseType.accept));
+
+        const content = dialog.getContentArea();
+        content.setSpacing(8);
+        const content_widget = content.as(gtk.Widget);
+        content_widget.setMarginTop(16);
+        content_widget.setMarginBottom(16);
+        content_widget.setMarginStart(16);
+        content_widget.setMarginEnd(16);
+        const prompt = gtk.Label.new(if (mode == .new_folder) "Folder name" else "New name");
+        prompt.setXalign(0);
+        const entry = gtk.Entry.new();
+        const initial_z = try allocPrintZ(owner.owner.gpa, "{s}", .{old_name orelse "untitled folder"});
+        defer owner.owner.gpa.free(initial_z);
+        entry.as(gtk.Editable).setText(initial_z);
+        const error_label = gtk.Label.new("");
+        error_label.setXalign(0);
+        error_label.setWrap(1);
+        error_label.as(gtk.Widget).addCssClass("error");
+        content.append(prompt.as(gtk.Widget));
+        content.append(entry.as(gtk.Widget));
+        content.append(error_label.as(gtk.Widget));
+
+        self.* = .{
+            .owner = owner,
+            .native = dialog,
+            .entry = entry.as(gtk.Editable),
+            .error_label = error_label,
+            .mode = mode,
+            .site_id = owner.site_id,
+            .base_path = base_path,
+            .old_name = old_owned,
+        };
+        owner.name_dialog = self;
+        _ = gtk.Dialog.signals.response.connect(dialog, *NameDialog, onResponse, self, .{});
+        dialog.as(gtk.Window).present();
+        _ = entry.as(gtk.Widget).grabFocus();
+    }
+
+    fn onResponse(_: *gtk.Dialog, response: c_int, self: *NameDialog) callconv(.c) void {
+        if (response != @intFromEnum(gtk.ResponseType.accept)) {
+            self.finish();
+            return;
+        }
+        const raw = std.mem.span(self.entry.getText());
+        const name = std.mem.trim(u8, raw, " \t");
+        if (!relay.vfs.path.isSafeChildName(name)) {
+            self.error_label.setText("Use one non-empty name without ‘/’; the names ‘.’ and ‘..’ are reserved.");
+            return;
+        }
+        const snapshot = self.owner.snapshot orelse {
+            self.error_label.setText("The folder is no longer available.");
+            return;
+        };
+        if (self.owner.site_id != self.site_id or !std.mem.eql(u8, snapshot.path, self.base_path)) {
+            self.error_label.setText("The pane changed while this dialog was open. Try again.");
+            return;
+        }
+
+        switch (self.mode) {
+            .new_folder => self.startNewFolder(name),
+            .rename => self.startRename(name),
+        }
+    }
+
+    fn startNewFolder(self: *NameDialog, name: []const u8) void {
+        const target = relay.vfs.path.join(self.owner.owner.gpa, self.base_path, name) catch {
+            self.error_label.setText("Could not build the destination path.");
+            return;
+        };
+        defer self.owner.owner.gpa.free(target);
+        self.owner.owner.core.mkdirPath(self.owner.token, self.site_id, target) catch |err| {
+            self.setStartError(err);
+            return;
+        };
+        self.owner.pending_ops += 1;
+        self.owner.setStatus("Creating “{s}”…", .{name});
+        self.finish();
+    }
+
+    fn startRename(self: *NameDialog, name: []const u8) void {
+        const old_name = self.old_name orelse return;
+        if (std.mem.eql(u8, old_name, name)) {
+            self.finish();
+            return;
+        }
+        const from = relay.vfs.path.join(self.owner.owner.gpa, self.base_path, old_name) catch {
+            self.error_label.setText("Could not build the source path.");
+            return;
+        };
+        defer self.owner.owner.gpa.free(from);
+        const to = relay.vfs.path.join(self.owner.owner.gpa, self.base_path, name) catch {
+            self.error_label.setText("Could not build the destination path.");
+            return;
+        };
+        defer self.owner.owner.gpa.free(to);
+        self.owner.owner.core.renamePath(self.owner.token, self.site_id, from, to) catch |err| {
+            self.setStartError(err);
+            return;
+        };
+        self.owner.pending_ops += 1;
+        self.owner.setStatus("Renaming “{s}” to “{s}”…", .{ old_name, name });
+        self.finish();
+    }
+
+    fn setStartError(self: *NameDialog, err: anyerror) void {
+        var buf: [160]u8 = undefined;
+        const message = std.fmt.bufPrintZ(&buf, "Could not start operation: {s}", .{@errorName(err)}) catch "Could not start operation.";
+        self.error_label.setText(message);
+    }
+
+    fn finish(self: *NameDialog) void {
+        const pane = self.owner;
+        pane.name_dialog = null;
+        self.native.as(gtk.Window).destroy();
+        self.free();
+    }
+
+    fn destroy(self: *NameDialog) void {
+        self.owner.name_dialog = null;
+        self.native.as(gtk.Window).destroy();
+        self.free();
+    }
+
+    fn free(self: *NameDialog) void {
+        const gpa = self.owner.owner.gpa;
+        gpa.free(self.base_path);
+        if (self.old_name) |name| gpa.free(name);
+        gpa.destroy(self);
+    }
+};
+
+const DeleteTarget = struct {
+    path: []u8,
+    recursive: bool,
+};
+
+const DeleteDialog = struct {
+    owner: *Pane,
+    native: *gtk.Dialog = undefined,
+    targets: std.ArrayList(DeleteTarget) = .empty,
+    collect_failed: bool = false,
+    site_id: u64,
+
+    fn create(owner: *Pane) !void {
+        const self = try owner.owner.gpa.create(DeleteDialog);
+        self.* = .{ .owner = owner, .site_id = owner.site_id };
+        errdefer {
+            self.freeTargets();
+            owner.owner.gpa.destroy(self);
+        }
+        owner.list.selectedForeach(collectTarget, self);
+        if (self.collect_failed) return error.OutOfMemory;
+        if (self.targets.items.len == 0) return error.NoSelection;
+
+        const dialog = gtk.Dialog.new();
+        errdefer dialog.as(gtk.Window).destroy();
+        self.native = dialog;
+        dialog.as(gtk.Window).setTitle("Delete Items");
+        dialog.as(gtk.Window).setTransientFor(owner.owner.native.as(gtk.Window));
+        dialog.as(gtk.Window).setModal(1);
+        dialog.as(gtk.Window).setDestroyWithParent(1);
+        _ = dialog.addButton("Cancel", @intFromEnum(gtk.ResponseType.cancel));
+        _ = dialog.addButton("Delete", @intFromEnum(gtk.ResponseType.accept));
+        dialog.setDefaultResponse(@intFromEnum(gtk.ResponseType.cancel));
+        if (dialog.getWidgetForResponse(@intFromEnum(gtk.ResponseType.accept))) |button| {
+            button.addCssClass("destructive-action");
+        }
+
+        const content = dialog.getContentArea();
+        content.setSpacing(8);
+        const content_widget = content.as(gtk.Widget);
+        content_widget.setMarginTop(16);
+        content_widget.setMarginBottom(16);
+        content_widget.setMarginStart(16);
+        content_widget.setMarginEnd(16);
+        var message_buf: [256]u8 = undefined;
+        const message = if (self.targets.items.len == 1)
+            std.fmt.bufPrintZ(&message_buf, "Permanently delete “{s}”?", .{relay.vfs.path.basename(self.targets.items[0].path)}) catch "Permanently delete this item?"
+        else
+            std.fmt.bufPrintZ(&message_buf, "Permanently delete {d} selected items?", .{self.targets.items.len}) catch "Permanently delete the selected items?";
+        const label = gtk.Label.new(message);
+        label.setWrap(1);
+        label.setXalign(0);
+        const warning = gtk.Label.new("This cannot be undone. Folders are deleted recursively.");
+        warning.setWrap(1);
+        warning.setXalign(0);
+        warning.as(gtk.Widget).addCssClass("dim-label");
+        content.append(label.as(gtk.Widget));
+        content.append(warning.as(gtk.Widget));
+
+        owner.delete_dialog = self;
+        _ = gtk.Dialog.signals.response.connect(dialog, *DeleteDialog, onResponse, self, .{});
+        dialog.as(gtk.Window).present();
+    }
+
+    fn collectTarget(_: *gtk.ListBox, row: *gtk.ListBoxRow, raw: ?*anyopaque) callconv(.c) void {
+        const self: *DeleteDialog = @ptrCast(@alignCast(raw.?));
+        if (self.collect_failed) return;
+        const snapshot = self.owner.snapshot orelse return;
+        const row_index = row.getIndex();
+        if (row_index < 0 or @as(usize, @intCast(row_index)) >= self.owner.sort_index.len) return;
+        const entry_index = self.owner.sort_index[@intCast(row_index)];
+        if (entry_index >= snapshot.entries.len) return;
+        const entry = &snapshot.entries[entry_index];
+        if (!relay.vfs.path.isSafeChildName(entry.name)) return;
+        const path = relay.vfs.path.join(self.owner.owner.gpa, snapshot.path, entry.name) catch {
+            self.collect_failed = true;
+            return;
+        };
+        self.targets.append(self.owner.owner.gpa, .{
+            .path = path,
+            .recursive = entry.kind == .dir,
+        }) catch {
+            self.owner.owner.gpa.free(path);
+            self.collect_failed = true;
+        };
+    }
+
+    fn onResponse(_: *gtk.Dialog, response: c_int, self: *DeleteDialog) callconv(.c) void {
+        if (response != @intFromEnum(gtk.ResponseType.accept)) {
+            self.finish();
+            return;
+        }
+        var started: usize = 0;
+        var first_error: ?anyerror = null;
+        for (self.targets.items) |target| {
+            self.owner.owner.core.deletePath(
+                self.owner.token,
+                self.site_id,
+                target.path,
+                target.recursive,
+            ) catch |err| {
+                if (first_error == null) first_error = err;
+                continue;
+            };
+            started += 1;
+        }
+        self.owner.pending_ops += started;
+        if (started == self.targets.items.len) {
+            self.owner.setStatus("Deleting {d} item{s}…", .{ started, if (started == 1) "" else "s" });
+        } else {
+            self.owner.setStatus("Started {d} of {d} deletions: {s}", .{
+                started,
+                self.targets.items.len,
+                if (first_error) |err| @errorName(err) else "unknown error",
+            });
+        }
+        self.finish();
+    }
+
+    fn finish(self: *DeleteDialog) void {
+        const pane = self.owner;
+        pane.delete_dialog = null;
+        self.native.as(gtk.Window).destroy();
+        self.free();
+    }
+
+    fn destroy(self: *DeleteDialog) void {
+        self.owner.delete_dialog = null;
+        self.native.as(gtk.Window).destroy();
+        self.free();
+    }
+
+    fn free(self: *DeleteDialog) void {
+        const gpa = self.owner.owner.gpa;
+        self.freeTargets();
+        gpa.destroy(self);
+    }
+
+    fn freeTargets(self: *DeleteDialog) void {
+        const gpa = self.owner.owner.gpa;
+        for (self.targets.items) |target| gpa.free(target.path);
+        self.targets.deinit(gpa);
     }
 };
 

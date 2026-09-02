@@ -7,7 +7,9 @@ GTK4 dual-pane browser: the left pane is local, while the right pane can browse
 saved or Quick Connect FTP/FTPS/SFTP sites with native credential and host-key
 prompts. Selected files and folders can transfer in either direction through a
 live queue with progress, conflict, pause/resume, cancel, and retry controls.
-The remaining M3 power-feature views are later parity slices.
+Both panes also support new-folder, rename, and confirmed recursive deletion
+against local or remote filesystems. The remaining M3 power-feature views are
+later parity slices.
 
 **Status: M3 complete (power features).** The M1 protocol core (FTP/FTPS/
 SFTP engines, SSH userland, VFS, pool, queue; the live Docker integration

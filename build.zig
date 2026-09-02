@@ -231,6 +231,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "relay_core", .module = core_mod },
                 .{ .name = "relay_ui", .module = ui_mod },
                 .{ .name = "gtk", .module = gobject.module("gtk4") },
+                .{ .name = "gdk", .module = gobject.module("gdk4") },
                 .{ .name = "gio", .module = gobject.module("gio2") },
                 .{ .name = "glib", .module = gobject.module("glib2") },
                 .{ .name = "gobject", .module = gobject.module("gobject2") },

@@ -8,6 +8,7 @@ comptime {
 }
 
 pub const gtk = @import("gtk");
+pub const gdk = @import("gdk");
 pub const gio = @import("gio");
 pub const glib = @import("glib");
 pub const gobject = @import("gobject");

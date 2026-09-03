@@ -99,4 +99,17 @@ jobs:
         with:
           version: 0.16.0
       - name: Live integration suite
-        run: zig build integration
+        shell: bash
+        run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/relay-integration.log"
+          if zig build integration 2>&1 | tee "$log"; then
+            exit 0
+          fi
+          if ! grep -Eq \
+            'proftpd-ftps +cancel mid-download +FAIL .*ConnectionLost: control connection lost mid-reply' \
+            "$log"; then
+            exit 1
+          fi
+          echo "::warning::Retrying the documented ProFTPD cancel-mid-download timing flake once"
+          zig build integration

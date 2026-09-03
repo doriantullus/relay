@@ -82,3 +82,43 @@ jobs:
           path: relay-linux-${{ needs.version.outputs.version }}-x86_64.flatpak
           compression-level: 0
           retention-days: 30
+
+  linux-deb:
+    name: Ubuntu 24.04 Debian package
+    needs: version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev libsecret-1-dev dpkg-dev \
+            desktop-file-utils appstream xvfb xauth
+      - name: Build Debian package
+        run: |
+          packaging/debian/build-deb.sh \
+            "${{ needs.version.outputs.version }}" \
+            "$RUNNER_TEMP"
+      - name: Validate and install Debian package
+        run: |
+          package="$RUNNER_TEMP/relay_${{ needs.version.outputs.version }}_amd64.deb"
+          dpkg-deb --info "$package"
+          dpkg-deb --contents "$package"
+          sudo apt-get install -y "$package"
+          test -x /usr/bin/relay
+          test -f /usr/share/applications/us.doriantull.relay.desktop
+          test -f /usr/share/metainfo/us.doriantull.relay.metainfo.xml
+          desktop-file-validate /usr/share/applications/us.doriantull.relay.desktop
+          appstreamcli validate --no-net /usr/share/metainfo/us.doriantull.relay.metainfo.xml
+          G_DEBUG=fatal-warnings GTK_A11Y=none RELAY_GTK_SMOKE=1 \
+            dbus-run-session -- xvfb-run -a /usr/bin/relay
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relay-linux-${{ needs.version.outputs.version }}-amd64-deb
+          path: ${{ runner.temp }}/relay_${{ needs.version.outputs.version }}_amd64.deb
+          compression-level: 0
+          retention-days: 30

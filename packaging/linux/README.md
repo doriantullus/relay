@@ -24,9 +24,12 @@ floor and are intended for controlled deployments rather than general Linux
 distribution.
 
 Every push to `main` runs `.github/workflows/main-artifacts.yml`. It uploads a
-ReleaseSafe macOS application bundle and an x86_64 Flatpak bundle. Artifact
-versions use the commit date plus the commit's zero-based position on main for
-that date, for example `2026-09-02.0` and `2026-09-02.1`.
+ReleaseSafe macOS application bundle, an x86_64 Flatpak bundle, and an Ubuntu
+24.04 amd64 `.deb`. Artifact versions use the commit date plus the commit's
+zero-based position on main for that date, for example `2026-09-02.0` and
+`2026-09-02.1`.
+
+See `../debian/README.md` for the Ubuntu 24.04 package build.
 
 For a release, build the Flatpak in a clean checkout, run the Xvfb smoke test,
 export the repository with `flatpak build-export`, and publish a signed update

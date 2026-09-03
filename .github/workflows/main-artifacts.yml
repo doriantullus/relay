@@ -1,0 +1,85 @@
+name: Main branch artifacts
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Derive artifact version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compute commit-date version
+        id: version
+        shell: bash
+        run: |
+          commit_date="$(git show -s --format=%cs "$GITHUB_SHA")"
+          daily_count="$(git log --first-parent --format=%cs "$GITHUB_SHA" | grep -c "^${commit_date}$")"
+          build_number="$((daily_count - 1))"
+          echo "version=${commit_date}.${build_number}" | tee -a "$GITHUB_OUTPUT"
+
+  macos:
+    name: macOS application
+    needs: version
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build ReleaseSafe application
+        run: zig build -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/relay"
+      - name: Archive application bundle
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$RUNNER_TEMP/relay/Relay.app" \
+            "relay-macos-${{ needs.version.outputs.version }}-arm64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relay-macos-${{ needs.version.outputs.version }}-arm64
+          path: relay-macos-${{ needs.version.outputs.version }}-arm64.zip
+          compression-level: 0
+          retention-days: 30
+
+  linux-flatpak:
+    name: Linux Flatpak
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Flatpak tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          flatpak remote-add --user --if-not-exists \
+            flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user --noninteractive -y flathub \
+            org.gnome.Platform//48 org.gnome.Sdk//48
+      - name: Build Flatpak repository
+        run: |
+          flatpak-builder --user --force-clean \
+            --repo="$RUNNER_TEMP/relay-repo" \
+            "$RUNNER_TEMP/relay-build" \
+            packaging/linux/us.doriantull.relay.yml
+      - name: Create Flatpak bundle
+        run: |
+          flatpak build-bundle \
+            --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
+            "$RUNNER_TEMP/relay-repo" \
+            "relay-linux-${{ needs.version.outputs.version }}-x86_64.flatpak" \
+            us.doriantull.relay
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relay-linux-${{ needs.version.outputs.version }}-x86_64-flatpak
+          path: relay-linux-${{ needs.version.outputs.version }}-x86_64.flatpak
+          compression-level: 0
+          retention-days: 30

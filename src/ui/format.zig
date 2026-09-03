@@ -17,6 +17,46 @@ pub fn humanBytes(buf: []u8, bytes: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d:.0} {s}", .{ value, units[unit] }) catch "";
 }
 
+/// ISO 8601 UTC to the minute for file-list modified columns.
+pub fn mtimeIso(buf: []u8, mtime: ?i64) []const u8 {
+    const value = mtime orelse return "";
+    if (value < 0) return "";
+    const epoch: std.time.epoch.EpochSeconds = .{ .secs = @intCast(value) };
+    const year_day = epoch.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch.getDaySeconds();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}", .{
+        year_day.year,
+        month_day.month.numeric(),
+        @as(u32, month_day.day_index) + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+    }) catch buf[0..0];
+}
+
+pub fn mtimeRelative(buf: []u8, mtime: ?i64, now: i64) []const u8 {
+    const value = mtime orelse return "";
+    const elapsed = @max(@as(i64, 0), now - value);
+    if (elapsed < 60) return std.fmt.bufPrint(buf, "just now", .{}) catch "";
+    if (elapsed < 3_600) return std.fmt.bufPrint(buf, "{d} min ago", .{elapsed / 60}) catch "";
+    if (elapsed < 86_400) return std.fmt.bufPrint(buf, "{d} hr ago", .{elapsed / 3_600}) catch "";
+    if (elapsed < 604_800) return std.fmt.bufPrint(buf, "{d} days ago", .{elapsed / 86_400}) catch "";
+    return mtimeIso(buf, mtime);
+}
+
+test "mtimeIso formats UTC timestamps" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("2024-01-01 00:00", mtimeIso(&buf, 1_704_067_200));
+    try std.testing.expectEqualStrings("", mtimeIso(&buf, null));
+}
+
+test "mtimeRelative uses readable recent units" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("just now", mtimeRelative(&buf, 990, 1_000));
+    try std.testing.expectEqualStrings("5 min ago", mtimeRelative(&buf, 700, 1_000));
+    try std.testing.expectEqualStrings("2 hr ago", mtimeRelative(&buf, 1_000, 8_200));
+}
+
 test "humanBytes formatting" {
     var buf: [32]u8 = undefined;
     try std.testing.expectEqualStrings("0 B", humanBytes(&buf, 0));

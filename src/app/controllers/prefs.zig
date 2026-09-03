@@ -486,153 +486,18 @@ pub const controls = mac.appkit.controls;
 // or corrupt file degrades to defaults (same policy as settings.zon).
 // ---------------------------------------------------------------------------
 
-pub const ui_prefs_file = "ui.zon";
-
-pub const Density = enum { comfortable, compact, dense };
-pub const DateFormat = enum { iso, relative };
-
-/// What main.zig saves on quit / restores on launch (M3 state restoration):
-/// Per-tab session state. Fields mirror the legacy pane0/pane1 fields for
-/// the active tab; the tabs array carries all tabs (Phase B).
-pub const TabState = struct {
-    pane0_site: u64 = 0,
-    pane0_path: []const u8 = "",
-    pane1_site: u64 = 0,
-    pane1_path: []const u8 = "",
-};
-
-/// per-pane (site, path) plus the panel collapse states. site_id 0 = local
-/// pane; an empty path means "nothing to restore" for that pane. Remote
-/// reconnects are gated by main.zig (agent/keychain auth only — a restore
-/// must never prompt at launch).
-pub const SessionState = struct {
-    /// Legacy fields — still written from the ACTIVE tab for back-compat
-    /// with older ui.zon readers. New code reads from `tabs`.
-    pane0_site: u64 = 0,
-    pane0_path: []const u8 = "",
-    pane1_site: u64 = 0,
-    pane1_path: []const u8 = "",
-    focused_pane: u32 = 0,
-    sidebar_collapsed: bool = false,
-    transfers_collapsed: bool = true,
-    inspector_collapsed: bool = true,
-    /// Phase B: all tabs. Slice owned by UiPrefs (dup'd in loadUiPrefs,
-    /// freed in freeUiPrefs). Empty = fall back to legacy pane0/pane1 fields.
-    tabs: []TabState = &.{},
-    active_tab: u32 = 0,
-};
-
-pub const UiPrefs = struct {
-    schema_version: u32 = 1,
-    /// Default download directory; empty = ~/Downloads at use time.
-    download_dir: []const u8 = "",
-    confirm_delete: bool = true,
-    density: Density = .compact,
-    monospace_lists: bool = false,
-    date_format: DateFormat = .iso,
-    /// Pref "ui.vimMode" (View ▸ Vim Key Bindings; off by default).
-    vim_mode: bool = false,
-    /// Reconnect saved remote panes at launch (off by default). Even when
-    /// on, reconnects only happen when auth is provably prompt-free (see
-    /// main.zig reconnectIsPromptFree).
-    reconnect_on_launch: bool = false,
-    /// Last session's pane/panel layout (saved on quit by main.zig).
-    session: SessionState = .{},
-};
-
-/// Loads ui.zon; `download_dir` and the session pane paths in the result
-/// are owned by `gpa` (free with `freeUiPrefs`). Missing/corrupt files
-/// yield defaults.
-pub fn loadUiPrefs(io: std.Io, dir: std.Io.Dir, gpa: Allocator) error{OutOfMemory}!UiPrefs {
-    const source = settings_mod.readFileZ(io, dir, ui_prefs_file, gpa) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return defaultUiPrefs(gpa),
-    };
-    defer gpa.free(source);
-
-    var zon_diag: std.zon.parse.Diagnostics = .{};
-    defer zon_diag.deinit(gpa);
-    const parsed = std.zon.parse.fromSliceAlloc(UiPrefs, gpa, source, &zon_diag, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.ParseZon => return defaultUiPrefs(gpa),
-    };
-    defer std.zon.parse.free(gpa, parsed);
-    var out = parsed;
-    out.download_dir = "";
-    out.session.pane0_path = "";
-    out.session.pane1_path = "";
-    out.session.tabs = &.{};
-    errdefer freeUiPrefs(gpa, &out);
-    out.download_dir = try gpa.dupe(u8, parsed.download_dir);
-    out.session.pane0_path = try gpa.dupe(u8, parsed.session.pane0_path);
-    out.session.pane1_path = try gpa.dupe(u8, parsed.session.pane1_path);
-    out.session.tabs = try dupTabStates(gpa, parsed.session.tabs);
-    return out;
-}
-
-fn defaultUiPrefs(gpa: Allocator) error{OutOfMemory}!UiPrefs {
-    var prefs: UiPrefs = .{};
-    prefs.download_dir = try gpa.dupe(u8, "");
-    errdefer gpa.free(prefs.download_dir);
-    prefs.session.pane0_path = try gpa.dupe(u8, "");
-    errdefer gpa.free(prefs.session.pane0_path);
-    prefs.session.pane1_path = try gpa.dupe(u8, "");
-    // tabs = &.{} is the zero value; no allocation needed.
-    return prefs;
-}
-
-pub fn freeUiPrefs(gpa: Allocator, prefs: *UiPrefs) void {
-    gpa.free(prefs.download_dir);
-    prefs.download_dir = "";
-    gpa.free(prefs.session.pane0_path);
-    prefs.session.pane0_path = "";
-    gpa.free(prefs.session.pane1_path);
-    prefs.session.pane1_path = "";
-    freeTabStates(gpa, prefs.session.tabs);
-    prefs.session.tabs = &.{};
-}
-
-/// Free a heap-allocated TabState slice and all path strings within it.
-pub fn freeTabStates(gpa: Allocator, tabs: []TabState) void {
-    for (tabs) |*t| {
-        gpa.free(t.pane0_path);
-        gpa.free(t.pane1_path);
-    }
-    if (tabs.len > 0) gpa.free(tabs);
-}
-
-/// Deep-copy a TabState slice: the array plus each tab's path strings.
-/// Returns &.{} for empty input (no allocation). Mirror of freeTabStates;
-/// fully unwinds its partial allocations on OOM.
-fn dupTabStates(gpa: Allocator, src: []const TabState) error{OutOfMemory}![]TabState {
-    if (src.len == 0) return &.{};
-    const tabs = try gpa.alloc(TabState, src.len);
-    errdefer gpa.free(tabs);
-    var done: usize = 0;
-    errdefer for (tabs[0..done]) |*t| {
-        gpa.free(t.pane0_path);
-        gpa.free(t.pane1_path);
-    };
-    for (src, 0..) |s, i| {
-        tabs[i] = s;
-        tabs[i].pane0_path = "";
-        tabs[i].pane1_path = "";
-        tabs[i].pane0_path = try gpa.dupe(u8, s.pane0_path);
-        errdefer gpa.free(tabs[i].pane0_path);
-        tabs[i].pane1_path = try gpa.dupe(u8, s.pane1_path);
-        done = i + 1;
-    }
-    return tabs;
-}
-
-/// Crash-safe persist (temp file + fsync + rename, via settings.zig).
-pub fn saveUiPrefs(prefs: UiPrefs, io: std.Io, dir: std.Io.Dir, gpa: Allocator) !void {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    std.zon.stringify.serialize(prefs, .{}, &out.writer) catch return error.OutOfMemory;
-    out.writer.writeByte('\n') catch return error.OutOfMemory;
-    try settings_mod.atomicWriteFile(io, dir, ui_prefs_file, out.written());
-}
+const portable_prefs = @import("relay_ui").prefs;
+pub const ui_prefs_file = portable_prefs.file_name;
+pub const Density = portable_prefs.Density;
+pub const DateFormat = portable_prefs.DateFormat;
+pub const TabState = portable_prefs.TabState;
+pub const SessionState = portable_prefs.SessionState;
+pub const UiPrefs = portable_prefs.UiPrefs;
+pub const loadUiPrefs = portable_prefs.load;
+pub const freeUiPrefs = portable_prefs.deinit;
+pub const saveUiPrefs = portable_prefs.save;
+const dupTabStates = portable_prefs.cloneTabs;
+const freeTabStates = portable_prefs.freeTabs;
 
 // ---------------------------------------------------------------------------
 // PrefsController — the Settings window.

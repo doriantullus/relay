@@ -1,9 +1,9 @@
 # Linux build box
 
-One **native arm64** container that produces **both** Linux architectures at
-native speed. Zig cross-compiles without a foreign-arch toolchain, so it needs
-only the foreign-arch *libraries* — which Debian multiarch installs side by
-side. No qemu, no second CI runner.
+One container that runs natively on either **arm64 or amd64** and produces
+**both** Linux architectures. Zig cross-compiles without a foreign-arch
+toolchain, so it needs only the foreign-arch *libraries* — which Debian
+multiarch installs side by side. No qemu, no second CI runner.
 
 ```sh
 docker build -t relay-linux-build docker/linux-build

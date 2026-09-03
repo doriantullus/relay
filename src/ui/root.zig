@@ -10,6 +10,7 @@ pub const platform = struct {
     pub const Paths = @import("platform/paths.zig").Paths;
     pub const MainLoop = @import("platform/main_loop.zig").MainLoop;
     pub const ManualMainLoop = @import("platform/main_loop.zig").Manual;
+    pub const services = @import("platform/services.zig");
 };
 
 pub const fuzzy = @import("fuzzy.zig");
@@ -24,6 +25,7 @@ pub const palette = @import("palette.zig");
 pub const edit_sessions = @import("edit_sessions.zig");
 pub const terminal = @import("terminal.zig");
 pub const sites = @import("sites.zig");
+pub const prefs = @import("prefs.zig");
 
 test "module sanity" {
     try std.testing.expectEqual(@as(usize, 0), core.version.major);
@@ -33,6 +35,7 @@ test {
     _ = platform.Paths;
     _ = platform.MainLoop;
     _ = platform.ManualMainLoop;
+    _ = platform.services;
     _ = fuzzy;
     _ = format;
     _ = temp_cache;
@@ -45,4 +48,5 @@ test {
     _ = edit_sessions;
     _ = terminal;
     _ = sites;
+    _ = prefs;
 }

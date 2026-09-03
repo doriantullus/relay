@@ -1,11 +1,12 @@
-# Relay Linux build box — one native arm64 container, both arches.
+# Relay Linux build box — native on the Docker host, both target arches.
 FROM debian:trixie
 
 ARG ZIG_VERSION=0.16.0
 
-# amd64 alongside the native arm64: GTK4 dev files for both live under
-# /usr/lib/<triple>/, headers are shared in /usr/include.
+# Install both GTK architectures regardless of whether the image is built
+# on an amd64 CI runner or an arm64 development machine.
 RUN dpkg --add-architecture amd64 \
+ && dpkg --add-architecture arm64 \
  && apt-get update -qq \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl xz-utils pkg-config git xvfb xauth \
@@ -14,10 +15,16 @@ RUN dpkg --add-architecture amd64 \
       libsecret-1-dev:arm64 libsecret-1-dev:amd64 \
  && rm -rf /var/lib/apt/lists/*
 
-# Zig is the only toolchain: it cross-compiles without a foreign-arch gcc.
-RUN curl -sL "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" \
+# Zig is the only toolchain. Install the binary matching the container's
+# native architecture; that binary cross-compiles both Relay targets.
+RUN case "$(dpkg --print-architecture)" in \
+      arm64) zig_arch=aarch64 ;; \
+      amd64) zig_arch=x86_64 ;; \
+      *) echo "unsupported build architecture" >&2; exit 1 ;; \
+    esac \
+ && curl -sL "https://ziglang.org/download/${ZIG_VERSION}/zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz" \
       | tar -xJ -C /opt \
- && ln -s "/opt/zig-aarch64-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig
+ && ln -s "/opt/zig-${zig_arch}-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig
 
 # Per-arch LIB-ONLY search prefixes. Zig appends lib/ and include/ to a
 # --search-prefix; Debian's GTK emits no -L from pkg-config, so a cross

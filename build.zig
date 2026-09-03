@@ -238,6 +238,8 @@ pub fn build(b: *std.Build) void {
             },
         });
         gtk_mod.addCSourceFile(.{ .file = b.path("src/gtk/secret_store.c") });
+        gtk_mod.addCSourceFile(.{ .file = b.path("src/gtk/helpers.c") });
+        gtk_mod.linkSystemLibrary("gtk4", .{ .use_pkg_config = .force });
         gtk_mod.linkSystemLibrary("libsecret-1", .{ .use_pkg_config = .force });
 
         const gtk_tests = b.addTest(.{ .root_module = gtk_mod });
@@ -257,6 +259,21 @@ pub fn build(b: *std.Build) void {
             .root_module = linux_app_mod,
         });
         b.getInstallStep().dependOn(&b.addInstallArtifact(linux_app, .{}).step);
+        b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+            b.path("packaging/linux/us.doriantull.relay.desktop"),
+            .{ .custom = "share/applications" },
+            "us.doriantull.relay.desktop",
+        ).step);
+        b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+            b.path("packaging/linux/us.doriantull.relay.metainfo.xml"),
+            .{ .custom = "share/metainfo" },
+            "us.doriantull.relay.metainfo.xml",
+        ).step);
+        b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+            b.path("packaging/linux/us.doriantull.relay.svg"),
+            .{ .custom = "share/icons/hicolor/scalable/apps" },
+            "us.doriantull.relay.svg",
+        ).step);
         spikes_step.dependOn(&linux_app.step);
     }
 }

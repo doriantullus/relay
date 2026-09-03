@@ -1,7 +1,8 @@
-# Relay — UX Specification (M2 subset; full vision in the approved plan)
+# Relay — UX Specification
 
 Design benchmark: Transmit's polish + ForkLift's keyboard power. Native
-AppKit, dark-mode-native, keyboard-first. Anti-patterns we exist to avoid:
+AppKit and GTK 4 frontends are dark-mode-native and keyboard-first.
+Anti-patterns we exist to avoid:
 popup-only transfer activity (Transmit 5), modal enumeration of big
 directories (Cyberduck), GUI-inaccessible config + plaintext secrets
 (FileZilla).
@@ -53,6 +54,9 @@ directories (Cyberduck), GUI-inaccessible config + plaintext secrets
 - Return = rename (Finder parity; M2 may stub rename-inline as a sheet),
   `Cmd+↓`/double-click = open (descend dir / download+open file later).
 - Density modes (View menu): Comfortable 28pt / Compact 22pt / Dense 18pt.
+- Linux uses `GtkColumnView` with multi-selection, sortable headers,
+  streaming snapshots, filter/hidden controls, active-pane styling, and
+  Control-based accelerators exposed in the primary menu.
 
 ## Status & feel (policy, enforced)
 
@@ -98,6 +102,11 @@ directories (Cyberduck), GUI-inaccessible config + plaintext secrets
 | Cmd+, | Settings |
 | Cmd+. | Cancel active listing / selected transfers |
 | Space / Delete (queue focused) | Pause-resume / remove queue item |
+
+On Linux, replace Command with Control. Additional Linux shortcuts include
+Ctrl+Shift+P for the command palette, Ctrl+P for path mode, Ctrl+Alt+T for
+Open in Terminal, Ctrl+E for external editing, Ctrl+Y for preview,
+Ctrl+Shift+B for synchronized browsing, and Ctrl+Shift+D for pane comparison.
 
 Menu bar: App · File · Edit · View · Go · Server · Transfers · Window ·
 Help — every action above lives in a menu with its shortcut visible.

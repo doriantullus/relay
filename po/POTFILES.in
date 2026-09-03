@@ -1,0 +1,3 @@
+src/gtk/application.zig
+packaging/linux/us.doriantull.relay.desktop
+packaging/linux/us.doriantull.relay.metainfo.xml

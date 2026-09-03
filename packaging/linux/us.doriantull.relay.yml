@@ -37,7 +37,7 @@ modules:
       build-args:
         - --share=network
     build-commands:
-      - zig build -Doptimize=ReleaseSafe --prefix=/app
+      - zig build -Doptimize=ReleaseSafe --prefix /app
     sources:
       - type: dir
         path: ../..

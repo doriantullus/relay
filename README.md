@@ -42,9 +42,10 @@ live Docker integration matrix covering FTP, FTPS, and SFTP servers.
 ## Building
 
 Requires Zig 0.16.0. The AppKit frontend requires macOS 15+ (Apple Silicon).
-The Linux frontend requires GTK4 and libsecret; Flatpak is the supported
-portable Linux package. The pinned Debian build box contains both architectures
-and is the reproducible path for raw local builds:
+The Linux frontend requires GTK4 and libsecret. Flatpak is the portable Linux
+package, and an Ubuntu 24.04 amd64 `.deb` is also published for native package
+installation. The pinned Debian build box contains both architectures and is
+the reproducible path for raw local builds:
 
 ```sh
 zig build            # Relay.app on macOS, relay + desktop resources on Linux
@@ -60,8 +61,9 @@ docker run --rm -v "$PWD:/src" -e ZIG_GLOBAL_CACHE_DIR=/src/zig-pkg-linux \
 
 That produces `zig-out/linux-arm64/bin/relay` and
 `zig-out/linux-amd64/bin/relay`. Every merge to `main` also publishes a
-versioned macOS application archive and Linux Flatpak through GitHub Actions.
-See `packaging/linux/README.md` for Flatpak details and
+versioned macOS application archive, Linux Flatpak, and Ubuntu 24.04 `.deb`
+through GitHub Actions. See `packaging/linux/README.md` for Flatpak details,
+`packaging/debian/README.md` for the Ubuntu package, and
 `docker/linux-build/README.md` for the raw cross-linking constraints.
 
 ## Architecture

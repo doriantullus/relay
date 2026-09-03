@@ -3,11 +3,6 @@ name: Main branch artifacts
 on:
   push:
     branches: [main]
-  pull_request:
-    paths:
-      - .github/workflows/main-artifacts.yml
-      - packaging/linux/us.doriantull.relay.yml
-  workflow_dispatch:
 
 permissions:
   contents: read

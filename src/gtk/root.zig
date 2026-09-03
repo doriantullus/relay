@@ -16,11 +16,13 @@ pub const gobject = @import("gobject");
 pub const paths = @import("paths.zig");
 pub const main_loop = @import("main_loop.zig");
 pub const secret_store = @import("secret_store.zig");
+pub const services = @import("services.zig");
 pub const application = @import("application.zig");
 
 test {
     _ = paths;
     _ = main_loop;
     _ = secret_store;
+    _ = services;
     _ = application;
 }

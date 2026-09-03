@@ -37,8 +37,10 @@ relay_mac (module)       zig-objc AppKit wrappers: window/table/outline/
                          quicklook · notifications · app_nap (all selector
                          strings live here)
 relay_gtk (module)       GTK4 4.18.6 bindings · GLib MainLoop · XDG Paths ·
-                         libsecret CredStore · GTK application/header bar ·
-                         dual local panes with async AppCore listings
+                         libsecret CredStore · GFileMonitor/GAppInfo/
+                         GNotification/GSubprocess services · GTK application
+                         with virtualized dual panes, sites, inspector,
+                         transfers, settings, palette, preview, and editing
 ── shared app layer ──
 relay_ui (module)        toolkit-free app logic shared by both frontends;
                          AppCore bridge · connect factories · fuzzy/frecency ·
@@ -55,8 +57,9 @@ vendored C (static)      LibreSSL 4.0 (crypto/ssl), libssh2 1.11.1
 ```
 
 The extraction is complete: `src/ui/bridge.zig` is the only core↔UI crossing.
-Its `Paths` and `MainLoop` dependencies are injected vtables, implemented by
-libdispatch/Foundation on macOS and GLib/XDG on Linux.
+Its `Paths`, `MainLoop`, opener, notifier, watcher, and terminal-launcher
+dependencies use narrow service seams implemented by native platform layers.
+Portable UI preferences and session persistence live in `src/ui/prefs.zig`.
 
 ## M3 integration seams (who owns what)
 

@@ -425,3 +425,15 @@ At that point:
 - `src/ui` remains platform- and toolkit-neutral.
 - `docs/UX.md`, `docs/ARCHITECTURE.md`, and release documentation accurately describe
   the Linux application rather than treating it as an experimental frontend.
+
+## Implementation status
+
+The handoff is implemented on this branch. The GTK frontend now includes the
+saved-sites editor/importer, virtualized file tables, pane and desktop
+drag/drop, grouped transfer center, inspector, settings/action menus,
+Control-based shortcuts, Linux opener/watcher/notifier/terminal services,
+command and path palettes with persisted frecency, preview, external editing
+with remote-change conflict choices, synchronized browsing, comparison, Vim
+navigation, session and opt-in queue restoration, and Flatpak desktop
+metadata. The release workflow validates a fatal-warning GTK smoke, installed
+resources, and both raw Linux architectures.

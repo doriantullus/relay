@@ -43,10 +43,10 @@
 //!    snapshot's own arena). Both are BORROWED for the duration of the
 //!    dispatch: a listener that keeps the snapshot must `ref()` it; the
 //!    sort index must be copied (or rebuilt) if kept.
-//!  - `.op_done` reports mkdir/rename/chmod/delete completion (these ride
-//!    a bridge-side queue, not CoreEvent, which has no such variant). On
-//!    success the bridge auto re-lists the affected directory on the same
-//!    pane token.
+//!  - `.op_done` reports mkdir/rename/chmod/delete/stat completion (these
+//!    ride a bridge-side queue, not CoreEvent, which has no such variant).
+//!    Mutating operations auto re-list the affected directory on success;
+//!    stat is metadata-only and never re-lists.
 //!  - The remaining tags map 1:1 onto CoreEvent payloads; slice payloads
 //!    are owned by the event-queue arena and valid only during dispatch.
 //!
@@ -128,6 +128,7 @@ pub const RequestId = u64;
 pub const PaneToken = u64;
 pub const TransferSpec = engine_mod.Spec;
 pub const ItemId = item_mod.ItemId;
+pub const RemoveResult = engine_mod.RemoveResult;
 pub const ConflictPolicy = item_mod.ConflictPolicy;
 
 /// Bridge-issued prompt ids start here; the queue engine's start at 1, so
@@ -198,15 +199,17 @@ pub const ListingDone = struct {
     elapsed_ms: u64 = 0,
 };
 
-pub const OpKind = enum { mkdir, rename, chmod, delete };
+pub const OpKind = enum { mkdir, rename, chmod, delete, stat };
 
 pub const OpDone = struct {
     op: OpKind,
+    request_id: RequestId = 0,
     pane_token: PaneToken,
     site_id: u64,
     /// Primary path (`from` for rename). Borrowed for this dispatch.
     path: []const u8,
     success: bool,
+    mtime: ?i64 = null,
     /// Set exactly when `!success`; message borrowed for this dispatch.
     failure: ?events_mod.Failure,
 };
@@ -718,10 +721,12 @@ pub const AppCore = struct {
             defer self.destroyOpJob(op);
             self.emit(.op_done, .{
                 .op = op.kind,
+                .request_id = op.request_id,
                 .pane_token = op.pane_token,
                 .site_id = op.site_id,
                 .path = op.path,
                 .success = op.success,
+                .mtime = op.mtime,
                 .failure = if (op.success) null else .{
                     .class = op.failure_class,
                     .protocol_code = op.failure_code,
@@ -730,7 +735,7 @@ pub const AppCore = struct {
             });
             // Re-list on success so every pane showing the directory
             // refreshes from truth (optimistic UI reconciliation).
-            if (op.success) {
+            if (op.success and op.kind != .stat) {
                 _ = self.listPath(op.pane_token, op.site_id, op.refresh_dir) catch 0;
             }
         }
@@ -931,19 +936,29 @@ pub const AppCore = struct {
     pub const OpStartError = error{ InvalidPath, OutOfMemory, ConcurrencyUnavailable };
 
     pub fn mkdirPath(self: *AppCore, pane_token: PaneToken, site_id: u64, raw_path: []const u8) OpStartError!void {
-        return self.startOp(.mkdir, pane_token, site_id, raw_path, null, 0, false);
+        _ = try self.startOp(.mkdir, pane_token, site_id, raw_path, null, 0, false);
     }
 
     pub fn renamePath(self: *AppCore, pane_token: PaneToken, site_id: u64, raw_from: []const u8, raw_to: []const u8) OpStartError!void {
-        return self.startOp(.rename, pane_token, site_id, raw_from, raw_to, 0, false);
+        _ = try self.startOp(.rename, pane_token, site_id, raw_from, raw_to, 0, false);
     }
 
     pub fn chmodPath(self: *AppCore, pane_token: PaneToken, site_id: u64, raw_path: []const u8, mode: u16) OpStartError!void {
-        return self.startOp(.chmod, pane_token, site_id, raw_path, null, mode, false);
+        _ = try self.startOp(.chmod, pane_token, site_id, raw_path, null, mode, false);
     }
 
     pub fn deletePath(self: *AppCore, pane_token: PaneToken, site_id: u64, raw_path: []const u8, recursive: bool) OpStartError!void {
-        return self.startOp(.delete, pane_token, site_id, raw_path, null, 0, recursive);
+        _ = try self.startOp(.delete, pane_token, site_id, raw_path, null, 0, recursive);
+    }
+
+    pub fn statPath(self: *AppCore, site_id: u64, raw_path: []const u8) OpStartError!RequestId {
+        return self.startOp(.stat, 0, site_id, raw_path, null, 0, false);
+    }
+
+    pub fn ensureLocalDir(self: *AppCore, raw_path: []const u8) !void {
+        const normalized = try path_mod.normalize(self.gpa, raw_path);
+        defer self.gpa.free(normalized);
+        if (normalized.len > 1) try self.local_root.createDirPath(self.io, normalized[1..]);
     }
 
     fn startOp(
@@ -955,7 +970,7 @@ pub const AppCore = struct {
         raw_to: ?[]const u8,
         mode: u16,
         recursive: bool,
-    ) OpStartError!void {
+    ) OpStartError!RequestId {
         const norm = try path_mod.normalize(self.gpa, raw_path);
         errdefer self.gpa.free(norm);
         var to_norm: ?[]u8 = null;
@@ -965,9 +980,11 @@ pub const AppCore = struct {
         errdefer self.gpa.free(refresh);
         const job = try self.gpa.create(OpJob);
         errdefer self.gpa.destroy(job);
+        const request_id = self.next_request_id;
         job.* = .{
             .core = self,
             .kind = kind,
+            .request_id = request_id,
             .pane_token = pane_token,
             .site_id = site_id,
             .path = norm,
@@ -977,6 +994,8 @@ pub const AppCore = struct {
             .refresh_dir = refresh,
         };
         try self.group.concurrent(self.io, opWorker, .{job});
+        self.next_request_id += 1;
+        return request_id;
     }
 
     fn destroyOpJob(self: *AppCore, op: *OpJob) void {
@@ -1016,6 +1035,10 @@ pub const AppCore = struct {
         return self.engine.remove(id);
     }
 
+    pub fn removeTransferDetailed(self: *AppCore, id: ItemId) RemoveResult {
+        return self.engine.removeDetailed(id);
+    }
+
     pub fn reorderTransfer(self: *AppCore, id: ItemId, new_index: usize) bool {
         return self.engine.reorder(id, new_index);
     }
@@ -1036,6 +1059,10 @@ pub const AppCore = struct {
         return self.engine.requeueFailed();
     }
 
+    pub fn requeueTransfer(self: *AppCore, id: ItemId) !bool {
+        return self.engine.requeue(id);
+    }
+
     /// UI snapshot of the queue in queue order (arena-per-result).
     pub fn queueSnapshot(self: *AppCore, alloc: Allocator) error{OutOfMemory}![]engine_mod.ItemSnapshot {
         return self.engine.snapshot(alloc);
@@ -1047,6 +1074,15 @@ pub const AppCore = struct {
         var loaded = persist_mod.loadOrEmpty(self.io, self.config_dir, queue_file, self.gpa);
         defer loaded.deinit();
         return self.engine.restore(loaded.value) catch 0;
+    }
+
+    /// Apply global directional bandwidth caps at runtime and mirror them
+    /// into settings so the native settings surface can persist them.
+    pub fn setTransferRateLimits(self: *AppCore, upload: u64, download: u64) void {
+        self.settings.rate_limit_up = upload;
+        self.settings.rate_limit_down = download;
+        self.engine.setGlobalRateLimit(.upload, upload);
+        self.engine.setGlobalRateLimit(.download, download);
     }
 
     // ------------------------------------------------------------------ //
@@ -1532,6 +1568,7 @@ fn listWorker(job: *ListingJob) void {
 const OpJob = struct {
     core: *AppCore,
     kind: OpKind,
+    request_id: RequestId,
     pane_token: PaneToken,
     site_id: u64,
     /// All paths normalized + gpa-owned by the job.
@@ -1544,6 +1581,7 @@ const OpJob = struct {
     token: CancelToken = .{},
     // Result (written by the worker before handoff to pending_ops).
     success: bool = false,
+    mtime: ?i64 = null,
     failure_class: diag_mod.ErrorClass = .permanent,
     failure_code: u32 = 0,
     failure_msg_buf: [512]u8 = undefined,
@@ -1559,15 +1597,17 @@ fn opWorker(job: *OpJob) void {
             break :run;
         };
         const io = core.io;
-        const result = switch (job.kind) {
-            .mkdir => vfs.mkdir(io, &job.token, &diag, job.path),
-            .rename => vfs.rename(io, &job.token, &diag, job.path, job.to_path.?),
-            .chmod => vfs.chmod(io, &job.token, &diag, job.path, job.mode),
-            .delete => vfs.remove(io, &job.token, &diag, job.path, job.recursive),
-        };
-        if (result) {
-            job.success = true;
-        } else |_| {}
+        switch (job.kind) {
+            .mkdir => vfs.mkdir(io, &job.token, &diag, job.path) catch break :run,
+            .rename => vfs.rename(io, &job.token, &diag, job.path, job.to_path.?) catch break :run,
+            .chmod => vfs.chmod(io, &job.token, &diag, job.path, job.mode) catch break :run,
+            .delete => vfs.remove(io, &job.token, &diag, job.path, job.recursive) catch break :run,
+            .stat => {
+                const entry = vfs.stat(io, &job.token, &diag, job.path) catch break :run;
+                job.mtime = entry.mtime;
+            },
+        }
+        job.success = true;
     }
     if (!job.success) {
         job.failure_class = diag.class;
@@ -1983,6 +2023,70 @@ test "mkdir wrapper: op_done fires and the parent re-lists on success" {
     try h.core.deletePath(3, item_mod.local_site_id, "/renamed", false);
     try h.waitUntil(&ops, OpRecorder.gotOp);
     try testing.expect(ops.ok);
+}
+
+test "statPath returns fresh metadata and failures without re-listing" {
+    var h: TestHarness = undefined;
+    try h.start(null);
+    defer h.stop();
+    const io = h.core.io;
+
+    try h.tmp_root.dir.writeFile(io, .{ .sub_path = "fresh.txt", .data = "fresh" });
+    var file = try h.tmp_root.dir.openFile(io, "fresh.txt", .{});
+    const expected_mtime = (try file.stat(io)).mtime.toSeconds();
+    file.close(io);
+
+    const Recorder = struct {
+        done: usize = 0,
+        listings: usize = 0,
+        request_id: RequestId = 0,
+        success: bool = false,
+        mtime: ?i64 = null,
+        failure_class: ?diag_mod.ErrorClass = null,
+        failure_message_ok: bool = false,
+
+        fn onOp(self: *@This(), op: OpDone) void {
+            self.done += 1;
+            self.request_id = op.request_id;
+            self.success = op.success;
+            self.mtime = op.mtime;
+            self.failure_class = if (op.failure) |failure| failure.class else null;
+            self.failure_message_ok = if (op.failure) |failure|
+                std.mem.indexOf(u8, failure.message, "does-not-exist") != null
+            else
+                false;
+        }
+
+        fn onListing(self: *@This(), _: ListingDone) void {
+            self.listings += 1;
+        }
+
+        fn gotFirst(self: *@This()) bool {
+            return self.done >= 1;
+        }
+
+        fn gotSecond(self: *@This()) bool {
+            return self.done >= 2;
+        }
+    };
+    var rec: Recorder = .{};
+    try h.core.registerListener(.op_done, &rec, Recorder.onOp);
+    try h.core.registerListener(.listing_done, &rec, Recorder.onListing);
+
+    const success_request = try h.core.statPath(item_mod.local_site_id, "/fresh.txt");
+    try h.waitUntil(&rec, Recorder.gotFirst);
+    try testing.expect(rec.success);
+    try testing.expectEqual(success_request, rec.request_id);
+    try testing.expectEqual(@as(?i64, expected_mtime), rec.mtime);
+    try testing.expectEqual(@as(usize, 0), rec.listings);
+
+    const failure_request = try h.core.statPath(item_mod.local_site_id, "/does-not-exist");
+    try h.waitUntil(&rec, Recorder.gotSecond);
+    try testing.expect(!rec.success);
+    try testing.expectEqual(failure_request, rec.request_id);
+    try testing.expectEqual(diag_mod.ErrorClass.permanent, rec.failure_class.?);
+    try testing.expect(rec.failure_message_ok);
+    try testing.expectEqual(@as(usize, 0), rec.listings);
 }
 
 test "enqueueTransfer: local→local copy through the real queue engine + pump" {

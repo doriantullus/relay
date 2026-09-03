@@ -41,13 +41,48 @@ jobs:
       - name: Install GTK development libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libsecret-1-dev xvfb xauth
+          sudo apt-get install -y libgtk-4-dev libsecret-1-dev xvfb xauth desktop-file-utils appstream flatpak-builder
       - name: Build GTK application
         run: zig build
       - name: GTK smoke test
-        run: GTK_A11Y=none RELAY_GTK_SMOKE=1 dbus-run-session -- xvfb-run -a zig-out/bin/relay
+        run: G_DEBUG=fatal-warnings GTK_A11Y=none RELAY_GTK_SMOKE=1 dbus-run-session -- xvfb-run -a zig-out/bin/relay
       - name: Unit tests (core + shared UI logic)
         run: zig build test
+      - name: Release install smoke
+        run: |
+          zig build -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/relay"
+          test -x "$RUNNER_TEMP/relay/bin/relay"
+          test -f "$RUNNER_TEMP/relay/share/applications/us.doriantull.relay.desktop"
+          G_DEBUG=fatal-warnings GTK_A11Y=none RELAY_GTK_SMOKE=1 \
+            dbus-run-session -- xvfb-run -a "$RUNNER_TEMP/relay/bin/relay"
+          G_DEBUG=fatal-warnings GTK_A11Y=none GTK_THEME=Adwaita:dark RELAY_GTK_SMOKE=1 \
+            dbus-run-session -- xvfb-run -a "$RUNNER_TEMP/relay/bin/relay"
+      - name: Validate Linux metadata
+        run: |
+          desktop-file-validate packaging/linux/us.doriantull.relay.desktop
+          appstreamcli validate --no-net packaging/linux/us.doriantull.relay.metainfo.xml
+          flatpak-builder --show-manifest packaging/linux/us.doriantull.relay.yml >/dev/null
+
+  linux-release-architectures:
+    name: Linux release (x86_64 + aarch64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build reproducible image
+        run: docker build -t relay-linux-build docker/linux-build
+      - name: Build both release architectures
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            -e ZIG_GLOBAL_CACHE_DIR=/src/zig-pkg-linux \
+            relay-linux-build ./docker/linux-build/build-linux.sh
+          test -x zig-out/linux-amd64/bin/relay
+          test -x zig-out/linux-arm64/bin/relay
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relay-linux-raw
+          path: |
+            zig-out/linux-amd64/
+            zig-out/linux-arm64/
 
   # Separate job from the unit tests so live-server flakes are visible at
   # a glance and never mask deterministic failures. ubuntu-latest runners

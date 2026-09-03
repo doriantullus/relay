@@ -1775,6 +1775,7 @@ pub const BrowserPane = struct {
     }
 
     fn handleOpDone(pane: *BrowserPane, d: bridge.OpDone) void {
+        if (d.op == .stat) return;
         if (d.success) return; // the bridge already re-listed; adopt reconciles
         const gpa = pane.gpa;
         switch (d.op) {
@@ -1782,6 +1783,7 @@ pub const BrowserPane = struct {
             .delete => pane.overlay.unhideAll(),
             .mkdir => pane.overlay.clearNewFolder(gpa),
             .chmod => pane.overlay.clearModes(), // rollback the staged modes
+            .stat => unreachable,
         }
         pane.redraw();
         const title: []const u8 = switch (d.op) {
@@ -1789,6 +1791,7 @@ pub const BrowserPane = struct {
             .rename => "Rename failed",
             .chmod => "Change Permissions failed",
             .delete => "Delete failed",
+            .stat => unreachable,
         };
         const detail: []const u8 = if (d.failure) |f| f.message else "";
         // Background-tab hygiene: only present a sheet when the pane is visible.

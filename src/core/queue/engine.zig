@@ -78,6 +78,12 @@ pub const ItemSnapshot = struct {
     failure_message: []const u8,
 };
 
+pub const RemoveResult = enum {
+    not_found,
+    removed,
+    canceling,
+};
+
 pub const Engine = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -222,6 +228,13 @@ pub const Engine = struct {
             if (it.id == id and !it.removed) return it;
         }
         return null;
+    }
+
+    fn containsIdLocked(self: *Engine, id: ItemId) bool {
+        for (self.items.items) |it| {
+            if (it.id == id) return true;
+        }
+        return false;
     }
 
     // ------------------------------------------------------------------
@@ -413,19 +426,25 @@ pub const Engine = struct {
 
     /// Remove an item from the queue. Active items are canceled first and
     /// vanish when their worker unwinds.
-    pub fn remove(self: *Engine, id: ItemId) bool {
+    pub fn removeDetailed(self: *Engine, id: ItemId) RemoveResult {
         self.lock();
         defer self.unlock();
-        const it = self.findLocked(id) orelse return false;
+        const it = self.findLocked(id) orelse return .not_found;
         if (it.state.isActive()) {
             it.removed = true;
             it.pending = .cancel;
             it.token.cancel();
+            self.saver.markDirty();
+            return .canceling;
         } else {
             self.unlinkDestroyLocked(it);
+            self.saver.markDirty();
+            return .removed;
         }
-        self.saver.markDirty();
-        return true;
+    }
+
+    pub fn remove(self: *Engine, id: ItemId) bool {
+        return self.removeDetailed(id) != .not_found;
     }
 
     /// Failed bucket → queued, attempts reset. Returns the requeue count.
@@ -449,6 +468,24 @@ pub const Engine = struct {
             self.sched.broadcastAll(self.io);
         }
         return count;
+    }
+
+    /// Requeue one failed item, preserving its queue position.
+    pub fn requeue(self: *Engine, id: ItemId) !bool {
+        self.lock();
+        defer self.unlock();
+        const it = self.findLocked(id) orelse return false;
+        if (it.state != .failed) return false;
+        it.attempts = 0;
+        it.failure = null;
+        it.not_before_ns = 0;
+        it.pending = .none;
+        it.token.reset();
+        self.setStateLocked(it, .queued, null);
+        self.saver.markDirty();
+        const lane = try self.sched.ensureLaneLocked(self, it.siteId());
+        lane.cond.signal(self.io);
+        return true;
     }
 
     /// UI answer to the (single) auth prompt for a site. On success the
@@ -555,6 +592,9 @@ pub const Engine = struct {
         defer self.unlock();
         var count: usize = 0;
         for (queue.items) |p| {
+            // Removed active items stay owned until their worker unwinds.
+            // Do not restore the same ID while that cleanup is in flight.
+            if (self.containsIdLocked(p.id)) continue;
             const state: item_mod.State = switch (p.state) {
                 .queued, .paused => .paused,
                 .failed => .failed,
@@ -1389,6 +1429,7 @@ test "persistence: autosave, corrupt-safe load, restore, resume" {
     defer loaded.deinit();
     try testing.expectEqual(@as(usize, 2), loaded.value.items.len);
     try testing.expectEqual(@as(usize, 2), try rig.eng.restore(loaded.value));
+    try testing.expectEqual(@as(usize, 0), try rig.eng.restore(loaded.value));
 
     {
         var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -1413,6 +1454,32 @@ test "persistence: autosave, corrupt-safe load, restore, resume" {
     var corrupt = persist.loadOrEmpty(io, tmp.dir, "queue.zon", testing.allocator);
     defer corrupt.deinit();
     try testing.expectEqual(@as(usize, 0), corrupt.value.items.len);
+}
+
+test "restore does not duplicate an ID pending removed-worker cleanup" {
+    var rig: TestRig = undefined;
+    try rig.start(.{ .conns = 1 });
+    defer rig.stop();
+
+    const id = try rig.eng.enqueue(.{
+        .direction = .download,
+        .src = .{ .site_id = 1, .path = "/pending.txt" },
+        .dst = .{ .site_id = 0, .path = "/pending.txt" },
+        .start_paused = true,
+    });
+    rig.eng.lock();
+    const item = rig.eng.findLocked(id).?;
+    item.removed = true;
+    rig.eng.unlock();
+
+    const persisted_items = [_]persist.PersistedItem{.{
+        .id = id,
+        .src_site = 1,
+        .src_path = "/pending.txt",
+        .dst_path = "/pending.txt",
+    }};
+    try testing.expectEqual(@as(usize, 0), try rig.eng.restore(.{ .items = &persisted_items }));
+    try testing.expectEqual(@as(usize, 1), rig.eng.items.items.len);
 }
 
 test "cancelAll silences a busy queue" {

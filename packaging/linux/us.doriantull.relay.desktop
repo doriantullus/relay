@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Relay
+Comment=Native FTP, FTPS, and SFTP client
+Exec=relay
+Icon=us.doriantull.relay
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=FTP;FTPS;SFTP;SSH;File Transfer;
+StartupNotify=true
+StartupWMClass=us.doriantull.relay

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>us.doriantull.relay</id>
+  <name>Relay</name>
+  <summary>Native FTP, FTPS, and SFTP file transfer</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+  <description>
+    <p>Relay is a keyboard-friendly, dual-pane file transfer client with saved sites, secure credential storage, transfer queues, previews, and external editing.</p>
+  </description>
+  <launchable type="desktop-id">us.doriantull.relay.desktop</launchable>
+  <provides>
+    <binary>relay</binary>
+  </provides>
+  <url type="homepage">https://github.com/doriantullus/relay</url>
+  <url type="bugtracker">https://github.com/doriantullus/relay/issues</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-09-02"/>
+  </releases>
+</component>

@@ -21,7 +21,9 @@ mkdir -p "$OUTPUT_DIR"
 PACKAGE_ROOT="$(mktemp -d "$OUTPUT_DIR/relay-deb.XXXXXX")"
 trap 'rm -rf "$PACKAGE_ROOT"' EXIT HUP INT TERM
 
-zig build -Doptimize=ReleaseSafe --prefix "$PACKAGE_ROOT/usr"
+# -Dcpu=baseline: without it Zig targets the build machine's CPU, and the
+# GitHub runners emit AVX-512 that crashes with SIGILL on most desktop CPUs.
+zig build -Doptimize=ReleaseSafe -Dcpu=baseline --prefix "$PACKAGE_ROOT/usr"
 
 mkdir -p "$PACKAGE_ROOT/DEBIAN"
 mkdir -p "$PACKAGE_ROOT/debian"

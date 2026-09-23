@@ -3,6 +3,7 @@ name: Main branch artifacts
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -96,7 +97,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libgtk-4-dev libsecret-1-dev dpkg-dev \
+            libgtk-4-dev libsecret-1-dev dpkg-dev binutils \
             desktop-file-utils appstream xvfb xauth
       - name: Build Debian package
         run: |
@@ -110,6 +111,12 @@ jobs:
           dpkg-deb --contents "$package"
           sudo apt-get install -y "$package"
           test -x /usr/bin/relay
+          # The package must run on any x86-64 CPU. Without -Dcpu=baseline Zig
+          # targets the runner's CPU and emits AVX/AVX-512, which SIGILLs elsewhere.
+          if objdump -d /usr/bin/relay | grep -qE '%(ymm|zmm)[0-9]'; then
+            echo "relay binary contains AVX/AVX-512 instructions; build with -Dcpu=baseline" >&2
+            exit 1
+          fi
           test -f /usr/share/applications/us.doriantull.relay.desktop
           test -f /usr/share/metainfo/us.doriantull.relay.metainfo.xml
           desktop-file-validate /usr/share/applications/us.doriantull.relay.desktop

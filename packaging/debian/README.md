@@ -14,7 +14,9 @@ packaging/debian/build-deb.sh 2026-09-03.0
 sudo apt install ./zig-out/relay_2026-09-03.0_amd64.deb
 ```
 
-The script performs a ReleaseSafe install into a temporary package root,
+The script performs a ReleaseSafe install into a temporary package root
+with `-Dcpu=baseline` so the binary runs on any x86-64 CPU (Zig otherwise
+targets the build machine's CPU, and the GitHub runners emit AVX-512),
 derives runtime dependencies from the linked executable with
 `dpkg-shlibdeps`, includes the desktop/AppStream/icon resources installed by
 `build.zig`, and creates the package with root ownership metadata.

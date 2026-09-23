@@ -37,7 +37,8 @@ modules:
       build-args:
         - --share=network
     build-commands:
-      - zig build -Doptimize=ReleaseSafe --prefix /app
+      # -Dcpu=baseline keeps the binary portable; Zig otherwise targets the build host CPU.
+      - zig build -Doptimize=ReleaseSafe -Dcpu=baseline --prefix /app
     sources:
       - type: dir
         path: ../..

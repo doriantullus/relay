@@ -374,6 +374,7 @@ fn buildUi() !void {
     // the "+" button routes through cmdNewTab so it picks up current prefs.
     g_ui.tabs.on_tab_created = setBrowserHooks;
     g_ui.tabs.on_new_request = newTabRequest;
+    g_ui.tabs.on_bar_visibility = onTabBarVisibility;
 
     g_ui.transfers = try transfers_mod.TransfersController.create(gpa, core);
     g_ui.transfers.setPromptWindow(g_ui.win); // parent for the overwrite-confirm sheet
@@ -616,16 +617,18 @@ fn setBrowserHooks(browser: *browser_mod.BrowserController) void {
 }
 
 /// Build the window content view: a plain NSView with the TabBar strip
-/// pinned to the top (fixed height = bar_height) and `content` below it
-/// filling the rest. Both have autoresizing so AppKit maintains the layout
-/// on window resize.
+/// pinned to the top (fixed height = bar_height while shown, 0 while hidden)
+/// and `content` below it filling the rest. Both have autoresizing so AppKit
+/// maintains the layout on window resize; layoutTabWindowContent re-splits
+/// the height when the strip hides or shows.
 ///
 /// NSView uses non-flipped (y-up) coordinates: origin is bottom-left.
-/// Bar lives at y = total_h - bar_height (top); content fills [0, total_h - bar_height).
+/// Bar lives at y = total_h - bar_height (top); content fills [0, total_h - bar_h).
 fn buildTabWindowContent(bar_view: objc.c.id, content: objc.Object) objc.Object {
     const total_w: f64 = 1240;
     const total_h: f64 = 780;
-    const bar_h: f64 = tab_bar_mod.bar_height;
+    const bar_hidden = foundation.toBool(objc.Object.fromId(bar_view).msgSend(foundation.BOOL, "isHidden", .{}));
+    const bar_h: f64 = if (bar_hidden) 0 else tab_bar_mod.bar_height;
 
     const outer = foundation.class("NSView").msgSend(objc.Object, "alloc", .{})
         .msgSend(objc.Object, "initWithFrame:", .{foundation.rect(0, 0, total_w, total_h)});
@@ -634,7 +637,7 @@ fn buildTabWindowContent(bar_view: objc.c.id, content: objc.Object) objc.Object 
 
     // Bar: top edge, width-sizable, minY-margin (stays at top as height grows).
     const bar = objc.Object.fromId(bar_view);
-    bar.msgSend(void, "setFrame:", .{foundation.rect(0, total_h - bar_h, total_w, bar_h)});
+    bar.msgSend(void, "setFrame:", .{foundation.rect(0, total_h - tab_bar_mod.bar_height, total_w, tab_bar_mod.bar_height)});
     bar.msgSend(void, "setAutoresizingMask:", .{@as(foundation.NSUInteger, (1 << 1) | (1 << 3))});
     outer.msgSend(void, "addSubview:", .{bar});
 
@@ -644,6 +647,23 @@ fn buildTabWindowContent(bar_view: objc.c.id, content: objc.Object) objc.Object 
     outer.msgSend(void, "addSubview:", .{content});
 
     return outer;
+}
+
+/// TabsController hook: the strip hid or showed. Re-split the window content
+/// height so a hidden strip reserves no space (the sidebar material then
+/// runs straight up to the toolbar). The bar keeps its top-pinned frame.
+fn onTabBarVisibility(hidden: bool) void {
+    if (!g_ui_built) return;
+    const bar = objc.Object.fromId(g_ui.tabs.bar.view());
+    const outer = bar.msgSend(objc.Object, "superview", .{});
+    if (outer.value == null) return;
+    const bounds = outer.msgSend(foundation.NSRect, "bounds", .{});
+    const bar_h: f64 = if (hidden) 0 else tab_bar_mod.bar_height;
+    objc.Object.fromId(g_ui.root_split.view()).msgSend(
+        void,
+        "setFrame:",
+        .{foundation.rect(0, 0, bounds.size.width, bounds.size.height - bar_h)},
+    );
 }
 
 /// True when reconnecting `site` cannot pose a credential prompt: SFTP

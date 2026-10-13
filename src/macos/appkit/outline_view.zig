@@ -19,6 +19,7 @@ const c = objc.c;
 // Shared ABI helpers: single definitions live in relay_mac foundation.zig,
 // re-exported through table_source.zig (deduped in M2 phase 3).
 const ts = @import("table_source.zig");
+const surface = @import("surface.zig");
 const NSInteger = ts.NSInteger;
 const NSUInteger = ts.NSUInteger;
 const NSPoint = ts.NSPoint;
@@ -26,6 +27,11 @@ const NSSize = ts.NSSize;
 const NSRect = ts.NSRect;
 const rect = ts.rect;
 const getClass = ts.getClass;
+
+// NSTableViewStyle / NSAutoresizingMaskOptions values for the sidebar.
+const table_style_source_list: NSInteger = 3;
+const autoresize_width_sizable: NSUInteger = 1 << 1;
+const autoresize_height_sizable: NSUInteger = 1 << 4;
 const nsStr = ts.nsStr;
 const nsStrBytes = ts.nsStrBytes;
 
@@ -203,6 +209,11 @@ pub const OutlineView = struct {
     ds: DataSource,
     row_height: f64,
     scroll: objc.Object,
+    /// Flat chrome tier hosting `scroll`; the view hosts embed. A plain
+    /// shaded surface rather than the translucent sidebar material: without
+    /// a full-height titlebar the material just shows the desktop through a
+    /// slab under the toolbar.
+    backdrop: *surface.Surface,
     outline: objc.Object,
     helper: objc.Object,
     /// section_items[s] is the header token; row_items[s][r] the row tokens.
@@ -222,6 +233,7 @@ pub const OutlineView = struct {
             .alloc = alloc,
             .ds = config.data_source,
             .row_height = config.row_height,
+            .backdrop = undefined,
             .scroll = undefined,
             .outline = undefined,
             .helper = undefined,
@@ -237,6 +249,10 @@ pub const OutlineView = struct {
         outline.msgSend(void, "setAllowsEmptySelection:", .{true});
         outline.msgSend(void, "setHeaderView:", .{@as(c.id, null)});
         outline.msgSend(void, "setFloatsGroupRows:", .{false});
+        // Source-list style: AppKit group-row typography, selection shape
+        // and vibrancy for a sidebar; the backdrop below supplies the material.
+        outline.msgSend(void, "setStyle:", .{@as(NSInteger, table_style_source_list)});
+        outline.msgSend(void, "setBackgroundColor:", .{getClass("NSColor").msgSend(objc.Object, "clearColor", .{})});
         outline.msgSend(void, "setIndentationPerLevel:", .{@as(f64, 4)});
         if (config.autosave_name) |name|
             outline.msgSend(void, "setAutosaveName:", .{nsStr(name.ptr)});
@@ -267,6 +283,11 @@ pub const OutlineView = struct {
         scroll.msgSend(void, "setDrawsBackground:", .{false});
         scroll.msgSend(void, "setDocumentView:", .{outline});
         self.scroll = scroll;
+        scroll.msgSend(void, "setAutoresizingMask:", .{autoresize_width_sizable | autoresize_height_sizable});
+
+        const backdrop = try surface.Surface.create(alloc, rect(0, 0, 220, 400), .{});
+        backdrop.obj.msgSend(void, "addSubview:", .{scroll});
+        self.backdrop = backdrop;
 
         try self.rebuildItems();
         outline.msgSend(void, "reloadData", .{});
@@ -279,9 +300,11 @@ pub const OutlineView = struct {
         self.outline.msgSend(void, "setDelegate:", .{@as(c.id, null)});
         self.outline.msgSend(void, "setDataSource:", .{@as(c.id, null)});
         self.outline.msgSend(void, "setTarget:", .{@as(c.id, null)});
+        self.scroll.msgSend(void, "removeFromSuperview", .{});
         self.scroll.msgSend(void, "release", .{});
         self.outline.msgSend(void, "release", .{});
         self.helper.msgSend(void, "release", .{});
+        self.backdrop.deinit();
 
         for (self.section_items.items) |item| objc.Object.fromId(item).msgSend(void, "release", .{});
         for (self.row_items.items) |*rows| {
@@ -302,9 +325,10 @@ pub const OutlineView = struct {
         self.alloc.destroy(self);
     }
 
-    /// The view to embed (the NSScrollView wrapping the outline).
+    /// The view to embed (the chrome backdrop wrapping the scroll view
+    /// wrapping the outline).
     pub fn view(self: *OutlineView) c.id {
-        return self.scroll.value;
+        return self.backdrop.view();
     }
 
     /// Full reload: re-query the vtable for every section and row.

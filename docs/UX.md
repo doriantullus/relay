@@ -71,6 +71,16 @@ directories (Cyberduck), GUI-inaccessible config + plaintext secrets
   the connection chip + last round-trip ms ("latency honesty").
 - Semantic NSColors ONLY (labelColor, controlAccentColor, …) — zero
   hard-coded colors; dark mode must be automatic.
+- Chrome tiers (macOS): the sidebar backdrop, each pane's status bar and
+  the bottom panel header are flat `Surface` views (windowBackground + a
+  labelColor shade + hairline separators) so they read apart from the
+  list's controlBackground; the sidebar outline uses source-list style on
+  that flat tier (NOT the translucent sidebar material — without a
+  full-height titlebar it just shows the desktop through). File lists are
+  full-width with alternating rows. The ACTIVE pane is marked the way macOS
+  marks inactive content: the other pane's path text drops to
+  secondaryLabelColor. No extra color anywhere; everything follows the
+  system accent and both appearances.
 
 ## Transfer panel
 

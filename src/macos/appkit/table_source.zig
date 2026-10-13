@@ -174,6 +174,9 @@ pub const DataSource = struct {
     sortChanged: ?*const fn (ctx: *anyopaque, col: usize, ascending: bool) void = null,
     /// `rows` is valid only for the duration of the callback.
     selectionChanged: ?*const fn (ctx: *anyopaque, rows: []const usize) void = null,
+    /// The table became first responder (click, Tab, programmatic focus).
+    /// Hosts use it to mark the active pane.
+    focusGained: ?*const fn (ctx: *anyopaque) void = null,
     doubleAction: ?*const fn (ctx: *anyopaque, row: ?usize) void = null,
     returnAction: ?*const fn (ctx: *anyopaque, row: ?usize) void = null,
     /// Return true if handled; false falls through to NSTableView's default
@@ -189,6 +192,9 @@ pub const Config = struct {
     density: Density = .compact,
     allows_multiple_selection: bool = true,
     header_visible: bool = true,
+    /// Finder-style zebra rows (alternatingContentBackgroundColors); off for
+    /// tables where a striped background would fight custom cell drawing.
+    alternating_rows: bool = true,
     /// NSTableView autosave name for column widths/order.
     autosave_name: ?[:0]const u8 = null,
 };
@@ -208,6 +214,9 @@ var g_cell_col_ivar: c.Ivar = null;
 var g_cell_bg_ivar: c.Ivar = null;
 
 const state_ivar_name = "relayState";
+
+/// NSTableViewStyleFullWidth.
+const table_style_full_width: NSInteger = 1;
 
 /// Recover a Zig pointer stored in an id-sized ivar (plain store; runtime
 /// classes have no ARC layout).
@@ -260,6 +269,8 @@ pub fn ensureClasses() void {
         if (!cls.addIvar(state_ivar_name)) @panic("addIvar(RelayTableView)");
         if (!cls.addMethod("keyDown:", tableKeyDown)) @panic("addMethod(keyDown:)");
         if (!cls.addMethod("menuForEvent:", tableMenuForEvent)) @panic("addMethod(menuForEvent:)");
+        if (!cls.addMethod("becomeFirstResponder", tableBecomeFirstResponder))
+            @panic("addMethod(becomeFirstResponder)");
         objc.registerClassPair(cls);
         g_table_state_ivar = c.class_getInstanceVariable(cls.value, state_ivar_name);
         if (g_table_state_ivar == null) @panic("ivar lookup (RelayTableView)");
@@ -359,6 +370,10 @@ pub const TableView = struct {
         table.msgSend(void, "setUsesAutomaticRowHeights:", .{false});
         table.msgSend(void, "setAllowsMultipleSelection:", .{config.allows_multiple_selection});
         table.msgSend(void, "setAllowsColumnReordering:", .{false});
+        // Full-width style: rows and selection run edge to edge, like Finder's
+        // list view, instead of the floating inset look.
+        table.msgSend(void, "setStyle:", .{@as(NSInteger, table_style_full_width)});
+        table.msgSend(void, "setUsesAlternatingRowBackgroundColors:", .{config.alternating_rows});
         self.table = table;
 
         for (columns) |spec| {
@@ -658,6 +673,24 @@ fn tableKeyDown(target: c.id, _: c.SEL, event_id: c.id) callconv(.c) void {
             .{event_id},
         );
     }
+}
+
+/// becomeFirstResponder override: let NSTableView take focus, then tell the
+/// host so it can mark the active pane.
+fn tableBecomeFirstResponder(target: c.id, _: c.SEL) callconv(.c) c.BOOL {
+    const ok = objc.Object.fromId(target).msgSendSuper(
+        getClass("NSTableView"),
+        c.BOOL,
+        "becomeFirstResponder",
+        .{},
+    );
+    if (ok != 0) {
+        const pool = objc.AutoreleasePool.init();
+        defer pool.deinit();
+        const tv = stateFromIvar(TableView, target, g_table_state_ivar);
+        if (tv.ds.focusGained) |hook| hook(tv.ds.ctx);
+    }
+    return ok;
 }
 
 fn tableMenuForEvent(target: c.id, _: c.SEL, event_id: c.id) callconv(.c) c.id {

@@ -64,6 +64,9 @@ pub const TabsController = struct {
     /// (the same path as Cmd+T) so the new browser gets the CURRENT prefs
     /// (density, date format, vim mode…) — TabsController doesn't know them.
     on_new_request: ?*const fn () void = null,
+    /// The strip was hidden (single tab) or revealed. The app relayouts the
+    /// window content so a hidden strip reserves no space.
+    on_bar_visibility: ?*const fn (hidden: bool) void = null,
     /// Last site_status per site id, tracked from the site_status listener
     /// (the core exposes no synchronous query; the sidebar tracks its own
     /// copy the same way). Drives the per-tab dot and the close-confirm.
@@ -124,7 +127,7 @@ pub const TabsController = struct {
         // Register a site_status listener so title chips update on connect.
         try core.registerListener(.site_status, self, onSiteStatus);
 
-        self.bar.setHidden(true); // single tab: strip hidden
+        self.setBarHidden(true); // single tab: strip hidden
         try self.refreshTitles();
 
         return self;
@@ -170,9 +173,14 @@ pub const TabsController = struct {
         if (self.on_tab_created) |hook| hook(browser);
         self.active = self.tabs.items.len - 1;
         self.swapViewIn(browser);
-        self.bar.setHidden(false);
+        self.setBarHidden(false);
         try self.refreshTitles();
         browser.focusPane(0);
+    }
+
+    fn setBarHidden(self: *TabsController, hidden: bool) void {
+        self.bar.setHidden(hidden);
+        if (self.on_bar_visibility) |hook| hook(hidden);
     }
 
     /// Close the tab at `index`. Returns false if it was the last tab (caller
@@ -195,7 +203,7 @@ pub const TabsController = struct {
         // active view in; closing a background tab makes this a no-op
         // re-add of the already-displayed view.
         self.swapViewIn(self.tabs.items[self.active].browser);
-        if (self.tabs.items.len == 1) self.bar.setHidden(true);
+        if (self.tabs.items.len == 1) self.setBarHidden(true);
         self.refreshTitles() catch {};
         self.activeBrowser().focusPane(self.activeBrowser().focused);
         return true;

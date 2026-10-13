@@ -60,6 +60,7 @@ const panels = mac.appkit.panels;
 const window_mod = mac.appkit.window;
 const drag = mac.appkit.drag;
 const banner_mod = mac.appkit.banner;
+const surface_mod = mac.appkit.surface;
 
 const vfs_mod = relay.vfs.iface;
 const path_mod = relay.vfs.path;
@@ -659,6 +660,12 @@ const chrome = struct {
         field.msgSend(void, "setEditable:", .{true});
         field.msgSend(void, "setSelectable:", .{true});
         field.msgSend(void, "setUsesSingleLineMode:", .{true});
+        // usesSingleLineMode alone does not stop the field editor from
+        // wrapping; the cell must scroll horizontally instead of wrapping.
+        const cell = field.msgSend(objc.Object, "cell", .{});
+        cell.msgSend(void, "setScrollable:", .{true});
+        cell.msgSend(void, "setWraps:", .{false});
+        cell.msgSend(void, "setLineBreakMode:", .{@as(NSUInteger, 2)}); // NSLineBreakByClipping
         field.msgSend(void, "setFont:", .{foundation.systemFont(font_size)});
         return field;
     }
@@ -696,6 +703,15 @@ const chrome = struct {
 
     fn setPlaceholder(view: objc.Object, s: []const u8) void {
         view.msgSend(void, "setPlaceholderString:", .{foundation.nsString(s)});
+    }
+
+    /// Active-pane treatment, the way macOS itself marks inactive content:
+    /// the inactive pane's path text drops to secondaryLabelColor, the
+    /// active pane's reads in labelColor. No extra color; the list's
+    /// selection highlight (accent vs. gray) carries the rest.
+    fn setFieldActive(field: objc.Object, on: bool) void {
+        const color: foundation.Color = if (on) .label else .secondary_label;
+        field.msgSend(void, "setTextColor:", .{color.object()});
     }
 
     fn setHidden(view: objc.Object, hidden: bool) void {
@@ -997,6 +1013,9 @@ pub const BrowserPane = struct {
     sync_label: objc.Object = undefined,
     /// 2pt per-site accent strip under the path bar (striped when prod).
     strip_view: objc.Object = undefined,
+    /// Chrome tier behind the status bar (windowBackground shade against the
+    /// table's controlBackground, hairline on top).
+    footer_surface: *surface_mod.Surface = undefined,
     /// Inline, non-modal error/warning bar drawn ABOVE the file table. The
     /// always-visible surface for async failures (connect refused/timeout,
     /// the FTPS data-channel listing timeout, listing failures on the current
@@ -1430,6 +1449,7 @@ pub const BrowserPane = struct {
 
     pub fn showFilterField(pane: *BrowserPane) void {
         chrome.setHidden(pane.filter_field, false);
+        pane.layoutPathBar();
         _ = pane.controller.win.makeFirstResponder(pane.filter_field);
     }
 
@@ -1437,6 +1457,7 @@ pub const BrowserPane = struct {
         pane.filter_buf.clearRetainingCapacity();
         chrome.setText(pane.filter_field, "");
         chrome.setHidden(pane.filter_field, true);
+        pane.layoutPathBar();
         pane.redraw();
         pane.focusTable();
     }
@@ -1513,6 +1534,29 @@ pub const BrowserPane = struct {
     /// Sync-browsing link indicator in the path bar (both panes).
     fn updateSyncIndicator(pane: *BrowserPane) void {
         chrome.setHidden(pane.sync_label, !pane.controller.sync_browsing);
+        pane.layoutPathBar();
+    }
+
+    /// Path-bar row: the path field spans the pane, edge to edge with the
+    /// table below it (`pad` inset on both sides, matching the list's text
+    /// inset), and only gives up room on the right for the controls that
+    /// are actually showing — the filter field and the "⇄" sync indicator.
+    /// Computed from the container's CURRENT bounds; the autoresizing masks
+    /// keep the result right when the split view resizes the pane.
+    fn layoutPathBar(pane: *BrowserPane) void {
+        const bounds = chrome.boundsOf(pane.container);
+        const w = bounds.size.width;
+        const top_y = bounds.size.height - bar_h + (bar_h - field_h) / 2;
+        var right = w - pad;
+        if (!chrome.isHidden(pane.filter_field)) {
+            chrome.setFrame(pane.filter_field, foundation.rect(right - filter_w, top_y, filter_w, field_h));
+            right -= filter_w + pad;
+        }
+        if (!chrome.isHidden(pane.sync_label)) {
+            chrome.setFrame(pane.sync_label, foundation.rect(right - sync_w, top_y, sync_w, field_h - 2));
+            right -= sync_w + pad;
+        }
+        chrome.setFrame(pane.path_field, foundation.rect(pad, top_y, right - pad, field_h));
     }
 
     /// Show/hide + repaint the per-site accent strip (remote role only).
@@ -2132,7 +2176,7 @@ pub const BrowserPane = struct {
 
     fn dsSelectionChanged(ctx: *anyopaque, rows: []const usize) void {
         const pane: *BrowserPane = @ptrCast(@alignCast(ctx));
-        pane.controller.focused = pane.index;
+        pane.controller.setFocused(pane.index);
         var count: usize = 0;
         var bytes: u64 = 0;
         for (rows) |row| {
@@ -2152,8 +2196,13 @@ pub const BrowserPane = struct {
 
     fn dsDoubleAction(ctx: *anyopaque, row: ?usize) void {
         const pane: *BrowserPane = @ptrCast(@alignCast(ctx));
-        pane.controller.focused = pane.index;
+        pane.controller.setFocused(pane.index);
         pane.openRow(row orelse return);
+    }
+
+    fn dsFocusGained(ctx: *anyopaque) void {
+        const pane: *BrowserPane = @ptrCast(@alignCast(ctx));
+        pane.controller.setFocused(pane.index);
     }
 
     fn dsReturnAction(ctx: *anyopaque, row: ?usize) void {
@@ -2165,7 +2214,7 @@ pub const BrowserPane = struct {
     fn dsKeyDown(ctx: *anyopaque, ev: table_source.KeyEvent) bool {
         const pane: *BrowserPane = @ptrCast(@alignCast(ctx));
         const ctrl = pane.controller;
-        ctrl.focused = pane.index;
+        ctrl.setFocused(pane.index);
         const ch: u8 = if (ev.chars.len == 1) std.ascii.toLower(ev.chars[0]) else 0;
 
         if (ev.command and ev.option) {
@@ -2536,9 +2585,18 @@ pub const BrowserController = struct {
 
     pub fn focusPane(self: *BrowserController, index: u32) void {
         if (index >= self.panes.len) return;
-        self.focused = index;
+        self.setFocused(index);
         _ = self.win.makeFirstResponder(objc.Object.fromId(self.panes[index].table.tableHandle()));
         self.notifySelection(self.panes[index]); // the inspector follows focus
+    }
+
+    /// Record the active pane and move the path-field emphasis to it. Every
+    /// path that changes `focused` at runtime goes through here (first-
+    /// responder hook, selection/double-click/key callbacks, focusPane).
+    pub fn setFocused(self: *BrowserController, index: u32) void {
+        if (index >= self.panes.len) return;
+        self.focused = index;
+        for (self.panes, 0..) |pane, i| chrome.setFieldActive(pane.path_field, i == index);
     }
 
     pub fn focusOtherPane(self: *BrowserController) void {
@@ -3042,6 +3100,7 @@ pub const BrowserController = struct {
                 .cellIcon = BrowserPane.dsCellIcon,
                 .sortChanged = BrowserPane.dsSortChanged,
                 .selectionChanged = BrowserPane.dsSelectionChanged,
+                .focusGained = BrowserPane.dsFocusGained,
                 .doubleAction = BrowserPane.dsDoubleAction,
                 .returnAction = BrowserPane.dsReturnAction,
                 .keyDown = BrowserPane.dsKeyDown,
@@ -3070,32 +3129,37 @@ pub const BrowserController = struct {
     fn buildChrome(pane: *BrowserPane) void {
         pane.container = chrome.makeView(foundation.rect(0, 0, pane_w, pane_h));
 
+        // Status-bar tier, added first so the label sits on top of it.
+        pane.footer_surface = surface_mod.Surface.create(
+            pane.gpa,
+            foundation.rect(0, 0, pane_w, status_h),
+            .{ .separator_top = true },
+        ) catch @panic("relay/browser: failed to create footer surface");
+        const footer_view = objc.Object.fromId(pane.footer_surface.view());
+        chrome.setAutoresizing(footer_view, chrome.width_sizable | chrome.max_y_margin);
+
+        // Path bar: the three controls are placed by layoutPathBar (below)
+        // once their visibility is known; the frames here are placeholders.
         const top_y = pane_h - bar_h + (bar_h - field_h) / 2;
-        pane.path_field = chrome.makeTextField(
-            foundation.rect(pad, top_y, pane_w - filter_w - sync_w - 4 * pad, field_h),
-            12,
-        );
+        pane.path_field = chrome.makeTextField(foundation.rect(pad, top_y, pane_w - 2 * pad, field_h), 12);
         chrome.setAutoresizing(pane.path_field, chrome.width_sizable | chrome.min_y_margin);
+        chrome.setFieldActive(pane.path_field, pane.index == pane.controller.focused);
         chrome.setPlaceholder(pane.path_field, if (pane.role == .remote) "Not connected" else "Path");
 
         // "⇄" between the path bar and the filter: visible while
         // synchronized browsing links the panes.
-        pane.sync_label = chrome.makeLabel(
-            foundation.rect(pane_w - filter_w - sync_w - 2 * pad, top_y, sync_w, field_h - 2),
-        );
+        pane.sync_label = chrome.makeLabel(foundation.rect(0, top_y, sync_w, field_h - 2));
         chrome.setAutoresizing(pane.sync_label, chrome.min_x_margin | chrome.min_y_margin);
         chrome.setText(pane.sync_label, "⇄");
         chrome.setTextColor(pane.sync_label, foundation.controlAccentColor());
         chrome.setToolTip(pane.sync_label, "Synchronized browsing (⌘⇧B)");
         chrome.setHidden(pane.sync_label, true);
 
-        pane.filter_field = chrome.makeTextField(
-            foundation.rect(pane_w - filter_w - pad, top_y, filter_w, field_h),
-            12,
-        );
+        pane.filter_field = chrome.makeTextField(foundation.rect(0, top_y, filter_w, field_h), 12);
         chrome.setAutoresizing(pane.filter_field, chrome.min_x_margin | chrome.min_y_margin);
         chrome.setPlaceholder(pane.filter_field, "Filter");
         chrome.setHidden(pane.filter_field, true);
+        pane.layoutPathBar();
 
         // Per-site accent strip, 2pt under the path bar (remote role only;
         // striped warning treatment when the site is tagged prod).
@@ -3135,6 +3199,7 @@ pub const BrowserController = struct {
         chrome.setTargetAction(pane.filter_field, pane.field_target, "relayBrowserFilterSubmit:");
         chrome.setDelegate(pane.filter_field, pane.field_target);
 
+        chrome.addSubview(pane.container, footer_view);
         chrome.addSubview(pane.container, pane.path_field);
         chrome.addSubview(pane.container, pane.sync_label);
         chrome.addSubview(pane.container, pane.filter_field);
@@ -3157,6 +3222,7 @@ pub const BrowserController = struct {
         chrome.release(pane.strip_view);
         chrome.release(pane.status_label);
         chrome.release(pane.field_target);
+        pane.footer_surface.deinit();
         chrome.release(pane.container);
         if (pane.snapshot) |snap| snap.unref();
         gpa.free(pane.compare_tints);
@@ -3967,10 +4033,17 @@ test "sync browsing, compare mode, vim layer (headless)" {
 
     // --- Synchronized browsing -------------------------------------------
     try testing.expect(chrome.isHidden(p0.sync_label));
+    // With nothing else in the bar the path field spans the pane like the
+    // table under it (same `pad` inset both sides).
+    const pane_width = chrome.boundsOf(p0.container).size.width;
+    try testing.expectEqual(pane_width - 2 * pad, chrome.boundsOf(p0.path_field).size.width);
     bc.toggleSyncBrowsing();
     try testing.expect(bc.sync_browsing);
     try testing.expect(!chrome.isHidden(p0.sync_label)); // "⇄" in both bars
     try testing.expect(!chrome.isHidden(p1.sync_label));
+    // The indicator takes its room from the path field's right end only
+    // while it shows.
+    try testing.expectEqual(pane_width - 3 * pad - sync_w, chrome.boundsOf(p0.path_field).size.width);
 
     // A navigation in pane 0 mirrors the relative change into pane 1.
     p0.navigateTo("/a/x", .push);
@@ -3995,6 +4068,7 @@ test "sync browsing, compare mode, vim layer (headless)" {
     try drainUntil(core, &stopped, SyncStopped.ready);
     try testing.expect(chrome.isHidden(p0.sync_label));
     try testing.expect(chrome.isHidden(p1.sync_label));
+    try testing.expectEqual(pane_width - 2 * pad, chrome.boundsOf(p0.path_field).size.width);
     {
         const hint = try chrome.text(gpa, p1.status_label);
         defer gpa.free(hint);

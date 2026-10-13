@@ -43,6 +43,7 @@ const foundation = mac.foundation;
 const runtime = mac.runtime;
 const table_source = mac.appkit.table_source;
 const split_view = mac.appkit.split_view;
+const surface_mod = mac.appkit.surface;
 const menu = mac.appkit.menu;
 const panels = mac.appkit.panels;
 const Window = mac.appkit.window.Window;
@@ -601,6 +602,8 @@ pub const TransfersController = struct {
     // AppKit handles (owned).
     root: objc.Object,
     header: objc.Object,
+    /// Backdrop behind `header` (chrome tier + hairline under the controls).
+    header_surface: *surface_mod.Surface,
     content: objc.Object,
     seg: objc.Object,
     pause_btn: objc.Object,
@@ -669,6 +672,7 @@ pub const TransfersController = struct {
             .failed_menu = undefined,
             .root = undefined,
             .header = undefined,
+            .header_surface = undefined,
             .content = undefined,
             .seg = undefined,
             .pause_btn = undefined,
@@ -786,7 +790,7 @@ pub const TransfersController = struct {
         uiglue.release(self.clear_btn);
         uiglue.release(self.agg_label);
         uiglue.release(self.limits_bar);
-        uiglue.release(self.header);
+        self.header_surface.deinit();
         uiglue.release(self.content);
         uiglue.release(self.root);
         uiglue.release(self.target);
@@ -835,7 +839,12 @@ pub const TransfersController = struct {
         self.root = uiglue.makeView(foundation.rect(0, 0, default_w, default_h));
 
         // Header strip, pinned to the top edge.
-        self.header = uiglue.makeView(foundation.rect(0, default_h - header_h, default_w, header_h));
+        self.header_surface = try surface_mod.Surface.create(
+            self.gpa,
+            foundation.rect(0, default_h - header_h, default_w, header_h),
+            .{ .separator_bottom = true },
+        );
+        self.header = objc.Object.fromId(self.header_surface.view());
         uiglue.setAutoresizing(self.header, uiglue.mask_width_sizable | uiglue.mask_min_y_margin);
 
         const seg_labels = [_][]const u8{ "Transfers", "Failed", "Transcript" };

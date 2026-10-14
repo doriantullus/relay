@@ -54,6 +54,12 @@ directories (Cyberduck), GUI-inaccessible config + plaintext secrets
 - Return = rename (Finder parity; M2 may stub rename-inline as a sheet),
   `Cmd+↓`/double-click = open (descend dir / download+open file later).
 - Density modes (View menu): Comfortable 28pt / Compact 22pt / Dense 18pt.
+- Drag & drop (macOS): rows dropped on a folder row, or into the other
+  pane, MOVE when both ends are the same site (a rename across
+  directories, optimistic hide, "Move failed" sheet + row back on refusal;
+  the destination pane refreshes when the batch completes) and TRANSFER
+  when the sites differ. A folder is never dropped into itself; a drop
+  where the rows already are is refused.
 - Linux uses `GtkColumnView` with multi-selection, sortable headers,
   streaming snapshots, filter/hidden controls, active-pane styling, and
   Control-based accelerators exposed in the primary menu.

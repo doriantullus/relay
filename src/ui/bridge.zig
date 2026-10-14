@@ -943,6 +943,14 @@ pub const AppCore = struct {
         _ = try self.startOp(.rename, pane_token, site_id, raw_from, raw_to, 0, false);
     }
 
+    /// Move = rename across directories on one site. Same op as renamePath
+    /// but hands back the request id so the UI can tell a move's op_done
+    /// from a plain rename's (only `from`'s parent re-lists automatically;
+    /// the destination directory is the caller's to refresh).
+    pub fn movePath(self: *AppCore, pane_token: PaneToken, site_id: u64, raw_from: []const u8, raw_to: []const u8) OpStartError!RequestId {
+        return self.startOp(.rename, pane_token, site_id, raw_from, raw_to, 0, false);
+    }
+
     pub fn chmodPath(self: *AppCore, pane_token: PaneToken, site_id: u64, raw_path: []const u8, mode: u16) OpStartError!void {
         _ = try self.startOp(.chmod, pane_token, site_id, raw_path, null, mode, false);
     }

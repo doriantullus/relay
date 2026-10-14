@@ -1082,6 +1082,12 @@ pub const BrowserPane = struct {
     rename_target: ?[]u8 = null,
     op_names: std.ArrayList([]u8) = .empty,
     op_generation: u64 = 0,
+    /// In-flight drag moves (core.movePath request ids) started from this
+    /// pane, and the pane the rows went to: the bridge only re-lists the
+    /// SOURCE directory after a rename, so the destination pane refreshes
+    /// itself once the last move of the batch completes.
+    move_requests: std.ArrayList(bridge.RequestId) = .empty,
+    move_dst: ?bridge.PaneToken = null,
 
     // Type-select accumulator.
     ts_buf: [24]u8 = undefined,
@@ -1820,6 +1826,10 @@ pub const BrowserPane = struct {
 
     fn handleOpDone(pane: *BrowserPane, d: bridge.OpDone) void {
         if (d.op == .stat) return;
+        if (pane.takeMoveRequest(d.request_id)) {
+            pane.handleMoveDone(d);
+            return;
+        }
         if (d.success) return; // the bridge already re-listed; adopt reconciles
         const gpa = pane.gpa;
         switch (d.op) {
@@ -1918,6 +1928,93 @@ pub const BrowserPane = struct {
             .conflict = .ask,
         }) catch return false;
         return true;
+    }
+
+    // ------------------------------------------------------------------ //
+    // Drag moves (same site: rows dropped on a folder row, or into the
+    // other pane when it shows the same site). A move is a rename across
+    // directories; the rows hide optimistically and come back on failure.
+
+    /// True when dropping `rows` of this pane into `dst_dir` would change
+    /// anything: refuses the rows' own directory (a no-op) and a folder
+    /// dropped into itself or one of its descendants.
+    fn canMoveRowsTo(pane: *BrowserPane, rows: []const u32, dst_dir: []const u8) bool {
+        const snap = pane.snapshot orelse return false;
+        if (std.mem.eql(u8, dst_dir, snap.path)) return false;
+        var movable = false;
+        for (rows) |row| {
+            if (row >= pane.visible.items.len) continue;
+            const slot = pane.visible.items[row];
+            if (slot == virtual_new_folder_row or slot >= snap.entries.len) continue;
+            const entry = &snap.entries[slot];
+            if (entry.kind == .dir and pathIsWithin(dst_dir, snap.path, entry.name)) return false;
+            movable = true;
+        }
+        return movable;
+    }
+
+    /// Start one core.movePath per row (optimistic hide, rolled back on a
+    /// refused start). Returns true if any move was started.
+    fn moveRowsTo(pane: *BrowserPane, rows: []const u32, dst_pane: *BrowserPane, dst_dir: []const u8) bool {
+        const snap = pane.snapshot orelse return false;
+        const site = pane.site orelse return false;
+        if (!pane.canMoveRowsTo(rows, dst_dir)) return false;
+        const gpa = pane.gpa;
+        const core = pane.controller.core;
+        var any = false;
+        for (rows) |row| {
+            if (row >= pane.visible.items.len) continue;
+            const slot = pane.visible.items[row];
+            if (slot == virtual_new_folder_row or slot >= snap.entries.len) continue;
+            const name = snap.entries[slot].name;
+            if (!path_mod.isSafeChildName(name)) continue;
+            const from = path_mod.join(gpa, snap.path, name) catch continue;
+            defer gpa.free(from);
+            const to = path_mod.join(gpa, dst_dir, name) catch continue;
+            defer gpa.free(to);
+            pane.overlay.hide(gpa, slot) catch continue; // optimistic apply
+            const request = core.movePath(pane.token(), site, from, to) catch {
+                pane.overlay.unhide(slot);
+                continue;
+            };
+            pane.move_requests.append(gpa, request) catch {};
+            any = true;
+        }
+        if (any) {
+            pane.move_dst = if (dst_pane != pane) dst_pane.token() else null;
+            pane.redraw();
+        }
+        return any;
+    }
+
+    /// Remove `request_id` from the in-flight moves; true if it was one.
+    fn takeMoveRequest(pane: *BrowserPane, request_id: bridge.RequestId) bool {
+        for (pane.move_requests.items, 0..) |r, i| {
+            if (r == request_id) {
+                _ = pane.move_requests.swapRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Move completion: a failed move brings its row back; the last
+    /// completion of a batch refreshes the destination pane (its directory
+    /// is not the one the bridge re-lists).
+    fn handleMoveDone(pane: *BrowserPane, d: bridge.OpDone) void {
+        if (!d.success) {
+            if (pane.snapshot) |snap| {
+                if (findEntryByName(snap.entries, path_mod.basename(d.path))) |slot| pane.overlay.unhide(slot);
+            }
+            pane.redraw();
+            const detail: []const u8 = if (d.failure) |f| f.message else "";
+            if (pane.isVisible())
+                panels.presentErrorSheet(pane.controller.win, "Move failed", detail);
+        }
+        if (pane.move_requests.items.len != 0) return;
+        const dst_token = pane.move_dst orelse return;
+        pane.move_dst = null;
+        if (g_pane_registry.get(dst_token)) |dst| dst.refresh();
     }
 
     /// Drop destination: the hovered directory row, else the current dir.
@@ -2371,15 +2468,30 @@ pub const BrowserPane = struct {
         return any;
     }
 
+    /// Internal rows hovering: same site (the same pane, or the other pane
+    /// showing that site) means a MOVE; another site means a transfer.
+    fn dropValidatePaneRows(ctx: *anyopaque, source_token: u64, rows: []const u32, target: drag.DropTarget) drag.Operation {
+        const pane: *BrowserPane = @ptrCast(@alignCast(ctx));
+        const dst_site = pane.site orelse return .none;
+        if (pane.snapshot == null) return .none;
+        const src = g_pane_registry.get(source_token) orelse return .none;
+        const src_site = src.site orelse return .none;
+        if (src_site != dst_site) return if (src == pane) .none else .copy;
+        const dst_dir = pane.dropDirOwned(target) orelse return .none;
+        defer pane.gpa.free(dst_dir);
+        return if (src.canMoveRowsTo(rows, dst_dir)) .move else .none;
+    }
+
     fn dropAcceptPaneRows(ctx: *anyopaque, source_token: u64, rows: []const u32, target: drag.DropTarget) bool {
         const pane: *BrowserPane = @ptrCast(@alignCast(ctx));
         // The pasteboard carries the source's unique pane token; the
         // registry resolves it process-wide, so the source pane may belong
         // to another controller (tab) than this table's.
         const src = g_pane_registry.get(source_token) orelse return false;
-        if (src == pane) return false; // M2: cross-pane drags only
         const dst_dir = pane.dropDirOwned(target) orelse return false;
         defer pane.gpa.free(dst_dir);
+        if (src.site != null and src.site == pane.site) return src.moveRowsTo(rows, pane, dst_dir);
+        if (src == pane) return false;
         var any = false;
         for (rows) |row| {
             if (src.enqueueRowTo(row, pane, dst_dir)) any = true;
@@ -2387,6 +2499,29 @@ pub const BrowserPane = struct {
         return any;
     }
 };
+
+/// True when `path` is the directory `base/name` itself or lies under it
+/// (all pane-coordinate normalized paths). Guards a folder being moved
+/// into itself.
+fn pathIsWithin(path: []const u8, base: []const u8, name: []const u8) bool {
+    const sep: usize = if (base.len == 1 and base[0] == '/') 0 else 1;
+    const dir_len = base.len + sep + name.len;
+    if (path.len < dir_len) return false;
+    if (!std.mem.startsWith(u8, path, base)) return false;
+    if (sep == 1 and path[base.len] != '/') return false;
+    if (!std.mem.eql(u8, path[base.len + sep .. dir_len], name)) return false;
+    return path.len == dir_len or path[dir_len] == '/';
+}
+
+test "pathIsWithin: a folder and its descendants, not its siblings" {
+    try testing.expect(pathIsWithin("/a/b", "/a", "b"));
+    try testing.expect(pathIsWithin("/a/b/c", "/a", "b"));
+    try testing.expect(pathIsWithin("/b", "/", "b"));
+    try testing.expect(pathIsWithin("/b/x", "/", "b"));
+    try testing.expect(!pathIsWithin("/a/bc", "/a", "b"));
+    try testing.expect(!pathIsWithin("/a", "/a", "b"));
+    try testing.expect(!pathIsWithin("/x/b", "/a", "b"));
+}
 
 /// Follow-stat through the core's local root: true when `abs` (a
 /// pane-coordinate absolute path) resolves to a directory, symlinks
@@ -3117,6 +3252,7 @@ pub const BrowserController = struct {
         drag.attachDropHandler(pane.table, .{
             .ctx = pane,
             .validate = BrowserPane.dropValidate,
+            .validatePaneRows = BrowserPane.dropValidatePaneRows,
             .acceptFiles = BrowserPane.dropAcceptFiles,
             .acceptPaneRows = BrowserPane.dropAcceptPaneRows,
         });
@@ -3234,6 +3370,7 @@ pub const BrowserController = struct {
         if (pane.rename_target) |name| gpa.free(name);
         for (pane.op_names.items) |name| gpa.free(name);
         pane.op_names.deinit(gpa);
+        pane.move_requests.deinit(gpa);
         if (pane.loading_path) |lp| gpa.free(lp);
         if (pane.saved_local_path) |p| gpa.free(p);
         gpa.destroy(pane);
@@ -4217,6 +4354,123 @@ fn toolTipOf(gpa: Allocator, view: objc.Object) ![]u8 {
     const tip = view.msgSend(objc.Object, "toolTip", .{});
     if (tip.value == null) return gpa.dupe(u8, "");
     return foundation.utf8FromNSString(gpa, tip);
+}
+
+fn rowOfName(pane: *BrowserPane, name: []const u8) ?u32 {
+    const snap = pane.snapshot orelse return null;
+    for (pane.visible.items, 0..) |slot, row| {
+        if (slot == virtual_new_folder_row or slot >= snap.entries.len) continue;
+        if (std.mem.eql(u8, snap.entries[slot].name, name)) return @intCast(row);
+    }
+    return null;
+}
+
+const PaneHasName = struct {
+    pane: *BrowserPane,
+    name: []const u8,
+    present: bool,
+
+    fn ready(self: *@This()) bool {
+        if (self.pane.pending_request != null) return false;
+        return (rowOfName(self.pane, self.name) != null) == self.present;
+    }
+};
+
+test "drag move: same-site drops move rows, refuse no-ops, refresh the destination pane (headless)" {
+    const pool = foundation.AutoreleasePool.init();
+    defer pool.deinit();
+    const gpa = testing.allocator;
+
+    var tmp_conf = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_conf.cleanup();
+    var tmp_root = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_root.cleanup();
+    var fake = FakeStore.init(gpa);
+    defer fake.deinit();
+
+    const core = try bridge.AppCore.initOptions(gpa, .{
+        .pump = .manual,
+        .config_dir = tmp_conf.dir,
+        .local_root = tmp_root.dir,
+        .cred_store = fake.credStore(),
+    });
+
+    const io = core.io;
+    try tmp_root.dir.writeFile(io, .{ .sub_path = "alpha.txt", .data = "a" });
+    try tmp_root.dir.writeFile(io, .{ .sub_path = "beta.txt", .data = "b" });
+    try tmp_root.dir.createDir(io, "sub", .default_dir);
+    try tmp_root.dir.createDir(io, "other", .default_dir);
+
+    const win = window_mod.Window.create(
+        foundation.rect(0, 0, 1000, 600),
+        "relay-move-test",
+        window_mod.StyleMask.standard,
+    );
+
+    const bc = try BrowserController.create(gpa, core, win, .{ .initial_local_path = "/" });
+    win.setContentView(objc.Object.fromId(bc.view()));
+
+    const p0 = bc.localPane();
+    const p1 = bc.remotePane();
+    var settled: PaneSettled = .{ .pane = p0, .path = "/" };
+    try drainUntil(core, &settled, PaneSettled.ready);
+    // Both panes on the same (local) site: p1 shows /sub.
+    bc.bindRemoteToPane(p1.token(), item_mod.local_site_id, "/sub");
+    settled = .{ .pane = p1, .path = "/sub" };
+    try drainUntil(core, &settled, PaneSettled.ready);
+
+    const alpha_row = rowOfName(p0, "alpha.txt").?;
+    const beta_row = rowOfName(p0, "beta.txt").?;
+    const sub_row = rowOfName(p0, "sub").?;
+    const other_row = rowOfName(p0, "other").?;
+    const whole: drag.DropTarget = .{ .row = null, .on_row = false };
+    const on_sub: drag.DropTarget = .{ .row = sub_row, .on_row = true };
+    const on_alpha: drag.DropTarget = .{ .row = alpha_row, .on_row = true };
+
+    // --- Validation: what the cursor offers ------------------------------
+    // Rows dropped where they already are: nothing to do.
+    try testing.expectEqual(drag.Operation.none, BrowserPane.dropValidatePaneRows(p0, p0.token(), &.{alpha_row}, whole));
+    try testing.expectEqual(drag.Operation.none, BrowserPane.dropValidatePaneRows(p0, p0.token(), &.{alpha_row}, on_alpha));
+    // Onto a folder row in the same pane: a move.
+    try testing.expectEqual(drag.Operation.move, BrowserPane.dropValidatePaneRows(p0, p0.token(), &.{ alpha_row, beta_row }, on_sub));
+    // A folder into itself (alone or in a batch): refused.
+    try testing.expectEqual(drag.Operation.none, BrowserPane.dropValidatePaneRows(p0, p0.token(), &.{sub_row}, on_sub));
+    try testing.expectEqual(drag.Operation.none, BrowserPane.dropValidatePaneRows(p0, p0.token(), &.{ alpha_row, sub_row }, on_sub));
+    // Into the other pane on the same site: a move; from /sub back to / too.
+    try testing.expectEqual(drag.Operation.move, BrowserPane.dropValidatePaneRows(p1, p0.token(), &.{other_row}, whole));
+
+    // --- Accept: one row into the other pane's directory -----------------
+    const alpha_slot = p0.visible.items[alpha_row];
+    try testing.expect(BrowserPane.dropAcceptPaneRows(p1, p0.token(), &.{alpha_row}, whole));
+    try testing.expect(p0.overlay.isHidden(alpha_slot)); // optimistic
+    try testing.expectEqual(@as(usize, 1), p0.move_requests.items.len);
+    try testing.expectEqual(@as(?bridge.PaneToken, p1.token()), p0.move_dst);
+
+    var gone: PaneHasName = .{ .pane = p0, .name = "alpha.txt", .present = false };
+    try drainUntil(core, &gone, PaneHasName.ready);
+    var arrived: PaneHasName = .{ .pane = p1, .name = "alpha.txt", .present = true };
+    try drainUntil(core, &arrived, PaneHasName.ready);
+    try testing.expectEqual(@as(usize, 0), p0.move_requests.items.len);
+    try testing.expectEqual(@as(?bridge.PaneToken, null), p0.move_dst);
+    const st = try tmp_root.dir.statFile(io, "sub/alpha.txt", .{});
+    try testing.expectEqual(std.Io.File.Kind.file, st.kind);
+
+    // --- Accept: a batch onto a folder row in the same pane ---------------
+    const beta_row2 = rowOfName(p0, "beta.txt").?;
+    const other_row2 = rowOfName(p0, "other").?;
+    const sub_row2 = rowOfName(p0, "sub").?;
+    try testing.expect(BrowserPane.dropAcceptPaneRows(p0, p0.token(), &.{ beta_row2, other_row2 }, .{ .row = sub_row2, .on_row = true }));
+    try testing.expectEqual(@as(usize, 2), p0.move_requests.items.len);
+    try testing.expectEqual(@as(?bridge.PaneToken, null), p0.move_dst); // same pane: the re-list covers it
+    gone = .{ .pane = p0, .name = "other", .present = false };
+    try drainUntil(core, &gone, PaneHasName.ready);
+    gone = .{ .pane = p0, .name = "beta.txt", .present = false };
+    try drainUntil(core, &gone, PaneHasName.ready);
+    _ = try tmp_root.dir.statFile(io, "sub/beta.txt", .{});
+    _ = try tmp_root.dir.statFile(io, "sub/other", .{});
+
+    core.shutdown();
+    bc.destroy();
 }
 
 test "inline error banner + chip tooltip: status/listing event transitions (headless)" {

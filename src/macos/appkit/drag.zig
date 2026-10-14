@@ -67,6 +67,12 @@ pub const DropHandler = struct {
     ctx: *anyopaque,
     /// Called repeatedly while the drag hovers. Return .none to refuse.
     validate: *const fn (ctx: *anyopaque, payload: Payload, target: DropTarget) Operation,
+    /// Internal rows hovering: like `validate`, but with the source pane
+    /// token and the dragged row indexes decoded from the pasteboard, so
+    /// the app can tell a move from a copy and refuse no-ops (a folder
+    /// dropped into itself, rows dropped where they already are). Falls
+    /// back to `validate` when null.
+    validatePaneRows: ?*const fn (ctx: *anyopaque, source_token: u64, rows: []const u32, target: DropTarget) Operation = null,
     /// Finder files dropped; absolute filesystem paths.
     acceptFiles: ?*const fn (ctx: *anyopaque, paths: []const []const u8, target: DropTarget) bool = null,
     /// Internal rows dropped from another (or the same) pane; `source_token`
@@ -187,6 +193,30 @@ fn dropTarget(row: NSInteger, drop_op: NSUInteger) DropTarget {
     };
 }
 
+const PaneRows = struct { token: u64, rows: []const u32 };
+
+/// Decode every pane-row item on the pasteboard (alloc owns `rows`). The
+/// first item's token stands for the whole drag: one drag has one source.
+fn readPaneRows(alloc: std.mem.Allocator, pasteboard: objc.Object) ?PaneRows {
+    const items = pasteboard.msgSend(objc.Object, "pasteboardItems", .{});
+    const count = items.msgSend(NSUInteger, "count", .{});
+    var rows: std.ArrayList(u32) = .empty;
+    var source_pane: ?u64 = null;
+    var i: NSUInteger = 0;
+    while (i < count) : (i += 1) {
+        const item = items.msgSend(objc.Object, "objectAtIndex:", .{i});
+        const data = item.msgSend(c.id, "dataForType:", .{nsStr(pane_rows_type)});
+        if (data == null) continue;
+        const data_obj = objc.Object.fromId(data);
+        const len = data_obj.msgSend(NSUInteger, "length", .{});
+        const bytes_ptr = data_obj.msgSend(?[*]const u8, "bytes", .{}) orelse continue;
+        const decoded = decodePaneRow(bytes_ptr[0..@intCast(len)]) orelse continue;
+        if (source_pane == null) source_pane = decoded.pane;
+        rows.append(alloc, decoded.row) catch return null;
+    }
+    return .{ .token = source_pane orelse return null, .rows = rows.items };
+}
+
 fn helperValidateDrop(
     target: c.id,
     _: c.SEL,
@@ -202,7 +232,16 @@ fn helperValidateDrop(
     const handler = tv.drop orelse return ns_drag_none;
     const pasteboard = objc.Object.fromId(info_id).msgSend(objc.Object, "draggingPasteboard", .{});
     const payload = payloadKind(pasteboard) orelse return ns_drag_none;
-    const op = handler.validate(handler.ctx, payload, dropTarget(row, drop_op));
+    const where = dropTarget(row, drop_op);
+    if (payload == .pane_rows) {
+        if (handler.validatePaneRows) |cb| {
+            var arena = std.heap.ArenaAllocator.init(tv.alloc);
+            defer arena.deinit();
+            const src = readPaneRows(arena.allocator(), pasteboard) orelse return ns_drag_none;
+            return cb(handler.ctx, src.token, src.rows, where).toNSDragOperation();
+        }
+    }
+    const op = handler.validate(handler.ctx, payload, where);
     return op.toNSDragOperation();
 }
 
@@ -256,22 +295,8 @@ fn helperAcceptDrop(
         },
         .pane_rows => {
             const cb = handler.acceptPaneRows orelse return 0;
-            var rows: std.ArrayList(u32) = .empty;
-            var source_pane: ?u64 = null;
-            var i: NSUInteger = 0;
-            while (i < count) : (i += 1) {
-                const item = items.msgSend(objc.Object, "objectAtIndex:", .{i});
-                const data = item.msgSend(c.id, "dataForType:", .{nsStr(pane_rows_type)});
-                if (data == null) continue;
-                const data_obj = objc.Object.fromId(data);
-                const len = data_obj.msgSend(NSUInteger, "length", .{});
-                const bytes_ptr = data_obj.msgSend(?[*]const u8, "bytes", .{}) orelse continue;
-                const decoded = decodePaneRow(bytes_ptr[0..@intCast(len)]) orelse continue;
-                if (source_pane == null) source_pane = decoded.pane;
-                rows.append(alloc, decoded.row) catch return 0;
-            }
-            const pane = source_pane orelse return 0;
-            return if (cb(handler.ctx, pane, rows.items, where)) 1 else 0;
+            const src = readPaneRows(alloc, pasteboard) orelse return 0;
+            return if (cb(handler.ctx, src.token, src.rows, where)) 1 else 0;
         },
     }
 }
